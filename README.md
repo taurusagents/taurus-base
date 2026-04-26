@@ -20,7 +20,15 @@ Standalone base Docker image used for Taurus agent containers.
 - Playwright + Chromium
 - Browser helper at `/usr/local/lib/browser-cli.mjs`
 
-## Build
+## Pull
+
+Published images are available from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/taurusagents/taurus-base:latest
+```
+
+## Build locally
 
 ```bash
 docker build -t taurus-base .
@@ -35,7 +43,7 @@ docker build -t ghcr.io/taurusagents/taurus-base:latest .
 ## Smoke test
 
 ```bash
-docker run --rm -it taurus-base bash
+docker run --rm -it ghcr.io/taurusagents/taurus-base:latest bash
 python3 --version
 node --version
 go version
