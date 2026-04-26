@@ -2,6 +2,9 @@
 # Build: docker build -t taurus-base .
 # Usage: use this image as the default Taurus agent container image.
 
+# Keep this on the newest Ubuntu LTS that Playwright officially supports.
+# Ubuntu 26.04 LTS is released, but Playwright 1.59 does not yet support
+# bundled Chromium on ubuntu26.04-x64; revisit after Playwright support lands.
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive

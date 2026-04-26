@@ -51,6 +51,25 @@ rg --version
 fd --version
 ```
 
+
+## Automatic publishing
+
+GitHub Actions publishes `ghcr.io/taurusagents/taurus-base` when `main` changes, when `v*` tags are pushed, on manual dispatch, and on a daily scheduled rebuild. The scheduled rebuild uses fresh base pulls so patched Ubuntu/package layers can flow into a new image even when this repository has no source changes.
+
+Tags:
+
+- `latest` — current `main` image
+- `sha-<commit>` — immutable commit image for push builds
+- `v*` — release tags
+
+## Runtime refresh
+
+Runtime node refresh/retag automation is deployment-specific and intentionally not maintained in this public image repository. Taurus operators should pull `ghcr.io/taurusagents/taurus-base:latest` into their deployment environment using their private ops automation. Existing running agent containers keep using the image/layers they started with; recreate them if you need an urgent security patch applied immediately.
+
+## Ubuntu LTS base policy
+
+The image should move to the newest Ubuntu LTS once the browser stack supports it. Ubuntu 26.04 LTS is released and supported until April 2031, but Playwright 1.59 currently does not officially support bundled Chromium on `ubuntu26.04-x64`. Because Taurus agents rely on the Browser tool, keep `ubuntu:22.04` until a CI image build and Browser smoke test pass on 26.04, or until Playwright ships official 26.04 support.
+
 ## Browser helper
 
 The image includes a small Playwright wrapper:
