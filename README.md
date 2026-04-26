@@ -13,7 +13,7 @@ Standalone base Docker image used for Taurus agent containers.
 - Ubuntu 22.04 base
 - Core CLI tools: bash, git, curl, jq, ripgrep, fd, rsync, vim, htop, etc.
 - Python 3 + common data / web libraries
-- Node.js 22 + common JS tooling
+- Node.js 24 + common JS tooling
 - Go toolchain
 - asdf version manager
 - GitHub CLI
