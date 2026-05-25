@@ -113,8 +113,12 @@ async function handleAction(input) {
 
         // Use CDP to get the accessibility tree
         const cdp = await page.context().newCDPSession(page);
-        const { nodes } = await cdp.send('Accessibility.getFullAXTree');
-        await cdp.detach();
+        let nodes;
+        try {
+          ({ nodes } = await cdp.send('Accessibility.getFullAXTree'));
+        } finally {
+          await cdp.detach();
+        }
 
         const tree = formatAXNodes(nodes);
         return `URL: ${url}\nTitle: ${title}\n\n${tree}`;
