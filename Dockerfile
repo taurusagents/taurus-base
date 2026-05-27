@@ -48,8 +48,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     requests==2.34.2 \
     beautifulsoup4==4.14.3 \
     lxml==6.1.1 \
-    pandas==3.0.3 \
-    numpy==2.4.6 \
+    pandas==2.3.3 \
+    numpy==2.2.6 \
     matplotlib==3.10.9 \
     pyyaml==6.0.3 \
     flask==3.1.3 \
