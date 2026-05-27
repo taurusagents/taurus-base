@@ -55,15 +55,15 @@ jobs:
 
       - name: Smoke test image
         run: |
-          docker run --rm taurus-base-smoke bash -lc '
+          docker run --rm taurus-base-smoke bash -lc "
             python3 --version &&
             node --version &&
             go version &&
             rg --version &&
             fd --version &&
             playwright --version &&
-            node -e 'const { chromium } = require("playwright"); (async () => { const browser = await chromium.launch({ headless: true }); await browser.close(); })().catch((error) => { console.error(error); process.exit(1); });'
-          '
+            node -e 'const { chromium } = require(\"playwright\"); (async () => { const browser = await chromium.launch({ headless: true }); await browser.close(); })().catch((error) => { console.error(error); process.exit(1); });'
+          "
 
       - name: Tag and push smoked image
         env:
