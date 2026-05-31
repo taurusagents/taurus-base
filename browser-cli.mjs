@@ -2,8 +2,10 @@
 /**
  * browser-cli.mjs — Thin CLI wrapper around Playwright for agentic use.
  *
- * Keeps Chromium alive between invocations via CDP.
- * State file at /tmp/.browser-cli.json stores the CDP endpoint.
+ * Keeps Chromium alive between invocations via CDP. State lives in /tmp so the
+ * rootful Taurus shell can reconnect and control the browser across tool calls,
+ * while Chromium itself runs under a dedicated non-root user with its sandbox
+ * enabled.
  *
  * Usage: node /usr/local/lib/browser-cli.mjs '{"action":"open","url":"https://example.com"}'
  */
@@ -12,13 +14,137 @@ import { createRequire } from 'module';
 const require = createRequire('/usr/lib/node_modules/');
 const { chromium } = require('playwright');
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import {
+  chmodSync,
+  chownSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
+import { execFileSync, spawn } from 'child_process';
 
 const STATE_FILE = '/tmp/.browser-cli.json';
 const CDP_PORT = 9222;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36';
 const VIEWPORT = { width: 1280, height: 720 };
+const BROWSER_USER = process.env.TAURUS_BROWSER_USER || 'taurus-browser';
+const BROWSER_HOME = process.env.TAURUS_BROWSER_HOME || `/home/${BROWSER_USER}`;
+const BROWSER_PROFILE_DIR = `${BROWSER_HOME}/.config/chromium-profile`;
+const BROWSER_RUNTIME_DIR = process.env.TAURUS_BROWSER_RUNTIME_DIR || '/tmp/taurus-browser-runtime';
+const USERNS_CLONE_SYSCTL = '/proc/sys/kernel/unprivileged_userns_clone';
+const MAX_USER_NAMESPACES_SYSCTL = '/proc/sys/user/max_user_namespaces';
+
+let browserIdentityCache = null;
+
+function browserSandboxConfigurationError(detail) {
+  return new Error(
+    `Chromium sandbox prerequisites are not available (${detail}). Taurus keeps Chromium sandboxing enabled and does not fall back to --no-sandbox. Configure the Docker host with kernel.unprivileged_userns_clone=1 and user.max_user_namespaces > 0, then recreate the container if needed.`,
+  );
+}
+
+function resolveBrowserIdentity() {
+  if (browserIdentityCache) return browserIdentityCache;
+
+  const uid = Number(execFileSync('id', ['-u', BROWSER_USER], { encoding: 'utf-8' }).trim());
+  const gid = Number(execFileSync('id', ['-g', BROWSER_USER], { encoding: 'utf-8' }).trim());
+  browserIdentityCache = { uid, gid };
+  return browserIdentityCache;
+}
+
+function browserEnv() {
+  return {
+    ...process.env,
+    HOME: BROWSER_HOME,
+    USER: BROWSER_USER,
+    LOGNAME: BROWSER_USER,
+    XDG_CACHE_HOME: `${BROWSER_HOME}/.cache`,
+    XDG_CONFIG_HOME: `${BROWSER_HOME}/.config`,
+    XDG_STATE_HOME: `${BROWSER_HOME}/.local/state`,
+    XDG_DATA_HOME: `${BROWSER_HOME}/.local/share`,
+    XDG_RUNTIME_DIR: BROWSER_RUNTIME_DIR,
+  };
+}
+
+function readOptionalIntegerFile(filePath) {
+  try {
+    const rawValue = readFileSync(filePath, 'utf-8').trim();
+    if (rawValue.length === 0) return null;
+    const parsed = Number.parseInt(rawValue, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function ensureWritableBrowserDirs() {
+  const dirs = [
+    BROWSER_HOME,
+    `${BROWSER_HOME}/.cache`,
+    `${BROWSER_HOME}/.config`,
+    `${BROWSER_HOME}/.local`,
+    `${BROWSER_HOME}/.local/state`,
+    `${BROWSER_HOME}/.local/share`,
+    BROWSER_PROFILE_DIR,
+    BROWSER_RUNTIME_DIR,
+  ];
+
+  const { uid, gid } = resolveBrowserIdentity();
+  for (const dir of dirs) {
+    mkdirSync(dir, { recursive: true });
+    if (process.getuid?.() === 0) {
+      chownSync(dir, uid, gid);
+    }
+  }
+
+  chmodSync(BROWSER_RUNTIME_DIR, 0o700);
+}
+
+function assertBrowserLaunchUser() {
+  const currentUid = process.getuid?.();
+  if (currentUid === undefined) return;
+
+  const { uid } = resolveBrowserIdentity();
+  if (currentUid === 0 || currentUid === uid) {
+    return;
+  }
+
+  throw new Error(`Browser helper must run as root or ${BROWSER_USER} to launch Chromium securely`);
+}
+
+function assertBrowserSandboxPrerequisites() {
+  const unprivilegedUsernsClone = readOptionalIntegerFile(USERNS_CLONE_SYSCTL);
+  if (unprivilegedUsernsClone === 0) {
+    throw browserSandboxConfigurationError(`${USERNS_CLONE_SYSCTL}=0 on the Docker host kernel`);
+  }
+
+  const maxUserNamespaces = readOptionalIntegerFile(MAX_USER_NAMESPACES_SYSCTL);
+  if (maxUserNamespaces !== null && maxUserNamespaces < 1) {
+    throw browserSandboxConfigurationError(
+      `${MAX_USER_NAMESPACES_SYSCTL}=${maxUserNamespaces} on the Docker host kernel`,
+    );
+  }
+
+  const unsharePath = '/usr/bin/unshare';
+  if (!existsSync(unsharePath)) return;
+
+  const identity = resolveBrowserIdentity();
+  try {
+    execFileSync(unsharePath, ['--user', '--map-root-user', '/bin/true'], {
+      stdio: 'pipe',
+      env: browserEnv(),
+      ...(process.getuid?.() === 0 ? { uid: identity.uid, gid: identity.gid } : {}),
+    });
+  } catch (err) {
+    const detail = err && typeof err === 'object' && 'stderr' in err && err.stderr
+      ? String(err.stderr).trim() || err.message
+      : err instanceof Error
+        ? err.message
+        : String(err);
+    throw browserSandboxConfigurationError(`user-namespace sandbox probe failed: ${detail}`);
+  }
+}
 
 // ── State persistence ──
 
@@ -35,6 +161,14 @@ function saveState(state) {
 
 function clearState() {
   try { unlinkSync(STATE_FILE); } catch { /* ignore */ }
+}
+
+function closeBrowserProcess() {
+  try {
+    execFileSync('pkill', ['-u', BROWSER_USER, '-f', `chrome.*--remote-debugging-port=${CDP_PORT}`], { stdio: 'ignore' });
+  } catch {
+    /* browser already gone */
+  }
 }
 
 // ── Launch or connect to Chromium ──
@@ -57,13 +191,27 @@ async function ensureBrowser() {
     }
   }
 
-  // Launch Chromium with remote debugging
+  assertBrowserLaunchUser();
+  ensureWritableBrowserDirs();
+  assertBrowserSandboxPrerequisites();
+
+  // Launch Chromium with remote debugging. The Taurus container stays rootful,
+  // but the browser process itself drops to a dedicated non-root user so Chromium
+  // can keep its sandbox enabled.
   const chromePath = chromium.executablePath();
+  const identity = resolveBrowserIdentity();
   const child = spawn(chromePath, [
-    '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+    '--headless', '--disable-gpu', '--disable-dev-shm-usage',
     `--user-agent=${USER_AGENT}`,
     `--remote-debugging-port=${CDP_PORT}`, '--remote-debugging-address=127.0.0.1',
-  ], { stdio: 'ignore', detached: true });
+    `--user-data-dir=${BROWSER_PROFILE_DIR}`,
+  ], {
+    stdio: 'ignore',
+    detached: true,
+    cwd: BROWSER_HOME,
+    env: browserEnv(),
+    ...(process.getuid?.() === 0 ? { uid: identity.uid, gid: identity.gid } : {}),
+  });
   child.unref();
 
   // Wait for CDP to be ready
@@ -90,7 +238,7 @@ async function handleAction(input) {
   const { action } = input;
 
   if (action === 'close') {
-    try { execSync('pkill -f "chrome.*remote-debugging"', { stdio: 'ignore' }); } catch { /* ok */ }
+    closeBrowserProcess();
     clearState();
     return 'Browser closed.';
   }
