@@ -2,7 +2,6 @@
 
 Standalone base Docker image used for Taurus agent containers.
 
-
 ## Contents
 
 - `Dockerfile` — the base image definition
@@ -51,7 +50,6 @@ rg --version
 fd --version
 ```
 
-
 ## Automatic publishing
 
 GitHub Actions publishes `ghcr.io/taurusagents/taurus-base` when `main` changes, when `v*` tags are pushed, on manual dispatch, and on a daily scheduled rebuild. The scheduled rebuild uses fresh base pulls so patched Ubuntu/package layers can flow into a new image even when this repository has no source changes.
@@ -77,6 +75,10 @@ The image includes a small Playwright wrapper:
 ```bash
 node /usr/local/lib/browser-cli.mjs '{"action":"open","url":"https://example.com"}'
 ```
+
+Taurus containers remain rootful overall so agents can keep using `apt-get` and normal root-owned workflows. Chromium itself is launched under a dedicated `taurus-browser` user with writable home/cache/profile/state directories, so the browser sandbox stays enabled and Taurus no longer relies on `--no-sandbox`.
+
+That browser sandbox still depends on the Docker host allowing unprivileged user namespaces. Taurus now fails fast with a clear error when `kernel.unprivileged_userns_clone=0` or `user.max_user_namespaces=0`, instead of silently implying the sandbox will work everywhere. Provision Taurus nodes with `kernel.unprivileged_userns_clone=1` and a positive `user.max_user_namespaces` value.
 
 ## Notes
 

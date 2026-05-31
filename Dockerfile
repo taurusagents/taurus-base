@@ -87,9 +87,26 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Dedicated browser user/state ──
+# Taurus containers stay rootful overall so agents can apt-get and own the box,
+# but Chromium itself runs as a separate non-root user with its own writable
+# home/cache/profile directories. The host kernel still needs unprivileged user
+# namespaces enabled so Chromium's sandbox can start under no-new-privileges.
+RUN useradd -r -m -d /home/taurus-browser -s /usr/sbin/nologin taurus-browser \
+    && mkdir -p /home/taurus-browser/.cache \
+        /home/taurus-browser/.config \
+        /home/taurus-browser/.local/state \
+        /home/taurus-browser/.local/share \
+        /tmp/taurus-browser-runtime \
+        /ms-playwright \
+    && chown -R taurus-browser:taurus-browser /home/taurus-browser /tmp/taurus-browser-runtime /ms-playwright \
+    && chmod 700 /tmp/taurus-browser-runtime
+
 # ── Playwright + Chromium ──
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npm install -g playwright@1.60.0 \
-    && playwright install --with-deps chromium
+    && playwright install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright
 
 # ── Browser CLI helper ──
 COPY browser-cli.mjs /usr/local/lib/browser-cli.mjs
