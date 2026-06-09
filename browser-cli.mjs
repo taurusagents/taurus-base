@@ -28,7 +28,12 @@ import { execFileSync, spawn } from 'child_process';
 const STATE_FILE = '/tmp/.browser-cli.json';
 const CDP_PORT = 9222;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36';
-const VIEWPORT = { width: 1280, height: 720 };
+const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+const MAX_VIEWPORT_DIM = 1568;
+// Keep screenshot JSON/base64 payloads below the Browser tool's 5,000,000-character
+// stdout transport budget. Random-noise probes showed 1280x900 remains safely under
+// the limit while larger common viewports such as 1440x900 can exceed it.
+const MAX_VIEWPORT_AREA = 1_152_000;
 const BROWSER_USER = process.env.TAURUS_BROWSER_USER || 'taurus-browser';
 const BROWSER_HOME = process.env.TAURUS_BROWSER_HOME || `/home/${BROWSER_USER}`;
 const BROWSER_PROFILE_DIR = `${BROWSER_HOME}/.config/chromium-profile`;
@@ -156,7 +161,12 @@ function loadState() {
 }
 
 function saveState(state) {
-  writeFileSync(STATE_FILE, JSON.stringify(state), 'utf-8');
+  const viewport = normalizeViewport(state?.viewport) || DEFAULT_VIEWPORT;
+  const nextState = { viewport };
+  if (typeof state?.cdpUrl === 'string' && state.cdpUrl.length > 0) {
+    nextState.cdpUrl = state.cdpUrl;
+  }
+  writeFileSync(STATE_FILE, JSON.stringify(nextState), 'utf-8');
 }
 
 function clearState() {
@@ -171,23 +181,77 @@ function closeBrowserProcess() {
   }
 }
 
+function normalizeViewport(value) {
+  const width = Number(value?.width);
+  const height = Number(value?.height);
+  if (getViewportValidationError(width, height)) {
+    return null;
+  }
+  return { width, height };
+}
+
+function getViewportValidationError(width, height) {
+  if (
+    !Number.isInteger(width)
+    || width < 1
+    || width > MAX_VIEWPORT_DIM
+    || !Number.isInteger(height)
+    || height < 1
+    || height > MAX_VIEWPORT_DIM
+    || width * height > MAX_VIEWPORT_AREA
+  ) {
+    return `"width" and "height" are required integers between 1 and ${MAX_VIEWPORT_DIM}, and width × height must not exceed ${MAX_VIEWPORT_AREA} CSS pixels so screenshot payloads stay within the current transport budget.`;
+  }
+  return null;
+}
+
+function throwValidationError(message) {
+  throw new Error(message);
+}
+
+function getPersistedViewport(state) {
+  return normalizeViewport(state?.viewport) || DEFAULT_VIEWPORT;
+}
+
+async function ensurePageViewport(page, viewport) {
+  const current = page.viewportSize();
+  if (!current || current.width !== viewport.width || current.height !== viewport.height) {
+    await page.setViewportSize(viewport);
+  }
+  return page.viewportSize() || viewport;
+}
+
+async function getRealViewport(page) {
+  return page.viewportSize()
+    || normalizeViewport(await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight })))
+    || DEFAULT_VIEWPORT;
+}
+
+async function ensurePrimaryPage(browser, viewport) {
+  const contexts = browser.contexts();
+  const ctx = contexts[0] || await browser.newContext({ viewport, userAgent: USER_AGENT });
+  const pages = ctx.pages();
+  const page = pages[0] || await ctx.newPage();
+  const appliedViewport = await ensurePageViewport(page, viewport);
+  return { page, viewport: appliedViewport };
+}
+
 // ── Launch or connect to Chromium ──
 
 async function ensureBrowser() {
   const state = loadState();
+  const desiredViewport = getPersistedViewport(state);
 
   // Try reconnecting to existing browser
   if (state?.cdpUrl) {
     try {
       const browser = await chromium.connectOverCDP(state.cdpUrl, { timeout: 3000 });
-      const contexts = browser.contexts();
-      const ctx = contexts[0] || await browser.newContext({ viewport: VIEWPORT, userAgent: USER_AGENT });
-      const pages = ctx.pages();
-      const page = pages[0] || await ctx.newPage();
+      const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
+      saveState({ cdpUrl: state.cdpUrl, viewport });
       return { browser, page };
     } catch {
-      // Browser died — clean up and launch fresh
-      clearState();
+      // Browser died — drop the stale connection details but preserve the last viewport choice.
+      saveState({ viewport: desiredViewport });
     }
   }
 
@@ -225,10 +289,9 @@ async function ensureBrowser() {
   }
 
   const browser = await chromium.connectOverCDP(cdpUrl);
-  const ctx = browser.contexts()[0] || await browser.newContext({ viewport: VIEWPORT, userAgent: USER_AGENT });
-  const page = ctx.pages()[0] || await ctx.newPage();
+  const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
 
-  saveState({ cdpUrl });
+  saveState({ cdpUrl, viewport });
   return { browser, page };
 }
 
@@ -243,12 +306,19 @@ async function handleAction(input) {
     return 'Browser closed.';
   }
 
+  if (action === 'resize') {
+    const validationError = getViewportValidationError(Number(input.width), Number(input.height));
+    if (validationError) {
+      throwValidationError(validationError);
+    }
+  }
+
   const { browser, page } = await ensureBrowser();
 
   try {
     switch (action) {
       case 'open': {
-        if (!input.url) return 'Error: "url" is required.';
+        if (!input.url) throwValidationError('"url" is required.');
         const response = await page.goto(input.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         const status = response?.status() ?? 'unknown';
         const title = await page.title();
@@ -273,28 +343,28 @@ async function handleAction(input) {
       }
 
       case 'click': {
-        if (!input.selector) return 'Error: "selector" is required.';
+        if (!input.selector) throwValidationError('"selector" is required.');
         await page.click(input.selector, { timeout: 5000 });
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         return `Clicked: ${input.selector}`;
       }
 
       case 'type': {
-        if (!input.selector) return 'Error: "selector" is required.';
-        if (input.text === undefined) return 'Error: "text" is required.';
+        if (!input.selector) throwValidationError('"selector" is required.');
+        if (input.text === undefined) throwValidationError('"text" is required.');
         await page.fill(input.selector, input.text, { timeout: 5000 });
         return `Typed into ${input.selector}: "${input.text}"`;
       }
 
       case 'select': {
-        if (!input.selector) return 'Error: "selector" is required.';
-        if (!input.values?.length) return 'Error: "values" is required.';
+        if (!input.selector) throwValidationError('"selector" is required.');
+        if (!input.values?.length) throwValidationError('"values" is required.');
         await page.selectOption(input.selector, input.values, { timeout: 5000 });
         return `Selected ${input.values.join(', ')} in ${input.selector}`;
       }
 
       case 'hover': {
-        if (!input.selector) return 'Error: "selector" is required.';
+        if (!input.selector) throwValidationError('"selector" is required.');
         await page.hover(input.selector, { timeout: 5000 });
         return `Hovered: ${input.selector}`;
       }
@@ -303,12 +373,24 @@ async function handleAction(input) {
         const buffer = await page.screenshot({ fullPage: false });
         const title = await page.title();
         const url = page.url();
+        const viewport = await getRealViewport(page);
         return JSON.stringify({
           __type: 'screenshot',
-          text: `Screenshot of "${title}" (${url})\nViewport: 1280x720, ${buffer.length} bytes`,
+          text: `Screenshot of "${title}" (${url})\nViewport: ${viewport.width}x${viewport.height}, ${buffer.length} bytes`,
           base64: buffer.toString('base64'),
           mediaType: 'image/png',
         });
+      }
+
+      case 'resize': {
+        const viewport = normalizeViewport(input);
+        if (!viewport) {
+          throwValidationError(getViewportValidationError(Number(input.width), Number(input.height)));
+        }
+        await page.setViewportSize(viewport);
+        const appliedViewport = await getRealViewport(page);
+        saveState({ ...loadState(), viewport: appliedViewport });
+        return `Viewport resized to ${appliedViewport.width}x${appliedViewport.height}`;
       }
 
       case 'scroll': {
@@ -335,13 +417,13 @@ async function handleAction(input) {
       }
 
       case 'evaluate': {
-        if (!input.expression) return 'Error: "expression" is required.';
+        if (!input.expression) throwValidationError('"expression" is required.');
         const result = await page.evaluate(input.expression);
         return typeof result === 'string' ? result : JSON.stringify(result, null, 2) ?? 'undefined';
       }
 
       case 'press': {
-        if (!input.key) return 'Error: "key" is required.';
+        if (!input.key) throwValidationError('"key" is required.');
         if (input.selector) {
           await page.press(input.selector, input.key, { timeout: 5000 });
         } else {
@@ -351,14 +433,14 @@ async function handleAction(input) {
       }
 
       case 'upload': {
-        if (!input.selector) return 'Error: "selector" is required.';
-        if (!input.files?.length) return 'Error: "files" is required (array of paths).';
+        if (!input.selector) throwValidationError('"selector" is required.');
+        if (!input.files?.length) throwValidationError('"files" is required (array of paths).');
         await page.setInputFiles(input.selector, input.files, { timeout: 5000 });
         return `Uploaded ${input.files.length} file(s) to ${input.selector}: ${input.files.join(', ')}`;
       }
 
       default:
-        return `Error: Unknown action "${action}"`;
+        throwValidationError(`Unknown action "${action}"`);
     }
   } finally {
     // Disconnect CDP but leave Chromium running

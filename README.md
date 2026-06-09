@@ -82,6 +82,8 @@ Taurus containers remain rootful overall so agents can keep using `apt-get` and 
 
 That browser sandbox still depends on the Docker host allowing unprivileged user namespaces. Taurus now fails fast with a clear error when `kernel.unprivileged_userns_clone=0` or `user.max_user_namespaces=0`, instead of silently implying the sandbox will work everywhere. Provision Taurus nodes with `kernel.unprivileged_userns_clone=1` and a positive `user.max_user_namespaces` value.
 
+Helper-level validation failures and unknown actions exit nonzero so Taurus can surface them as tool errors. The `resize` action accepts viewport dimensions only in the range `1..1568` per axis, and also requires `width × height <= 1,152,000` so screenshot JSON/base64 payloads stay within the Browser tool's current 5,000,000-character output budget.
+
 ## Notes
 
 - This repo currently has **no license**.
