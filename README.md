@@ -80,7 +80,9 @@ node /usr/local/lib/browser-cli.mjs '{"action":"open","url":"https://example.com
 
 Taurus containers remain rootful overall so agents can keep using `apt-get` and normal root-owned workflows. Chromium itself is launched under a dedicated `taurus-browser` user with writable home/cache/profile/state directories, so the browser sandbox stays enabled and Taurus no longer relies on `--no-sandbox`.
 
-That browser sandbox still depends on the Docker host allowing unprivileged user namespaces. Taurus now fails fast with a clear error when `kernel.unprivileged_userns_clone=0` or `user.max_user_namespaces=0`, instead of silently implying the sandbox will work everywhere. Provision Taurus nodes with `kernel.unprivileged_userns_clone=1` and a positive `user.max_user_namespaces` value.
+That browser sandbox depends on both host kernel settings and container runtime policy. The host must allow unprivileged user namespaces (`kernel.unprivileged_userns_clone=1` and a positive `user.max_user_namespaces`), and the container runtime must use a seccomp policy that permits Chromium's required `unshare(CLONE_NEWUSER)` / `clone(...CLONE_NEWUSER...)` sandbox paths. Taurus fails fast when the probe is blocked so operators are not misled into blaming sysctls alone.
+
+Taurus's runtime fix is to keep the default Docker AppArmor profile, keep `no-new-privileges` and the reduced capability allowlist, and supply a Taurus-managed seccomp profile for agent containers. Do not switch to `seccomp=unconfined`, `apparmor=unconfined`, or `--no-sandbox` as the steady-state fix.
 
 Helper-level validation failures and unknown actions exit nonzero so Taurus can surface them as tool errors. The `resize` action accepts viewport dimensions only in the range `1..1568` per axis, and also requires `width × height <= 1,152,000` so screenshot JSON/base64 payloads stay within the Browser tool's current 5,000,000-character output budget.
 

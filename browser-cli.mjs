@@ -45,7 +45,7 @@ let browserIdentityCache = null;
 
 function browserSandboxConfigurationError(detail) {
   return new Error(
-    `Chromium sandbox prerequisites are not available (${detail}). Taurus keeps Chromium sandboxing enabled and does not fall back to --no-sandbox. Configure the Docker host with kernel.unprivileged_userns_clone=1 and user.max_user_namespaces > 0, then recreate the container if needed.`,
+    `Chromium sandbox prerequisites are not available (${detail}). Taurus keeps Chromium sandboxing enabled and does not fall back to --no-sandbox. Ensure the Docker host allows unprivileged user namespaces (kernel.unprivileged_userns_clone=1 and user.max_user_namespaces > 0) and that the container runtime security policy is compatible with Chromium's user-namespace sandbox (especially the seccomp profile, not just the sysctls), then recreate the container if needed.`,
   );
 }
 
