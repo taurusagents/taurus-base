@@ -1,4 +1,4 @@
-name: Publish image
+name: Publish images
 
 on:
   push:
@@ -20,6 +20,18 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_key: base
+            image: ghcr.io/taurusagents/taurus-base
+            dockerfile: Dockerfile
+            smoke_tag: taurus-base-smoke
+          - image_key: subscription
+            image: ghcr.io/taurusagents/taurus-base-subscription
+            dockerfile: Dockerfile.subscription
+            smoke_tag: taurus-base-subscription-smoke
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -38,7 +50,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
-          images: ghcr.io/taurusagents/taurus-base
+          images: ${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,enable=${{ github.event_name != 'schedule' }}
@@ -48,22 +60,43 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           load: true
           pull: true
-          tags: taurus-base-smoke
+          tags: ${{ matrix.smoke_tag }}
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Smoke test image
         run: |
-          docker run --rm taurus-base-smoke bash -lc "
-            python3 --version &&
-            node --version &&
-            go version &&
-            rg --version &&
-            fd --version &&
-            playwright --version &&
-            node -e 'const { chromium } = require(\"playwright\"); (async () => { const browser = await chromium.launch({ headless: true }); await browser.close(); })().catch((error) => { console.error(error); process.exit(1); });'
-          "
+          case "${{ matrix.image_key }}" in
+            base)
+              docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
+                python3 --version &&
+                node --version &&
+                go version &&
+                rg --version &&
+                fd --version &&
+                playwright --version &&
+                node -e 'const { chromium } = require(\"playwright\"); (async () => { const browser = await chromium.launch({ headless: true }); await browser.close(); })().catch((error) => { console.error(error); process.exit(1); });'
+              "
+              ;;
+            subscription)
+              docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
+                python3 --version &&
+                node --version &&
+                claude --version | tee /tmp/claude-version &&
+                grep -F '2.1.198' /tmp/claude-version &&
+                codex --version | tee /tmp/codex-version &&
+                grep -F '0.142.5' /tmp/codex-version &&
+                test -f /usr/local/lib/taurus-subscription/runtime-versions.json &&
+                node -e 'const manifest = require(\"/usr/local/lib/taurus-subscription/runtime-versions.json\"); if (manifest.claudeCode !== \"2.1.198\" || manifest.codex !== \"0.142.5\" || manifest.mcpSdk !== \"1.29.0\") { console.error(JSON.stringify(manifest)); process.exit(1); } console.log(JSON.stringify(manifest)); console.log(require.resolve(\"@modelcontextprotocol/sdk/server/index.js\"));'
+              "
+              ;;
+            *)
+              echo "Unknown image key: ${{ matrix.image_key }}" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Tag and push smoked image
         env:
@@ -71,6 +104,6 @@ jobs:
         run: |
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
-            docker tag taurus-base-smoke "$tag"
+            docker tag "${{ matrix.smoke_tag }}" "$tag"
             docker push "$tag"
           done <<< "$IMAGE_TAGS"
