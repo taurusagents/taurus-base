@@ -1,0 +1,48 @@
+# Taurus-managed subscription sidecar image
+# Build: docker build -f Dockerfile.subscription -t taurus-base-subscription .
+# Usage: hidden Taurus subscription sidecars use this image instead of the
+# user-visible default agent container image.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Keep the image minimal but compatible with the baked Claude/Codex CLIs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    fd-find \
+    file \
+    git \
+    gnupg \
+    jq \
+    python3 \
+    python3-venv \
+    ripgrep \
+    && ln -s $(which fdfind) /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Match Taurus base's pinned Node.js stream so the subscription sidecar moves on
+# the same deliberate review cadence as the main Taurus image family.
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs=24.15.0-1nodesource1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
+RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-versions.json'); ['@anthropic-ai/claude-code@' + versions.claudeCode, '@openai/codex@' + versions.codex, '@modelcontextprotocol/sdk@' + versions.mcpSdk].join(' ')") \
+    && npm install -g ${packages} \
+    && mkdir -p /usr/local/lib/taurus-subscription \
+    && cp /tmp/subscription-runtime-versions.json /usr/local/lib/taurus-subscription/runtime-versions.json \
+    && rm -f /tmp/subscription-runtime-versions.json
+
+ENV NODE_PATH=/usr/lib/node_modules
+
+# Taurus intentionally keeps wrapper/helper assets app-mounted under
+# /provider/taurus-mcp so wrapper changes can ship without rebuilding this image.
+WORKDIR /provider
