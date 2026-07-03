@@ -84,6 +84,12 @@ jobs:
               docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
                 python3 --version &&
                 node --version &&
+                sqlite3 --version &&
+                tmp_db=\$(mktemp /tmp/codex-rollout.XXXXXX.sqlite) &&
+                sqlite3 \"\$tmp_db\" \"CREATE TABLE threads (id TEXT, rollout_path TEXT, updated_at TEXT); INSERT INTO threads (id, rollout_path, updated_at) VALUES ('thread-1', 'sessions/run/rollout.jsonl', '2026-01-01T00:00:00Z');\" &&
+                sqlite3 -readonly \"\$tmp_db\" \"SELECT rollout_path FROM threads WHERE id = 'thread-1' ORDER BY updated_at DESC;\" | tee /tmp/sqlite-rollout &&
+                grep -F 'sessions/run/rollout.jsonl' /tmp/sqlite-rollout &&
+                rm -f \"\$tmp_db\" &&
                 claude --version | tee /tmp/claude-version &&
                 grep -F '2.1.198' /tmp/claude-version &&
                 codex --version | tee /tmp/codex-version &&
