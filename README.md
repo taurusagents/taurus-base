@@ -59,8 +59,8 @@ Taurus expects inside the sidecar:
 
 - Node.js 24
 - Python 3
-- `@anthropic-ai/claude-code@2.1.198`
-- `@openai/codex@0.142.5`
+- `@anthropic-ai/claude-code@2.1.207`
+- `@openai/codex@0.144.1`
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
 
