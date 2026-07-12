@@ -12,6 +12,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile` — the default Taurus agent image definition
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
+- `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --stdio`
 - `patches/codex-local-compaction.patch` — Taurus staging patch applied to the pinned Codex source build
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
@@ -67,9 +68,12 @@ Taurus expects inside the sidecar:
 
 The subscription Dockerfile now clones the pinned upstream Codex source,
 applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
-builds the `codex` binary in a throwaway builder stage, and then smoke-tests
-`codex --help` / `codex --version` inside the final image so publish/builds fail
-fast if the patched binary cannot start in the runtime container.
+builds the `codex` binary in a throwaway builder stage, and then runs
+[`codex-app-server-smoke.mjs`](codex-app-server-smoke.mjs) to smoke-test
+`codex --version` plus a real `codex app-server --stdio` JSON-RPC
+`initialize`/`getAuthStatus` probe inside the final image so publish/builds fail
+fast if the patched binary cannot start on the same app-server path Taurus uses
+at runtime.
 
 Pull it with:
 

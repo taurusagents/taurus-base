@@ -81,6 +81,7 @@ RUN mkdir -p /etc/apt/keyrings \
 
 COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
+COPY codex-app-server-smoke.mjs /tmp/codex-app-server-smoke.mjs
 COPY --from=codex-builder /out/codex /usr/local/bin/codex
 RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-versions.json'); ['@anthropic-ai/claude-code@' + versions.claudeCode, '@modelcontextprotocol/sdk@' + versions.mcpSdk].join(' ')") \
     && npm install -g ${packages} \
@@ -89,13 +90,13 @@ RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-vers
     && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
     && rm -f /tmp/subscription-runtime-versions.json /tmp/codex-local-compaction.patch
 
-# Fail the image build immediately if the patched Codex binary cannot start in
-# the final subscription runtime image.
+# Fail the image build immediately if the patched Codex binary cannot start the
+# same stdio app-server Taurus uses in subscription sidecars.
 RUN chmod 0755 /usr/local/bin/codex \
-    && codex --help >/tmp/codex-help \
-    && test -s /tmp/codex-help \
     && codex --version | tee /tmp/codex-version \
-    && grep -F '0.144.1' /tmp/codex-version
+    && grep -F '0.144.1' /tmp/codex-version \
+    && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/local/bin/codex \
+    && rm -f /tmp/codex-app-server-smoke.mjs
 
 ENV NODE_PATH=/usr/lib/node_modules
 
