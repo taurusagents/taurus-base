@@ -1,0 +1,17 @@
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index b34085aa7..41ecf3816 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -84,8 +84,10 @@ pub(crate) async fn build_compaction_initial_context(
+     }
+ }
+ 
+-pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
+-    provider.supports_remote_compaction()
++pub(crate) fn should_use_remote_compact_task(_provider: &ModelProviderInfo) -> bool {
++    // Taurus staging experiment: force local compaction so the summary is emitted client-side
++    // instead of being hidden behind the remote compaction task.
++    false
+ }
+ 
+ pub(crate) async fn run_inline_auto_compact_task(

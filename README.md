@@ -12,6 +12,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile` — the default Taurus agent image definition
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
+- `patches/codex-local-compaction.patch` — Taurus staging patch applied to the pinned Codex source build
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
 ## `taurus-base`
@@ -60,9 +61,15 @@ Taurus expects inside the sidecar:
 - Node.js 24
 - Python 3
 - `@anthropic-ai/claude-code@2.1.207`
-- `@openai/codex@0.144.1`
+- patched source build of `openai/codex` `rust-v0.144.1` (remote compaction forced local for Taurus staging)
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
+
+The subscription Dockerfile now clones the pinned upstream Codex source,
+applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
+builds the `codex` binary in a throwaway builder stage, and then smoke-tests
+`codex --help` / `codex --version` inside the final image so publish/builds fail
+fast if the patched binary cannot start in the runtime container.
 
 Pull it with:
 
