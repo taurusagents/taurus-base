@@ -3,6 +3,50 @@
 # Usage: hidden Taurus subscription sidecars use this image instead of the
 # user-visible default agent container image.
 
+ARG CODEX_GIT_REF=rust-v0.144.1
+ARG CODEX_GIT_COMMIT=44918ea10c0f99151c6710411b4322c2f5c96bea
+ARG CODEX_RUST_VERSION=1.95.0
+ARG CODEX_BUILD_JOBS=1
+
+FROM ubuntu:22.04 AS codex-builder
+
+ARG CODEX_GIT_REF
+ARG CODEX_GIT_COMMIT
+ARG CODEX_RUST_VERSION
+ARG CODEX_BUILD_JOBS
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/root/.cargo/bin:${PATH}
+
+# Keep Codex build dependencies in a throwaway stage so the runtime image stays
+# small while still compiling the pinned upstream source reproducibly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    curl \
+    git \
+    libcap-dev \
+    libclang-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
+# Upstream rust-v0.144.1 still refreshes internal workspace package versions in
+# Cargo.lock during build, so `cargo build --locked` fails on the pinned tag.
+# Build from the pinned commit anyway. `CODEX_BUILD_JOBS` defaults to 1 for
+# memory-constrained builders but can be overridden by CI/staging.
+RUN curl -fsSL https://sh.rustup.rs | bash -s -- -y --profile minimal --default-toolchain ${CODEX_RUST_VERSION} \
+    && git clone --depth 1 --branch ${CODEX_GIT_REF} https://github.com/openai/codex.git /tmp/codex-src \
+    && cd /tmp/codex-src \
+    && test "$(git rev-parse HEAD)" = "${CODEX_GIT_COMMIT}" \
+    && git apply /tmp/codex-local-compaction.patch \
+    && cd codex-rs \
+    && cargo build --release -j ${CODEX_BUILD_JOBS} -p codex-cli --bin codex \
+    && install -D target/release/codex /out/codex
+
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -38,11 +82,24 @@ RUN mkdir -p /etc/apt/keyrings \
     && rm -rf /var/lib/apt/lists/*
 
 COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
-RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-versions.json'); ['@anthropic-ai/claude-code@' + versions.claudeCode, '@openai/codex@' + versions.codex, '@modelcontextprotocol/sdk@' + versions.mcpSdk].join(' ')") \
+COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
+COPY codex-app-server-smoke.mjs /tmp/codex-app-server-smoke.mjs
+COPY --from=codex-builder /out/codex /usr/bin/codex
+RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-versions.json'); ['@anthropic-ai/claude-code@' + versions.claudeCode, '@modelcontextprotocol/sdk@' + versions.mcpSdk].join(' ')") \
     && npm install -g ${packages} \
+    && ln -sf /usr/bin/codex /usr/local/bin/codex \
     && mkdir -p /usr/local/lib/taurus-subscription \
     && cp /tmp/subscription-runtime-versions.json /usr/local/lib/taurus-subscription/runtime-versions.json \
-    && rm -f /tmp/subscription-runtime-versions.json
+    && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
+    && rm -f /tmp/subscription-runtime-versions.json /tmp/codex-local-compaction.patch
+
+# Fail the image build immediately if the patched Codex binary cannot start the
+# same stdio app-server Taurus uses in subscription sidecars.
+RUN chmod 0755 /usr/bin/codex \
+    && /usr/bin/codex --version | tee /tmp/codex-version \
+    && grep -F '0.144.1' /tmp/codex-version \
+    && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
+    && rm -f /tmp/codex-app-server-smoke.mjs
 
 ENV NODE_PATH=/usr/lib/node_modules
 

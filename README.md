@@ -12,6 +12,8 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile` — the default Taurus agent image definition
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
+- `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --listen stdio://`
+- `patches/codex-local-compaction.patch` — Taurus staging patch that forces local compaction and exposes the plain summary body (without Codex's internal `SUMMARY_PREFIX` boilerplate; omitted entirely when empty) as `summary` on the app-server v2 `contextCompaction` wire item
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
 ## `taurus-base`
@@ -60,9 +62,22 @@ Taurus expects inside the sidecar:
 - Node.js 24
 - Python 3
 - `@anthropic-ai/claude-code@2.1.207`
-- `@openai/codex@0.144.1`
+- patched source build of `openai/codex` `rust-v0.144.1` (remote compaction forced local for Taurus staging)
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
+
+The subscription Dockerfile now clones the pinned upstream Codex source,
+applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
+builds the `codex` binary in a throwaway builder stage, and then runs
+[`codex-app-server-smoke.mjs`](codex-app-server-smoke.mjs) to smoke-test
+`/usr/bin/codex --version` plus a real `/usr/bin/codex app-server --listen
+stdio://` JSON-RPC `initialize`/`getAuthStatus` probe inside the final image so
+publish/builds fail fast if the patched binary cannot start on the same path
+and argv Taurus uses at runtime.
+
+The builder defaults to `CODEX_BUILD_JOBS=1` for memory-constrained hosts; pass
+`--build-arg CODEX_BUILD_JOBS=4` (or similar) on larger builders to speed up the
+Rust compile.
 
 Pull it with:
 
@@ -74,6 +89,8 @@ Build it locally with:
 
 ```bash
 docker build -f Dockerfile.subscription -t taurus-base-subscription .
+# or, on a roomier builder:
+docker build -f Dockerfile.subscription --build-arg CODEX_BUILD_JOBS=4 -t taurus-base-subscription .
 ```
 
 Smoke test it with:
