@@ -70,10 +70,10 @@ The subscription Dockerfile now clones the pinned upstream Codex source,
 applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
 builds the `codex` binary in a throwaway builder stage, and then runs
 [`codex-app-server-smoke.mjs`](codex-app-server-smoke.mjs) to smoke-test
-`codex --version` plus a real `codex app-server --stdio` JSON-RPC
-`initialize`/`getAuthStatus` probe inside the final image so publish/builds fail
-fast if the patched binary cannot start on the same app-server path Taurus uses
-at runtime.
+`/usr/bin/codex --version` plus a real `/usr/bin/codex app-server --listen
+stdio://` JSON-RPC `initialize`/`getAuthStatus` probe inside the final image so
+publish/builds fail fast if the patched binary cannot start on the same path
+and argv Taurus uses at runtime.
 
 Pull it with:
 

@@ -2,9 +2,10 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 
 // Build-time smoke test for the exact runtime path Taurus uses: start the
-// stdio app-server, complete the JSON-RPC initialize handshake, then issue one
-// lightweight request (`getAuthStatus`) to prove the server is actually live.
-const codexBin = process.argv[2] || 'codex';
+// app-server with `--listen stdio://`, complete the JSON-RPC initialize
+// handshake, then issue one lightweight request (`getAuthStatus`) to prove the
+// server is actually live.
+const codexBin = process.argv[2] || '/usr/bin/codex';
 const codexHome = process.env.CODEX_HOME;
 
 if (!codexHome) {
@@ -15,7 +16,7 @@ if (!codexHome) {
 fs.rmSync(codexHome, { recursive: true, force: true });
 fs.mkdirSync(codexHome, { recursive: true });
 
-const child = spawn(codexBin, ['app-server', '--stdio'], {
+const child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
   env: process.env,
   stdio: ['pipe', 'pipe', 'pipe'],
 });
