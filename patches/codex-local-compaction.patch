@@ -1,17 +1,192 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+index ca8487b..00d8ee7 100644
+--- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
++++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+@@ -1119,7 +1119,7 @@ impl ThreadHistoryBuilder {
+ 
+     fn handle_context_compacted(&mut self, _payload: &ContextCompactedEvent) {
+         let id = self.next_item_id();
+-        self.push_item_in_current_turn(ThreadItem::ContextCompaction { id });
++        self.push_item_in_current_turn(ThreadItem::ContextCompaction { id, summary: None });
+     }
+ 
+     fn handle_entered_review_mode(
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/item.rs b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
+index 7a5e4dc..ef6859a 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/item.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
+@@ -392,6 +392,9 @@ pub enum ThreadItem {
+     #[ts(rename_all = "camelCase")]
+     ContextCompaction {
+         id: String,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        summary: Option<String>,
+     },
+ }
+ 
+@@ -967,9 +970,10 @@ impl From<CoreTurnItem> for ThreadItem {
+                     duration_ms,
+                 }
+             }
+-            CoreTurnItem::ContextCompaction(compaction) => {
+-                ThreadItem::ContextCompaction { id: compaction.id }
+-            }
++            CoreTurnItem::ContextCompaction(compaction) => ThreadItem::ContextCompaction {
++                id: compaction.id,
++                summary: compaction.summary,
++            },
+         }
+     }
+ }
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+index d35d39f..4cfedc2 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+@@ -258,6 +258,7 @@ fn thread_items_list_round_trips() {
+     let response = ThreadItemsListResponse {
+         data: vec![ThreadItem::ContextCompaction {
+             id: "item_1".to_string(),
++            summary: None,
+         }],
+         next_cursor: None,
+         backwards_cursor: Some("cursor_0".to_string()),
+@@ -272,6 +273,21 @@ fn thread_items_list_round_trips() {
+         })
+     );
+ 
++    let summary_item = ThreadItem::from(TurnItem::ContextCompaction(
++        codex_protocol::items::ContextCompactionItem {
++            id: "item_2".to_string(),
++            summary: Some("summary body".to_string()),
++        },
++    ));
++    assert_eq!(
++        serde_json::to_value(&summary_item).expect("serialize summary item"),
++        json!({
++            "type": "contextCompaction",
++            "id": "item_2",
++            "summary": "summary body",
++        })
++    );
++
+     let params_without_turn = ThreadItemsListParams {
+         thread_id: "thr_123".to_string(),
+         turn_id: None,
+diff --git a/codex-rs/app-server/tests/suite/v2/compaction.rs b/codex-rs/app-server/tests/suite/v2/compaction.rs
+index a534912..a9f040e 100644
+--- a/codex-rs/app-server/tests/suite/v2/compaction.rs
++++ b/codex-rs/app-server/tests/suite/v2/compaction.rs
+@@ -95,10 +95,13 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
+     let started = wait_for_context_compaction_started(&mut mcp).await?;
+     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+ 
+-    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
++    let ThreadItem::ContextCompaction { id: started_id, .. } = started.item else {
+         unreachable!("started item should be context compaction");
+     };
+-    let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
++    let ThreadItem::ContextCompaction {
++        id: completed_id, ..
++    } = completed.item
++    else {
+         unreachable!("completed item should be context compaction");
+     };
+ 
+@@ -182,10 +185,13 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+     let started = wait_for_context_compaction_started(&mut mcp).await?;
+     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+ 
+-    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
++    let ThreadItem::ContextCompaction { id: started_id, .. } = started.item else {
+         unreachable!("started item should be context compaction");
+     };
+-    let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
++    let ThreadItem::ContextCompaction {
++        id: completed_id, ..
++    } = completed.item
++    else {
+         unreachable!("completed item should be context compaction");
+     };
+ 
+@@ -300,10 +306,13 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
+     let started = wait_for_context_compaction_started(&mut mcp).await?;
+     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+ 
+-    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
++    let ThreadItem::ContextCompaction { id: started_id, .. } = started.item else {
+         unreachable!("started item should be context compaction");
+     };
+-    let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
++    let ThreadItem::ContextCompaction {
++        id: completed_id, ..
++    } = completed.item
++    else {
+         unreachable!("completed item should be context compaction");
+     };
+ 
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index b34085aa7..41ecf3816 100644
+index d2a9fd5..c6b0da5 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -84,8 +84,10 @@ pub(crate) async fn build_compaction_initial_context(
+@@ -224,9 +224,12 @@ async fn run_compact_task_inner_impl(
+     initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+ ) -> CodexResult<String> {
+-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+-    sess.emit_turn_item_started(&turn_context, &compaction_item)
+-        .await;
++    let compaction_item = ContextCompactionItem::new();
++    sess.emit_turn_item_started(
++        &turn_context,
++        &TurnItem::ContextCompaction(compaction_item.clone()),
++    )
++    .await;
+     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+ 
+     let mut history = sess.clone_history().await;
+@@ -367,8 +370,11 @@ async fn run_compact_task_inner_impl(
+     .await;
+     sess.recompute_token_usage(&turn_context).await;
+ 
+-    sess.emit_turn_item_completed(&turn_context, compaction_item)
+-        .await;
++    sess.emit_turn_item_completed(
++        &turn_context,
++        TurnItem::ContextCompaction(compaction_item.with_summary(summary_text.clone())),
++    )
++    .await;
+     let warning = EventMsg::Warning(WarningEvent {
+         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+     });
+diff --git a/codex-rs/protocol/src/items.rs b/codex-rs/protocol/src/items.rs
+index a65bd97..c6b026a 100644
+--- a/codex-rs/protocol/src/items.rs
++++ b/codex-rs/protocol/src/items.rs
+@@ -407,6 +407,9 @@ pub struct McpToolCallError {
+ #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
+ pub struct ContextCompactionItem {
+     pub id: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub summary: Option<String>,
+ }
+ 
+ fn new_item_id() -> String {
+@@ -415,7 +418,15 @@ fn new_item_id() -> String {
+ 
+ impl ContextCompactionItem {
+     pub fn new() -> Self {
+-        Self { id: new_item_id() }
++        Self {
++            id: new_item_id(),
++            summary: None,
++        }
++    }
++
++    pub fn with_summary(mut self, summary: String) -> Self {
++        self.summary = Some(summary);
++        self
      }
  }
  
--pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
--    provider.supports_remote_compaction()
-+pub(crate) fn should_use_remote_compact_task(_provider: &ModelProviderInfo) -> bool {
-+    // Taurus staging experiment: force local compaction so the summary is emitted client-side
-+    // instead of being hidden behind the remote compaction task.
-+    false
- }
- 
- pub(crate) async fn run_inline_auto_compact_task(

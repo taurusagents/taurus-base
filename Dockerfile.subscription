@@ -6,12 +6,14 @@
 ARG CODEX_GIT_REF=rust-v0.144.1
 ARG CODEX_GIT_COMMIT=44918ea10c0f99151c6710411b4322c2f5c96bea
 ARG CODEX_RUST_VERSION=1.95.0
+ARG CODEX_BUILD_JOBS=1
 
 FROM ubuntu:22.04 AS codex-builder
 
 ARG CODEX_GIT_REF
 ARG CODEX_GIT_COMMIT
 ARG CODEX_RUST_VERSION
+ARG CODEX_BUILD_JOBS
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/root/.cargo/bin:${PATH}
@@ -34,15 +36,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
 # Upstream rust-v0.144.1 still refreshes internal workspace package versions in
 # Cargo.lock during build, so `cargo build --locked` fails on the pinned tag.
-# Build from the pinned commit anyway, and cap jobs to keep memory usage stable
-# on memory-constrained builders.
+# Build from the pinned commit anyway. `CODEX_BUILD_JOBS` defaults to 1 for
+# memory-constrained builders but can be overridden by CI/staging.
 RUN curl -fsSL https://sh.rustup.rs | bash -s -- -y --profile minimal --default-toolchain ${CODEX_RUST_VERSION} \
     && git clone --depth 1 --branch ${CODEX_GIT_REF} https://github.com/openai/codex.git /tmp/codex-src \
     && cd /tmp/codex-src \
     && test "$(git rev-parse HEAD)" = "${CODEX_GIT_COMMIT}" \
     && git apply /tmp/codex-local-compaction.patch \
     && cd codex-rs \
-    && cargo build --release -j 1 -p codex-cli --bin codex \
+    && cargo build --release -j ${CODEX_BUILD_JOBS} -p codex-cli --bin codex \
     && install -D target/release/codex /out/codex
 
 FROM ubuntu:22.04

@@ -13,7 +13,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
 - `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --listen stdio://`
-- `patches/codex-local-compaction.patch` — Taurus staging patch applied to the pinned Codex source build
+- `patches/codex-local-compaction.patch` — Taurus staging patch that forces local compaction and exposes the plaintext summary on the app-server v2 wire
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
 ## `taurus-base`
@@ -75,6 +75,10 @@ stdio://` JSON-RPC `initialize`/`getAuthStatus` probe inside the final image so
 publish/builds fail fast if the patched binary cannot start on the same path
 and argv Taurus uses at runtime.
 
+The builder defaults to `CODEX_BUILD_JOBS=1` for memory-constrained hosts; pass
+`--build-arg CODEX_BUILD_JOBS=4` (or similar) on larger builders to speed up the
+Rust compile.
+
 Pull it with:
 
 ```bash
@@ -85,6 +89,8 @@ Build it locally with:
 
 ```bash
 docker build -f Dockerfile.subscription -t taurus-base-subscription .
+# or, on a roomier builder:
+docker build -f Dockerfile.subscription --build-arg CODEX_BUILD_JOBS=4 -t taurus-base-subscription .
 ```
 
 Smoke test it with:
