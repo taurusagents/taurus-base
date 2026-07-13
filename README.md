@@ -12,7 +12,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile` — the default Taurus agent image definition
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
-- `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --stdio`
+- `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --listen stdio://`
 - `patches/codex-local-compaction.patch` — Taurus staging patch applied to the pinned Codex source build
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
