@@ -13,7 +13,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
 - `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --listen stdio://`
-- `patches/codex-local-compaction.patch` — Taurus staging patch that forces local compaction and exposes the plaintext summary on the app-server v2 wire
+- `patches/codex-local-compaction.patch` — Taurus staging patch that forces local compaction and exposes the plain summary body (without Codex's internal `SUMMARY_PREFIX` boilerplate; omitted entirely when empty) as `summary` on the app-server v2 `contextCompaction` wire item
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
 ## `taurus-base`

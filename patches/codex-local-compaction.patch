@@ -1,5 +1,5 @@
 diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
-index ca8487b..00d8ee7 100644
+index ca8487b79..00d8ee780 100644
 --- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 @@ -1119,7 +1119,7 @@ impl ThreadHistoryBuilder {
@@ -12,7 +12,7 @@ index ca8487b..00d8ee7 100644
  
      fn handle_entered_review_mode(
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/item.rs b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
-index 7a5e4dc..ef6859a 100644
+index 7a5e4dc1f..ef6859ae1 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/item.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
 @@ -392,6 +392,9 @@ pub enum ThreadItem {
@@ -40,7 +40,7 @@ index 7a5e4dc..ef6859a 100644
      }
  }
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
-index d35d39f..4cfedc2 100644
+index d35d39fe4..4cfedc228 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
 @@ -258,6 +258,7 @@ fn thread_items_list_round_trips() {
@@ -74,7 +74,7 @@ index d35d39f..4cfedc2 100644
          thread_id: "thr_123".to_string(),
          turn_id: None,
 diff --git a/codex-rs/app-server/tests/suite/v2/compaction.rs b/codex-rs/app-server/tests/suite/v2/compaction.rs
-index a534912..a9f040e 100644
+index a534912a8..a9f040e42 100644
 --- a/codex-rs/app-server/tests/suite/v2/compaction.rs
 +++ b/codex-rs/app-server/tests/suite/v2/compaction.rs
 @@ -95,10 +95,13 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
@@ -126,10 +126,23 @@ index a534912..a9f040e 100644
      };
  
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index d2a9fd5..c6b0da5 100644
+index d2a9fd522..fdf68c7cd 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -224,9 +224,12 @@ async fn run_compact_task_inner_impl(
+@@ -84,8 +84,10 @@ pub(crate) async fn build_compaction_initial_context(
+     }
+ }
+ 
+-pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
+-    provider.supports_remote_compaction()
++pub(crate) fn should_use_remote_compact_task(_provider: &ModelProviderInfo) -> bool {
++    // Taurus staging experiment: force local compaction so the summary is emitted client-side
++    // instead of being hidden behind the remote compaction task.
++    false
+ }
+ 
+ pub(crate) async fn run_inline_auto_compact_task(
+@@ -224,9 +226,12 @@ async fn run_compact_task_inner_impl(
      initial_context_injection: InitialContextInjection,
      compaction_metadata: CompactionTurnMetadata,
  ) -> CodexResult<String> {
@@ -145,22 +158,27 @@ index d2a9fd5..c6b0da5 100644
      let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
  
      let mut history = sess.clone_history().await;
-@@ -367,8 +370,11 @@ async fn run_compact_task_inner_impl(
+@@ -367,7 +372,17 @@ async fn run_compact_task_inner_impl(
      .await;
      sess.recompute_token_usage(&turn_context).await;
  
 -    sess.emit_turn_item_completed(&turn_context, compaction_item)
--        .await;
-+    sess.emit_turn_item_completed(
-+        &turn_context,
-+        TurnItem::ContextCompaction(compaction_item.with_summary(summary_text.clone())),
-+    )
-+    .await;
++    // Expose only the plain summary body (`summary_suffix`) on the wire; the
++    // SUMMARY_PREFIX boilerplate baked into `summary_text` is instruction text
++    // for the model's replacement history, not for API consumers. When the
++    // compaction turn produced no assistant message, `summary_suffix` is empty
++    // and we keep `summary: None` instead of emitting `Some("")`.
++    let compaction_item = if summary_suffix.is_empty() {
++        compaction_item
++    } else {
++        compaction_item.with_summary(summary_suffix.clone())
++    };
++    sess.emit_turn_item_completed(&turn_context, TurnItem::ContextCompaction(compaction_item))
+         .await;
      let warning = EventMsg::Warning(WarningEvent {
          message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
-     });
 diff --git a/codex-rs/protocol/src/items.rs b/codex-rs/protocol/src/items.rs
-index a65bd97..c6b026a 100644
+index a65bd970d..c6b026a13 100644
 --- a/codex-rs/protocol/src/items.rs
 +++ b/codex-rs/protocol/src/items.rs
 @@ -407,6 +407,9 @@ pub struct McpToolCallError {
