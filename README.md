@@ -66,6 +66,13 @@ Taurus expects inside the sidecar:
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
 
+⚠️ When bumping `@anthropic-ai/claude-code`, run the session-repair canary
+from the `taurus-agents` repo (`tests/staging/cc-session-repair-canary.ts`,
+pointed at the new CLI binary via `CC_CANARY_CLAUDE_BIN`) before shipping the
+image. Taurus ports the CLI's resume-time session-repair classifier, and the
+canary empirically re-verifies every known session-tail shape against the real
+binary; a silent semantic change there can reintroduce transcript pollution.
+
 The subscription Dockerfile now clones the pinned upstream Codex source,
 applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
 builds the `codex` binary in a throwaway builder stage, and then runs
