@@ -29,6 +29,7 @@ The default agent image includes:
 - GitHub CLI
 - Playwright + Chromium
 - Browser helper at `/usr/local/lib/browser-cli.mjs`
+- Browser helper support for WebGL2 via SwiftShader software rendering, console/log capture, and native keyboard/mouse input actions
 
 Pull it with:
 

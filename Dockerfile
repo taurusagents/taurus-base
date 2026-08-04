@@ -12,20 +12,34 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ── Core utilities ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    bc \
     file \
     git \
     curl \
     wget \
     jq \
+    dnsutils \
+    whois \
     tree \
     vim \
     less \
     htop \
+    time \
+    lsof \
+    iproute2 \
+    netcat-openbsd \
+    iputils-ping \
+    traceroute \
+    psmisc \
+    moreutils \
     unzip \
     zip \
+    p7zip-full \
     make \
     build-essential \
     sqlite3 \
+    poppler-utils \
+    imagemagick \
     openssh-client \
     ca-certificates \
     gnupg \

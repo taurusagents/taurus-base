@@ -70,15 +70,22 @@ jobs:
         run: |
           case "${{ matrix.image_key }}" in
             base)
-              docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
-                python3 --version &&
-                node --version &&
-                go version &&
-                rg --version &&
-                fd --version &&
-                playwright --version &&
-                node -e 'const { chromium } = require(\"playwright\"); (async () => { const browser = await chromium.launch({ headless: true }); await browser.close(); })().catch((error) => { console.error(error); process.exit(1); });'
-              "
+              docker run --rm \
+                -v "$PWD/browser-image-smoke.mjs:/tmp/browser-image-smoke.mjs:ro" \
+                "${{ matrix.smoke_tag }}" bash -lc "
+                  python3 --version &&
+                  node --version &&
+                  go version &&
+                  rg --version &&
+                  fd --version &&
+                  playwright --version &&
+                  dig -v &&
+                  /usr/bin/time --version &&
+                  ss --version &&
+                  pdftotext -v &&
+                  convert -version | head -n 1 &&
+                  node /tmp/browser-image-smoke.mjs
+                "
               ;;
             subscription)
               docker run --rm "${{ matrix.smoke_tag }}" bash -lc "

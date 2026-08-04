@@ -34,6 +34,13 @@ const MAX_VIEWPORT_DIM = 1568;
 // stdout transport budget. Random-noise probes showed 1280x900 remains safely under
 // the limit while larger common viewports such as 1440x900 can exceed it.
 const MAX_VIEWPORT_AREA = 1_152_000;
+const CONSOLE_SETTLE_MS = 300;
+const MAX_CONSOLE_ENTRIES = 200;
+const MAX_CONSOLE_ENTRY_LENGTH = 500;
+const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
+const DEFAULT_DRAG_STEPS = 10;
+const MAX_DRAG_STEPS = 1_000;
+const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
 const BROWSER_USER = process.env.TAURUS_BROWSER_USER || 'taurus-browser';
 const BROWSER_HOME = process.env.TAURUS_BROWSER_HOME || `/home/${BROWSER_USER}`;
 const BROWSER_PROFILE_DIR = `${BROWSER_HOME}/.config/chromium-profile`;
@@ -209,6 +216,248 @@ function throwValidationError(message) {
   throw new Error(message);
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseInteger(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function hasOwnInput(input, key) {
+  return Object.prototype.hasOwnProperty.call(input, key) && input[key] !== undefined;
+}
+
+function requireInteger(input, key, message) {
+  const parsed = parseInteger(input[key]);
+  if (parsed === null) {
+    throwValidationError(message ?? `"${key}" is required and must be an integer.`);
+  }
+  return parsed;
+}
+
+function requireCoordinatePair(input, xKey, yKey, actionName) {
+  const hasX = hasOwnInput(input, xKey);
+  const hasY = hasOwnInput(input, yKey);
+  if (!hasX || !hasY) {
+    throwValidationError(`"${actionName}" requires both "${xKey}" and "${yKey}".`);
+  }
+  return {
+    [xKey]: requireInteger(input, xKey),
+    [yKey]: requireInteger(input, yKey),
+  };
+}
+
+function validateSingleKeyAction(action, key) {
+  if (typeof key !== 'string' || key.length === 0) {
+    throwValidationError('"key" is required.');
+  }
+  if (key.includes('+') && key !== '+') {
+    throwValidationError(`"${action}" accepts only a single key. Use "press" for key chords such as "Control+a".`);
+  }
+}
+
+function validateMouseButton(button) {
+  if (button === undefined) return;
+  if (!VALID_MOUSE_BUTTONS.has(button)) {
+    throwValidationError('"button" must be one of "left", "right", or "middle".');
+  }
+}
+
+function validateActionInput(input) {
+  switch (input.action) {
+    case 'resize': {
+      const validationError = getViewportValidationError(Number(input.width), Number(input.height));
+      if (validationError) {
+        throwValidationError(validationError);
+      }
+      break;
+    }
+
+    case 'click': {
+      const hasSelector = typeof input.selector === 'string' && input.selector.length > 0;
+      const hasX = hasOwnInput(input, 'x');
+      const hasY = hasOwnInput(input, 'y');
+      if (hasX !== hasY) {
+        throwValidationError('"click" coordinate mode requires both "x" and "y".');
+      }
+      if (hasSelector === (hasX && hasY)) {
+        throwValidationError('"click" requires exactly one target: either "selector", or both "x" and "y".');
+      }
+      if (hasX && hasY) {
+        requireCoordinatePair(input, 'x', 'y', 'click');
+      }
+      break;
+    }
+
+    case 'mousemove': {
+      requireCoordinatePair(input, 'x', 'y', 'mousemove');
+      break;
+    }
+
+    case 'mousedown':
+    case 'mouseup': {
+      validateMouseButton(input.button);
+      const hasX = hasOwnInput(input, 'x');
+      const hasY = hasOwnInput(input, 'y');
+      if (hasX !== hasY) {
+        throwValidationError(`"${input.action}" coordinate mode requires both "x" and "y".`);
+      }
+      if (hasX && hasY) {
+        requireCoordinatePair(input, 'x', 'y', input.action);
+      }
+      break;
+    }
+
+    case 'drag': {
+      requireCoordinatePair(input, 'x', 'y', 'drag');
+      requireCoordinatePair(input, 'x2', 'y2', 'drag');
+      if (input.steps !== undefined) {
+        const steps = requireInteger(input, 'steps');
+        if (steps < 1 || steps > MAX_DRAG_STEPS) {
+          throwValidationError(`"steps" must be an integer between 1 and ${MAX_DRAG_STEPS}.`);
+        }
+      }
+      break;
+    }
+
+    case 'keydown':
+    case 'keyup': {
+      validateSingleKeyAction(input.action, input.key);
+      break;
+    }
+  }
+}
+
+function stripAnsiSequences(text) {
+  return text
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, '')
+    .replace(/\u001B[@-_]/g, '');
+}
+
+function escapeControlCharacters(text) {
+  return text.replace(/[\x00-\x1F\x7F-\x9F]/g, char => {
+    switch (char) {
+      case '\n': return '\\n';
+      case '\r': return '\\r';
+      case '\t': return '\\t';
+      case '\0': return '\\0';
+      default: return `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`;
+    }
+  });
+}
+
+function sanitizeConsoleText(text) {
+  return escapeControlCharacters(stripAnsiSequences(String(text ?? '')));
+}
+
+function truncateConsoleText(text, maxLength) {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function pluralize(count, singular, plural = `${singular}s`) {
+  return count === 1 ? singular : plural;
+}
+
+function formatConsoleValue(arg) {
+  if (!arg || typeof arg !== 'object') return String(arg);
+  if (typeof arg.unserializableValue === 'string') return arg.unserializableValue;
+  if ('value' in arg && arg.value !== undefined) {
+    return typeof arg.value === 'string' ? arg.value : JSON.stringify(arg.value);
+  }
+  if (typeof arg.description === 'string' && arg.description.length > 0) return arg.description;
+  if (typeof arg.type === 'string' && arg.type.length > 0) return arg.type;
+  return '[unserializable value]';
+}
+
+function formatConsoleApiEntry(event) {
+  const type = event.type === 'warning' ? 'warn' : event.type;
+  const body = (event.args ?? []).map(formatConsoleValue).join(' ');
+  return `[${type}] ${body}`.trimEnd();
+}
+
+function formatExceptionEntry(event) {
+  const description = event.exceptionDetails?.exception?.description;
+  const firstLine = (typeof description === 'string' && description.length > 0)
+    ? description.split(/\r?\n/, 1)[0]
+    : event.exceptionDetails?.text || 'Uncaught exception';
+  return `[exception] ${firstLine}`;
+}
+
+function formatLogEntry(entry) {
+  const source = entry?.source || 'log';
+  const pieces = [];
+  if (typeof entry?.text === 'string' && entry.text.length > 0) {
+    pieces.push(entry.text);
+  }
+  if (typeof entry?.url === 'string' && entry.url.length > 0) {
+    pieces.push(`(${entry.url})`);
+  }
+  return `[${source}] ${pieces.join(' ') || 'log entry'}`;
+}
+
+function formatConsoleOutput(entries) {
+  if (entries.length === 0) {
+    return 'No console or log entries captured since the current page loaded.';
+  }
+
+  const droppedBeforeFormatting = Math.max(0, entries.length - MAX_CONSOLE_ENTRIES);
+  const sanitizedEntries = entries
+    .slice(-MAX_CONSOLE_ENTRIES)
+    .map(entry => truncateConsoleText(sanitizeConsoleText(entry), MAX_CONSOLE_ENTRY_LENGTH));
+
+  let visibleEntries = sanitizedEntries.slice();
+  let droppedByOutputCap = 0;
+  while (visibleEntries.join('\n').length > MAX_CONSOLE_OUTPUT_LENGTH && visibleEntries.length > 0) {
+    visibleEntries.pop();
+    droppedByOutputCap += 1;
+  }
+
+  const summaryLines = [];
+  if (droppedBeforeFormatting > 0) {
+    summaryLines.push(`... ${droppedBeforeFormatting} older ${pluralize(droppedBeforeFormatting, 'entry')} omitted.`);
+  }
+  if (droppedByOutputCap > 0) {
+    summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry')} omitted after reaching the output cap.`);
+  }
+
+  while (visibleEntries.length > 0 && visibleEntries.concat(summaryLines).join('\n').length > MAX_CONSOLE_OUTPUT_LENGTH) {
+    visibleEntries.pop();
+    droppedByOutputCap += 1;
+    if (summaryLines.length > 0 && summaryLines[summaryLines.length - 1].includes('output cap')) {
+      summaryLines[summaryLines.length - 1] = `... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry')} omitted after reaching the output cap.`;
+    } else {
+      summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry')} omitted after reaching the output cap.`);
+    }
+  }
+
+  return visibleEntries.concat(summaryLines).join('\n');
+}
+
+async function captureConsoleOutput(page) {
+  const cdp = await page.context().newCDPSession(page);
+  const entries = [];
+
+  // Every console action attaches a fresh CDP client. Chromium replays buffered
+  // console and exception events when Runtime.enable runs on a new session, so
+  // this helper stays stateless across separate tool invocations.
+  cdp.on('Runtime.consoleAPICalled', event => entries.push(formatConsoleApiEntry(event)));
+  cdp.on('Runtime.exceptionThrown', event => entries.push(formatExceptionEntry(event)));
+  cdp.on('Log.entryAdded', event => entries.push(formatLogEntry(event.entry)));
+
+  try {
+    await cdp.send('Runtime.enable');
+    await cdp.send('Log.enable');
+    await sleep(CONSOLE_SETTLE_MS);
+    return formatConsoleOutput(entries);
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
 function getPersistedViewport(state) {
   return normalizeViewport(state?.viewport) || DEFAULT_VIEWPORT;
 }
@@ -266,6 +515,11 @@ async function ensureBrowser() {
   const identity = resolveBrowserIdentity();
   const child = spawn(chromePath, [
     '--headless', '--disable-gpu', '--disable-dev-shm-usage',
+    // This raw Chromium spawn bypasses Playwright's default launch arguments.
+    // Playwright enables unsafe SwiftShader in headless Chromium so WebGL keeps
+    // working there; keep this flag aligned with Playwright defaults when
+    // Playwright is upgraded.
+    '--enable-unsafe-swiftshader',
     `--user-agent=${USER_AGENT}`,
     `--remote-debugging-port=${CDP_PORT}`, '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${BROWSER_PROFILE_DIR}`,
@@ -285,7 +539,7 @@ async function ensureBrowser() {
       const resp = await fetch(`${cdpUrl}/json/version`);
       if (resp.ok) break;
     } catch { /* not ready yet */ }
-    await new Promise(r => setTimeout(r, 200));
+    await sleep(200);
   }
 
   const browser = await chromium.connectOverCDP(cdpUrl);
@@ -306,12 +560,7 @@ async function handleAction(input) {
     return 'Browser closed.';
   }
 
-  if (action === 'resize') {
-    const validationError = getViewportValidationError(Number(input.width), Number(input.height));
-    if (validationError) {
-      throwValidationError(validationError);
-    }
-  }
+  validateActionInput(input);
 
   const { browser, page } = await ensureBrowser();
 
@@ -342,11 +591,22 @@ async function handleAction(input) {
         return `URL: ${url}\nTitle: ${title}\n\n${tree}`;
       }
 
+      case 'console': {
+        return await captureConsoleOutput(page);
+      }
+
       case 'click': {
-        if (!input.selector) throwValidationError('"selector" is required.');
-        await page.click(input.selector, { timeout: 5000 });
+        if (typeof input.selector === 'string' && input.selector.length > 0) {
+          await page.click(input.selector, { timeout: 5000 });
+          await page.waitForLoadState('domcontentloaded').catch(() => {});
+          return `Clicked: ${input.selector}`;
+        }
+
+        const x = requireInteger(input, 'x');
+        const y = requireInteger(input, 'y');
+        await page.mouse.click(x, y);
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        return `Clicked: ${input.selector}`;
+        return `Clicked at (${x}, ${y})`;
       }
 
       case 'type': {
@@ -367,6 +627,58 @@ async function handleAction(input) {
         if (!input.selector) throwValidationError('"selector" is required.');
         await page.hover(input.selector, { timeout: 5000 });
         return `Hovered: ${input.selector}`;
+      }
+
+      case 'keydown': {
+        await page.keyboard.down(input.key);
+        return `Key down: ${input.key}`;
+      }
+
+      case 'keyup': {
+        await page.keyboard.up(input.key);
+        return `Key up: ${input.key}`;
+      }
+
+      case 'mousemove': {
+        const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mousemove');
+        await page.mouse.move(x, y);
+        return `Mouse moved to (${x}, ${y})`;
+      }
+
+      case 'mousedown': {
+        const button = input.button ?? 'left';
+        validateMouseButton(button);
+        if (hasOwnInput(input, 'x') || hasOwnInput(input, 'y')) {
+          const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mousedown');
+          await page.mouse.move(x, y);
+        }
+        await page.mouse.down({ button });
+        return `Mouse down: ${button}`;
+      }
+
+      case 'mouseup': {
+        const button = input.button ?? 'left';
+        validateMouseButton(button);
+        if (hasOwnInput(input, 'x') || hasOwnInput(input, 'y')) {
+          const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mouseup');
+          await page.mouse.move(x, y);
+        }
+        await page.mouse.up({ button });
+        return `Mouse up: ${button}`;
+      }
+
+      case 'drag': {
+        const { x, y } = requireCoordinatePair(input, 'x', 'y', 'drag');
+        const { x2, y2 } = requireCoordinatePair(input, 'x2', 'y2', 'drag');
+        const steps = input.steps === undefined ? DEFAULT_DRAG_STEPS : requireInteger(input, 'steps');
+        if (steps < 1 || steps > MAX_DRAG_STEPS) {
+          throwValidationError(`"steps" must be an integer between 1 and ${MAX_DRAG_STEPS}.`);
+        }
+        await page.mouse.move(x, y);
+        await page.mouse.down();
+        await page.mouse.move(x2, y2, { steps });
+        await page.mouse.up();
+        return `Dragged from (${x}, ${y}) to (${x2}, ${y2}) in ${steps} step${steps === 1 ? '' : 's'}`;
       }
 
       case 'screenshot': {
@@ -396,7 +708,7 @@ async function handleAction(input) {
       case 'scroll': {
         const delta = input.direction === 'up' ? -(input.amount ?? 300) : (input.amount ?? 300);
         await page.mouse.wheel(0, delta);
-        await new Promise(r => setTimeout(r, 300));
+        await sleep(300);
         return `Scrolled ${input.direction ?? 'down'} by ${Math.abs(delta)}px`;
       }
 
@@ -412,7 +724,7 @@ async function handleAction(input) {
 
       case 'wait': {
         const ms = input.ms ?? 1000;
-        await new Promise(r => setTimeout(r, ms));
+        await sleep(ms);
         return `Waited ${ms}ms`;
       }
 
