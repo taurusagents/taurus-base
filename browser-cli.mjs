@@ -237,6 +237,14 @@ function requireInteger(input, key, message) {
   return parsed;
 }
 
+function requireNonNegativeInteger(input, key) {
+  const parsed = requireInteger(input, key, `"${key}" is required and must be a non-negative integer.`);
+  if (parsed < 0) {
+    throwValidationError(`"${key}" is required and must be a non-negative integer.`);
+  }
+  return parsed;
+}
+
 function requireCoordinatePair(input, xKey, yKey, actionName) {
   const hasX = hasOwnInput(input, xKey);
   const hasY = hasOwnInput(input, yKey);
@@ -244,8 +252,8 @@ function requireCoordinatePair(input, xKey, yKey, actionName) {
     throwValidationError(`"${actionName}" requires both "${xKey}" and "${yKey}".`);
   }
   return {
-    [xKey]: requireInteger(input, xKey),
-    [yKey]: requireInteger(input, yKey),
+    [xKey]: requireNonNegativeInteger(input, xKey),
+    [yKey]: requireNonNegativeInteger(input, yKey),
   };
 }
 
@@ -338,12 +346,17 @@ function stripAnsiSequences(text) {
 }
 
 function escapeControlCharacters(text) {
-  return text.replace(/[\x00-\x1F\x7F-\x9F]/g, char => {
+  return text.replace(/[\x00-\x1F\x7F-\x9F\u2028\u2029]/g, char => {
     switch (char) {
       case '\n': return '\\n';
       case '\r': return '\\r';
       case '\t': return '\\t';
       case '\0': return '\\0';
+      // Keep each console entry on one physical line. Unicode line and paragraph
+      // separators do not look like control bytes, but they still split rendered
+      // lines and can spoof extra console entries, so escape them explicitly.
+      case '\u2028':
+      case '\u2029': return `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`;
       default: return `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`;
     }
   });
@@ -412,25 +425,25 @@ function formatConsoleOutput(entries) {
   let visibleEntries = sanitizedEntries.slice();
   let droppedByOutputCap = 0;
   while (visibleEntries.join('\n').length > MAX_CONSOLE_OUTPUT_LENGTH && visibleEntries.length > 0) {
-    visibleEntries.pop();
+    visibleEntries.shift();
     droppedByOutputCap += 1;
   }
 
   const summaryLines = [];
   if (droppedBeforeFormatting > 0) {
-    summaryLines.push(`... ${droppedBeforeFormatting} older ${pluralize(droppedBeforeFormatting, 'entry')} omitted.`);
+    summaryLines.push(`... ${droppedBeforeFormatting} older ${pluralize(droppedBeforeFormatting, 'entry', 'entries')} omitted.`);
   }
   if (droppedByOutputCap > 0) {
-    summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry')} omitted after reaching the output cap.`);
+    summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry', 'entries')} omitted after reaching the output cap.`);
   }
 
   while (visibleEntries.length > 0 && visibleEntries.concat(summaryLines).join('\n').length > MAX_CONSOLE_OUTPUT_LENGTH) {
-    visibleEntries.pop();
+    visibleEntries.shift();
     droppedByOutputCap += 1;
     if (summaryLines.length > 0 && summaryLines[summaryLines.length - 1].includes('output cap')) {
-      summaryLines[summaryLines.length - 1] = `... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry')} omitted after reaching the output cap.`;
+      summaryLines[summaryLines.length - 1] = `... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry', 'entries')} omitted after reaching the output cap.`;
     } else {
-      summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry')} omitted after reaching the output cap.`);
+      summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry', 'entries')} omitted after reaching the output cap.`);
     }
   }
 

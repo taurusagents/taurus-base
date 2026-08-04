@@ -29,6 +29,8 @@ function browser(input, { expectFailure = false } = {}) {
 
 function buildProbePage() {
   const html = `<!doctype html><title>browser smoke</title><style>html,body,canvas{margin:0;width:100%;height:100%}body{overflow:hidden}canvas{display:block;background:#111}</style><canvas id="game" width="320" height="200"></canvas><script>
+const lineSeparator = String.fromCharCode(0x2028);
+const paragraphSeparator = String.fromCharCode(0x2029);
 const state = window.__probe = { keys: {}, keyEvents: [], mouseMoves: [], mouseDowns: [], mouseUps: [], clicks: [], dragTrail: [], dragging: false };
 window.addEventListener("keydown", event => { state.keys[event.key] = true; state.keyEvents.push({ type: "down", key: event.key, shiftKey: event.shiftKey }); });
 window.addEventListener("keyup", event => { state.keys[event.key] = false; state.keyEvents.push({ type: "up", key: event.key, shiftKey: event.shiftKey }); });
@@ -37,11 +39,12 @@ window.addEventListener("mousedown", event => { state.dragging = true; state.mou
 window.addEventListener("mouseup", event => { state.dragging = false; state.mouseUps.push({ x: event.clientX, y: event.clientY, button: event.button, buttons: event.buttons }); });
 window.addEventListener("click", event => { state.clicks.push({ x: event.clientX, y: event.clientY, button: event.button }); });
 console.log("boot log", 42);
+console.log("unicode line integrity", "left" + lineSeparator + "middle" + paragraphSeparator + "right", "你好🙂");
 console.warn("a warning\\nwith newline\\tand tab\\u001b[31mRED\\u001b[0m");
 setTimeout(() => { throw new Error("boot crash"); }, 0);
 new Image().src = "http://127.0.0.1:9/tex.png";
 </script>`;
-  return `data:text/html,${encodeURIComponent(html)}`;
+  return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
 }
 
 function evaluateJson(expression) {
@@ -53,12 +56,18 @@ function runSmoke() {
   assert.match(openOutput, /Title: browser smoke/);
 
   const consoleOutput = browser({ action: 'console' });
+  const lineSeparator = String.fromCharCode(0x2028);
+  const paragraphSeparator = String.fromCharCode(0x2029);
   assert.match(consoleOutput, /\[log\] boot log 42/);
+  assert.match(consoleOutput, /\[log\] unicode line integrity left\\u2028middle\\u2029right 你好🙂/);
   assert.match(consoleOutput, /\[warn\] a warning\\nwith newline\\tand tabRED/);
   assert.match(consoleOutput, /\[exception\] Error: boot crash/);
   assert.match(consoleOutput, /\[network\].*127\.0\.0\.1:9\/tex\.png/);
   assert.doesNotMatch(consoleOutput, /\u001b\[/);
   assert.doesNotMatch(consoleOutput, /^\[warn\].*\nwith newline/m);
+  assert.equal(consoleOutput.includes(lineSeparator), false, 'console output should not contain raw 0x2028');
+  assert.equal(consoleOutput.includes(paragraphSeparator), false, 'console output should not contain raw 0x2029');
+  assert.equal(consoleOutput.includes('你好🙂'), true, 'console output should preserve non-control Unicode');
   assert.match(browser({ action: 'console' }), /\[log\] boot log 42/);
 
   browser({ action: 'keydown', key: 'w' });
@@ -88,6 +97,11 @@ function runSmoke() {
 
   browser({ action: 'click', x: 55, y: 65 });
   assert.deepEqual(evaluateJson('JSON.stringify(window.__probe.clicks.at(-1))'), { x: 55, y: 65, button: 0 });
+
+  assert.match(
+    browser({ action: 'click', x: -5, y: 10 }, { expectFailure: true }),
+    /"x" is required and must be a non-negative integer\./,
+  );
 
   const snapshot = browser({ action: 'snapshot' });
   assert.match(snapshot, /Title: browser smoke/);
@@ -126,6 +140,23 @@ function runSmoke() {
   assert.match(webglProbe.renderer, /SwiftShader/i);
   assert.deepEqual(webglProbe.pixels, [64, 128, 191, 255]);
   assert.equal(webglProbe.webgpuAdapter, 'null');
+
+  browser({
+    action: 'open',
+    url: `data:text/html;charset=UTF-8,${encodeURIComponent('<!doctype html><title>console cap</title>')}`,
+  });
+  evaluateJson(`(() => {
+    const payload = "x".repeat(600);
+    for (let index = 1; index <= 210; index += 1) {
+      console.log("cap-line-" + String(index).padStart(3, "0"), payload);
+    }
+    return JSON.stringify(true);
+  })()`);
+  const cappedConsoleOutput = browser({ action: 'console' });
+  assert.match(cappedConsoleOutput, /\.\.\. 10 older entries omitted\./);
+  assert.match(cappedConsoleOutput, /\.\.\. 1 additional entry omitted after reaching the output cap\./);
+  assert.equal(cappedConsoleOutput.includes('[log] cap-line-210'), true, 'newest capped console entry should survive output trimming');
+  assert.equal(cappedConsoleOutput.includes('[log] cap-line-011'), false, 'oldest retained console entry should be dropped first at the output cap');
 
   assert.match(
     browser({ action: 'keydown', key: 'Control+a' }, { expectFailure: true }),
