@@ -95,6 +95,22 @@ function countOccurrences(text, needle) {
   return text.split(needle).length - 1;
 }
 
+/**
+ * Polls `produce` until it returns `expected`, then returns whatever it last
+ * produced. Used where the browser needs a moment to reach a state (a new tab
+ * committing its first document, say) — a helper that never reaches it simply
+ * fails the assertion after the deadline, so this cannot hide a regression.
+ */
+function waitForValue(produce, expected, { timeoutMs = 5_000, intervalMs = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = produce();
+  while (latest !== expected && Date.now() < deadline) {
+    sleepSync(intervalMs);
+    latest = produce();
+  }
+  return latest;
+}
+
 function buildProbePage() {
   const html = `<!doctype html><title>browser smoke</title><style>html,body,canvas{margin:0;width:100%;height:100%}body{overflow:hidden}canvas{display:block;background:#111}</style><canvas id="game" width="320" height="200"></canvas><script>
 const lineSeparator = String.fromCharCode(0x2028);
@@ -491,16 +507,50 @@ function runPageInitiatedNavigationSmoke(origin) {
 
 /** Recovering from tabs and navigations that used to strand the helper. */
 function runStrandedTabSmoke(origin) {
-  browser({ action: 'open', url: `${origin}/stable` });
+  // The tab the helper is on is blank and the page with content is a second
+  // tab. Which tab a browser reports first is not guaranteed, so this
+  // arrangement — blank tab first, content tab second — is the one that pins
+  // the choice down: taking whichever tab comes first would stay on the blank
+  // one for good.
+  browser({ action: 'open', url: 'about:blank' });
+  evaluateJson(`JSON.stringify(window.open(${JSON.stringify(`${origin}/stable`)}, "_blank") ? "opened" : "blocked")`);
+  const drivenPage = () => browser({ action: 'evaluate', expression: 'location.href' });
+  assert.equal(
+    waitForValue(drivenPage, `${origin}/stable`),
+    `${origin}/stable`,
+    'the helper must drive the tab that has content, not the blank one it started on',
+  );
+
+  // The same preference, the other way round: a blank tab the page opens next
+  // to the one being driven must not take over.
   evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
   sleepSync(300);
 
+  // The tab the page just opened took the foreground with it, and only the
+  // foregrounded tab is painted — so screenshots have to put the page they are
+  // capturing back in front, or they wait for a frame that never comes.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const shot = JSON.parse(browser({ action: 'screenshot' }));
+    assert.equal(shot.__type, 'screenshot');
+    assert.ok(shot.base64.length > 0, 'a screenshot taken with other tabs open must still produce an image');
+  }
   assert.equal(
     browser({ action: 'evaluate', expression: 'location.href' }),
     `${origin}/stable`,
     'a blank tab opened by the page must not become the page the helper drives',
   );
   assert.match(browser({ action: 'snapshot' }), /Title: stable page/);
+
+  // A tab the page opens that the browser refuses to navigate (a data: URL in
+  // a new tab) leaves a target nothing can attach to; without recovery the
+  // whole browser becomes unreachable and every later call times out.
+  evaluateJson(`JSON.stringify(window.open("data:text/html,%3Ctitle%3Estuck%3C/title%3E", "_blank") ? "opened" : "blocked")`);
+  sleepSync(500);
+  assert.equal(
+    waitForValue(drivenPage, `${origin}/stable`),
+    `${origin}/stable`,
+    'the helper must recover from a tab it cannot attach to, and stay on the page it was driving',
+  );
 
   const strandingOutput = browser({
     action: 'evaluate',
@@ -511,8 +561,11 @@ function runStrandedTabSmoke(origin) {
   assert.equal(strandingOutput.includes('Execution context was destroyed'), false, 'the raw Playwright wording should not leak');
 
   // The tool is not stuck: the navigation the expression started did happen.
-  sleepSync(300);
-  assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/game');
+  assert.equal(
+    waitForValue(() => browser({ action: 'evaluate', expression: 'location.pathname' }), '/game'),
+    '/game',
+    'the navigation the expression started should still have happened',
+  );
 }
 
 /** Viewport ceiling and the screenshot payloads it has to keep affordable. */

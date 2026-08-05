@@ -60,6 +60,9 @@ const MAX_UNVERIFIED_DOCUMENT_AGE_MS = 24 * 60 * 60 * 1_000;
 // Deliberately match the Taurus app repo's shell output limit so helper-side
 // trimming and shell-side transport truncation stay aligned.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
+// Foregrounding the page is a precondition for rendering, not the action
+// itself: give up quickly rather than letting an unresponsive tab stall a call.
+const BRING_TO_FRONT_TIMEOUT_MS = 2_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
@@ -250,6 +253,19 @@ function isExecutionContextDestroyedError(err) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Rejects if `promise` has not settled within `ms`. Used for best-effort steps
+ * that must never turn into a hang; the underlying call is simply abandoned.
+ */
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms).unref();
+    }),
+  ]);
 }
 
 function parseInteger(value) {
@@ -809,30 +825,41 @@ async function readPageConsoleCapture(page, maxEntries, maxEntryLength) {
 /**
  * Window that page-reported console timestamps are clamped into, so a page
  * cannot position a forged entry among browser-attested ones by choosing an
- * arbitrary timestamp. Navigation start comes from the browser's Performance
- * metrics rather than the page's `performance.timeOrigin`, which the page can
- * redefine.
+ * arbitrary timestamp.
+ *
+ * The start of the document is read from an isolated world rather than from the
+ * page: an isolated world shares the document but has its own JavaScript
+ * globals, so its `performance.timeOrigin` is the browser's value even when the
+ * page has redefined its own. Reading it this way deliberately avoids enabling
+ * any instrumentation domain — enabling the Performance domain on a page has
+ * been observed to leave later screenshots of that page hanging.
  */
 async function resolveShimTimestampWindow(cdp) {
-  let documentAgeMs = null;
+  let documentStart = null;
   try {
-    await cdp.send('Performance.enable');
-    const { metrics } = await cdp.send('Performance.getMetrics');
-    const values = new Map((metrics ?? []).map(metric => [metric.name, metric.value]));
-    // Both are monotonic seconds; their difference is the age of the document.
-    const navigationStart = values.get('NavigationStart');
-    const monotonicNow = values.get('Timestamp');
-    if (Number.isFinite(navigationStart) && Number.isFinite(monotonicNow) && monotonicNow >= navigationStart) {
-      documentAgeMs = (monotonicNow - navigationStart) * 1_000;
+    const { frameTree } = await cdp.send('Page.getFrameTree');
+    const frameId = frameTree?.frame?.id;
+    if (typeof frameId === 'string') {
+      const { executionContextId } = await cdp.send('Page.createIsolatedWorld', {
+        frameId,
+        worldName: 'taurus-console-clock',
+        grantUniveralAccess: false,
+      });
+      const { result } = await cdp.send('Runtime.evaluate', {
+        expression: 'performance.timeOrigin',
+        contextId: executionContextId,
+        returnByValue: true,
+      });
+      if (Number.isFinite(result?.value)) documentStart = result.value;
     }
   } catch {
     /* fall back to the loose bound below */
   }
 
   const latest = Date.now();
-  const earliest = documentAgeMs === null
+  const earliest = documentStart === null
     ? latest - MAX_UNVERIFIED_DOCUMENT_AGE_MS
-    : latest - documentAgeMs - NAVIGATION_START_TOLERANCE_MS;
+    : Math.min(documentStart - NAVIGATION_START_TOLERANCE_MS, latest);
   return { earliest, latest };
 }
 
@@ -957,6 +984,12 @@ async function ensurePrimaryPage(browser, viewport) {
   // it. Falling back to the first page keeps a genuinely blank session — the
   // freshly launched browser — working.
   const page = pages.find(candidate => !isBlankPage(candidate)) || pages[0] || await ctx.newPage();
+  // Headless Chromium only produces compositor frames for the foregrounded tab.
+  // Any tab the page opens takes the foreground with it, and from then on
+  // screenshots of the page we drive wait forever for a frame that is never
+  // painted, while animation frames stall. Foreground the page we drive, but
+  // never let this step hold up the action itself.
+  await withTimeout(page.bringToFront(), BRING_TO_FRONT_TIMEOUT_MS).catch(() => {});
   // Installed twice on purpose: at document start for every future document of
   // this page (the registration only lives as long as this CDP connection), and
   // immediately for the document already loaded. Only the first form can claim
@@ -969,6 +1002,42 @@ async function ensurePrimaryPage(browser, viewport) {
 
 // ── Launch or connect to Chromium ──
 
+async function connectAndPreparePage(cdpUrl, desiredViewport, timeout) {
+  const browser = await chromium.connectOverCDP(cdpUrl, { timeout });
+  const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
+  saveState({ cdpUrl, viewport });
+  return { browser, page };
+}
+
+/**
+ * Closes page targets that never committed a document — a tab the page opened
+ * whose navigation the browser then refused (`window.open` to a data: URL, for
+ * example). Attaching to such a target never completes, which makes connecting
+ * to the whole browser hang, so every later call would fail until the agent
+ * gave up and closed the browser. They hold nothing the agent can be working
+ * with: no document, no URL, no title.
+ *
+ * Returns whether anything was closed, i.e. whether reconnecting is worth a
+ * second try.
+ */
+async function discardUncommittedPageTargets(cdpUrl) {
+  try {
+    const response = await fetch(`${cdpUrl}/json/list`, { signal: AbortSignal.timeout(2_000) });
+    if (!response.ok) return false;
+
+    const targets = await response.json();
+    const uncommitted = (Array.isArray(targets) ? targets : [])
+      .filter(target => target?.type === 'page' && typeof target.id === 'string' && !target.url);
+
+    for (const target of uncommitted) {
+      await fetch(`${cdpUrl}/json/close/${target.id}`, { signal: AbortSignal.timeout(2_000) }).catch(() => {});
+    }
+    return uncommitted.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureBrowser() {
   const state = loadState();
   const desiredViewport = getPersistedViewport(state);
@@ -976,12 +1045,19 @@ async function ensureBrowser() {
   // Try reconnecting to existing browser
   if (state?.cdpUrl) {
     try {
-      const browser = await chromium.connectOverCDP(state.cdpUrl, { timeout: 3000 });
-      const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
-      saveState({ cdpUrl: state.cdpUrl, viewport });
-      return { browser, page };
+      return await connectAndPreparePage(state.cdpUrl, desiredViewport, 3000);
     } catch {
-      // Browser died — drop the stale connection details but preserve the last viewport choice.
+      // Either the browser died, or it is alive but holds a target that cannot
+      // be attached to. Clear the latter out and give the running browser one
+      // more chance before falling back to launching a new one.
+      try {
+        if (await discardUncommittedPageTargets(state.cdpUrl)) {
+          return await connectAndPreparePage(state.cdpUrl, desiredViewport, 5000);
+        }
+      } catch {
+        /* still unreachable — fall through to a fresh launch */
+      }
+      // Drop the stale connection details but preserve the last viewport choice.
       saveState({ viewport: desiredViewport });
     }
   }
