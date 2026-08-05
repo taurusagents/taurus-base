@@ -292,6 +292,14 @@ function throwValidationError(message) {
  * prefix is the one where the browser, not the page, is speaking. Matching the
  * phrase anywhere would replace a page's real error text with a navigation
  * explanation that does not apply to it.
+ *
+ * One shape stays indistinguishable: a page that throws a bare string rather
+ * than an Error is rendered without the inner prefix, so a page can still
+ * arrange for this rewrite by mimicking the wording. That is accepted, because
+ * it gains the page nothing it does not already have — the text of an error it
+ * throws is its own, and it could simply throw the rewritten sentence. Ruling
+ * it out would mean tracking document identity across the call to prove
+ * whether a navigation actually happened.
  */
 const EXECUTION_CONTEXT_DESTROYED_PATTERN = new RegExp(
   '^page\\.evaluate: (?:'

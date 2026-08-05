@@ -434,6 +434,7 @@ function runSmoke() {
   try {
     runPageInitiatedNavigationSmoke(pageServer.origin);
     runStrandedTabSmoke(pageServer.origin);
+    runExternalBlankTabSmoke(pageServer.origin);
     runSessionResetSmoke(pageServer.origin);
   } finally {
     pageServer.stop();
@@ -530,10 +531,12 @@ function runPageInitiatedNavigationSmoke(origin) {
 /** Recovering from tabs and navigations that used to strand the helper. */
 function runStrandedTabSmoke(origin) {
   // The tab the helper is on is blank and the page with content is a second
-  // tab. Which tab a browser reports first is not guaranteed, so this
-  // arrangement — blank tab first, content tab second — is the one that pins
-  // the choice down: taking whichever tab comes first would stay on the blank
-  // one for good.
+  // tab the page opened. Which of the two a browser hands over first is not
+  // part of any contract — one reports them in creation order, another puts the
+  // most recently opened or activated tab first — so this arrangement only
+  // discriminates under the first of those. The inverted arrangement further
+  // down covers the other; between them the choice is pinned whichever order
+  // this browser happens to use, and the correct answer is the same in both.
   browser({ action: 'open', url: 'about:blank' });
   evaluateJson(`JSON.stringify(window.open(${JSON.stringify(`${origin}/stable`)}, "_blank") ? "opened" : "blocked")`);
   const drivenPage = () => browser({ action: 'evaluate', expression: 'location.href' });
@@ -609,6 +612,67 @@ function runStrandedTabSmoke(origin) {
     'the navigation the expression started should still have happened',
   );
   assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/game');
+}
+
+/**
+ * Opens blank tabs through the browser's own endpoint and activates each, so
+ * they are newer and more recently foregrounded than the page being driven —
+ * the opposite of a tab the page opened before the helper touched anything.
+ */
+function openBlankTabsThroughBrowser(count) {
+  const probe = spawnSync('node', ['-e', `
+    (async () => {
+      for (let index = 0; index < ${count}; index += 1) {
+        const created = await (await fetch('http://127.0.0.1:9222/json/new?about:blank', { method: 'PUT' })).json();
+        await fetch('http://127.0.0.1:9222/json/activate/' + created.id, { method: 'PUT' });
+      }
+      console.log('opened');
+    })().catch(error => console.log('failed: ' + error.message));
+  `], { encoding: 'utf8' });
+
+  const outcome = (probe.stdout || '').trim();
+  assert.equal(outcome, 'opened', `could not open blank tabs through the browser: ${outcome || probe.stderr}`);
+}
+
+// Blank tabs per attempt, and attempts per run. A browser is free to hand its
+// pages over in any order it likes, and this one varies the order between runs,
+// so a single blank tab can leave a helper that simply takes the first page it
+// is handed looking correct. Enough blank tabs and the first page it is handed
+// is a blank one whatever the order; a few fresh attempts cover the rest.
+// Piling them on is safe: driving the page with content is the right answer
+// under every ordering, so more tabs and more attempts can only expose a wrong
+// choice, never invent one.
+const EXTERNAL_BLANK_TABS_PER_ATTEMPT = 10;
+const EXTERNAL_BLANK_TAB_ATTEMPTS = 3;
+
+/**
+ * The tab preference again, with the arrangement inverted: here the page with
+ * content is the older tab and the blank ones are newest and in the foreground.
+ * The scenario above covers a browser that hands over its oldest page first;
+ * this one covers a browser that starts from the most recent.
+ */
+function runExternalBlankTabSmoke(origin) {
+  for (let attempt = 0; attempt < EXTERNAL_BLANK_TAB_ATTEMPTS; attempt += 1) {
+    // From a fresh session each time, so the only tabs are the one being driven
+    // and the blank ones opened below, and so the previous attempt's choice
+    // cannot decide this one's ordering.
+    browser({ action: 'close' });
+    browser({ action: 'open', url: `${origin}/stable` });
+
+    openBlankTabsThroughBrowser(EXTERNAL_BLANK_TABS_PER_ATTEMPT);
+    waitForPageTargets(
+      urls => urls.includes('about:blank') && urls.includes(`${origin}/stable`),
+      'the blank tabs should have been opened alongside the page being driven',
+    );
+
+    assert.equal(
+      browser({ action: 'evaluate', expression: 'location.href' }),
+      `${origin}/stable`,
+      'a blank tab opened outside the page must not become the page the helper drives',
+    );
+  }
+
+  assert.match(browser({ action: 'snapshot' }), /Title: stable page/);
 }
 
 /**
