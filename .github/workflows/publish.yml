@@ -71,6 +71,10 @@ jobs:
           case "${{ matrix.image_key }}" in
             base)
               docker run --rm \
+                # Builder-only seccomp relaxation so the smoke can exercise the
+                # browser sandbox probe syscalls in CI; this does not claim the
+                # published runtime matches the same seccomp profile.
+                --security-opt seccomp=unconfined \
                 -v "$PWD/browser-image-smoke.mjs:/tmp/browser-image-smoke.mjs:ro" \
                 "${{ matrix.smoke_tag }}" bash -lc "
                   python3 --version &&
@@ -83,7 +87,7 @@ jobs:
                   /usr/bin/time --version &&
                   ss --version &&
                   pdftotext -v &&
-                  convert -version | head -n 1 &&
+                  convert -version > /dev/null &&
                   node /tmp/browser-image-smoke.mjs
                 "
               ;;

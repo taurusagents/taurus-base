@@ -37,6 +37,8 @@ const MAX_VIEWPORT_AREA = 1_152_000;
 const CONSOLE_SETTLE_MS = 300;
 const MAX_CONSOLE_ENTRIES = 200;
 const MAX_CONSOLE_ENTRY_LENGTH = 500;
+// Deliberately match the Taurus app repo's shell output limit so helper-side
+// trimming and shell-side transport truncation stay aligned.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
@@ -221,8 +223,7 @@ function sleep(ms) {
 }
 
 function parseInteger(value) {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) ? parsed : null;
+  return typeof value === 'number' && Number.isInteger(value) ? value : null;
 }
 
 function hasOwnInput(input, key) {
@@ -362,6 +363,19 @@ function escapeControlCharacters(text) {
   });
 }
 
+function escapeLineIntegrityCharacters(text) {
+  return String(text ?? '').replace(/[\x85\u2028\u2029]/g, char => {
+    switch (char) {
+      // Preserve ordinary newlines in page-derived output, but escape the three
+      // non-printing separators that can still split rendered lines.
+      case '\x85': return '\\x85';
+      case '\u2028': return '\\u2028';
+      case '\u2029': return '\\u2029';
+      default: return char;
+    }
+  });
+}
+
 function sanitizeConsoleText(text) {
   return escapeControlCharacters(stripAnsiSequences(String(text ?? '')));
 }
@@ -371,8 +385,225 @@ function truncateConsoleText(text, maxLength) {
   return `${text.slice(0, maxLength - 1)}…`;
 }
 
+function installConsoleCaptureInPage() {
+  if (globalThis.__taurusConsoleCaptureInstalled) return;
+
+  const ENTRY_LIMIT = 1_000;
+  const originalConsole = globalThis.console;
+  const buffer = [];
+  let sequence = 0;
+
+  function appendEntry(type, text) {
+    buffer.push({
+      type,
+      text,
+      timestamp: Date.now(),
+      sequence,
+    });
+    sequence += 1;
+    if (buffer.length > ENTRY_LIMIT) {
+      buffer.shift();
+    }
+  }
+
+  function formatValue(value, depth = 0, quoteStrings = false) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+
+    const valueType = typeof value;
+    if (valueType === 'string') return quoteStrings ? JSON.stringify(value) : value;
+    if (valueType === 'number' || valueType === 'boolean' || valueType === 'bigint') return String(value);
+    if (valueType === 'symbol') return String(value);
+    if (valueType === 'function') return value.name ? `[Function: ${value.name}]` : '[Function]';
+
+    if (value instanceof Error) {
+      const name = value.name || 'Error';
+      return value.message ? `${name}: ${value.message}` : name;
+    }
+
+    if (value instanceof Date || value instanceof RegExp) {
+      return String(value);
+    }
+
+    if (ArrayBuffer.isView(value)) {
+      const length = typeof value.length === 'number' ? value.length : value.byteLength;
+      return `${value.constructor?.name || 'TypedArray'}(${length})`;
+    }
+
+    if (Array.isArray(value)) {
+      if (depth > 0) return `Array(${value.length})`;
+      const items = value.slice(0, 10).map(item => formatValue(item, depth + 1, true));
+      if (value.length > 10) items.push('…');
+      return `[${items.join(', ')}]`;
+    }
+
+    if (value instanceof Map) {
+      if (depth > 0) return `Map(${value.size})`;
+      const entries = [];
+      let index = 0;
+      for (const [key, entryValue] of value) {
+        if (index >= 10) {
+          entries.push('…');
+          break;
+        }
+        entries.push(`${formatValue(key, depth + 1, true)} => ${formatValue(entryValue, depth + 1, true)}`);
+        index += 1;
+      }
+      return `Map(${value.size}) {${entries.join(', ')}}`;
+    }
+
+    if (value instanceof Set) {
+      if (depth > 0) return `Set(${value.size})`;
+      const entries = [];
+      let index = 0;
+      for (const entryValue of value) {
+        if (index >= 10) {
+          entries.push('…');
+          break;
+        }
+        entries.push(formatValue(entryValue, depth + 1, true));
+        index += 1;
+      }
+      return `Set(${value.size}) {${entries.join(', ')}}`;
+    }
+
+    const constructorName = value?.constructor?.name;
+    if (depth > 0) {
+      return constructorName && constructorName !== 'Object' ? constructorName : 'Object';
+    }
+
+    try {
+      const entries = Object.entries(value);
+      const properties = entries.slice(0, 10).map(([key, entryValue]) => `${key}: ${formatValue(entryValue, depth + 1, true)}`);
+      if (entries.length > 10) properties.push('…');
+      if (properties.length === 0) {
+        return constructorName && constructorName !== 'Object' ? constructorName : '{}';
+      }
+      return `{${properties.join(', ')}}`;
+    } catch {
+      return constructorName && constructorName !== 'Object' ? constructorName : 'Object';
+    }
+  }
+
+  function wrapConsoleMethod(methodName, type = methodName) {
+    const original = typeof originalConsole[methodName] === 'function'
+      ? originalConsole[methodName].bind(originalConsole)
+      : null;
+    if (!original) return;
+
+    originalConsole[methodName] = (...args) => {
+      if (methodName === 'clear') {
+        buffer.length = 0;
+        sequence = 0;
+        return original(...args);
+      }
+
+      const rendered = args.map(arg => formatValue(arg)).join(' ');
+      appendEntry(type, rendered);
+      return original(...args);
+    };
+  }
+
+  globalThis.__taurusConsoleCaptureInstalled = true;
+  globalThis.__taurusConsoleBuffer = buffer;
+
+  wrapConsoleMethod('debug');
+  wrapConsoleMethod('log');
+  wrapConsoleMethod('info');
+  wrapConsoleMethod('warn');
+  wrapConsoleMethod('error');
+  wrapConsoleMethod('dir');
+  wrapConsoleMethod('dirxml');
+  wrapConsoleMethod('trace');
+  wrapConsoleMethod('table');
+  wrapConsoleMethod('clear');
+}
+
 function pluralize(count, singular, plural = `${singular}s`) {
   return count === 1 ? singular : plural;
+}
+
+function takeFirstRenderedLine(text) {
+  return String(text ?? '').split(/[\r\n\x85\u2028\u2029]/, 1)[0];
+}
+
+function formatConsoleErrorSummary(preview, description) {
+  const name = preview?.properties?.find(property => property?.name === 'name' && typeof property.value === 'string')?.value;
+  const message = preview?.properties?.find(property => property?.name === 'message' && typeof property.value === 'string')?.value;
+  if (name && message) {
+    return `${name}: ${message}`;
+  }
+  if (name) {
+    return name;
+  }
+  return takeFirstRenderedLine(description || 'Error');
+}
+
+function formatPreviewPrimitive(type, description) {
+  if (type === 'string') return JSON.stringify(description ?? '');
+  if (type === 'undefined') return 'undefined';
+  if (type === 'symbol') return description || 'Symbol()';
+  if (type === 'function') return description || 'function';
+  return description ?? String(type);
+}
+
+function formatPropertyPreviewValue(property) {
+  if (!property || typeof property !== 'object') return '[unserializable value]';
+  if (property.type === 'string') return JSON.stringify(property.value ?? '');
+  if (property.type === 'undefined') return 'undefined';
+  if (property.type === 'symbol') return property.value || 'Symbol()';
+  if (property.type === 'function') return property.value || 'function';
+  if (property.type === 'accessor') return '[accessor]';
+  if (property.type === 'object' && property.subtype === 'null') return 'null';
+  if (property.type === 'object' && property.subtype === 'error') {
+    return formatConsoleErrorSummary(property.valuePreview, property.value);
+  }
+  if (property.type === 'object') {
+    return property.value
+      || property.valuePreview?.description
+      || property.subtype
+      || 'Object';
+  }
+  return property.value ?? '[unserializable value]';
+}
+
+function formatPreviewValue(preview) {
+  if (!preview || typeof preview !== 'object') return '[unserializable value]';
+  if (preview.type !== 'object') {
+    return formatPreviewPrimitive(preview.type, preview.description);
+  }
+  if (preview.subtype === 'null') {
+    return 'null';
+  }
+  if (preview.subtype === 'error') {
+    return formatConsoleErrorSummary(preview, preview.description);
+  }
+  if (preview.subtype === 'array') {
+    const items = (preview.properties ?? [])
+      .filter(property => /^\d+$/.test(property?.name ?? ''))
+      .map(formatPropertyPreviewValue);
+    if (preview.overflow) items.push('…');
+    return `[${items.join(', ')}]`;
+  }
+  if (preview.subtype === 'map') {
+    const entries = (preview.entries ?? []).map(entry => `${formatPreviewValue(entry?.key)} => ${formatPreviewValue(entry?.value)}`);
+    if (preview.overflow) entries.push('…');
+    const prefix = preview.description || 'Map';
+    return `${prefix} {${entries.join(', ')}}`;
+  }
+  if (preview.subtype === 'set') {
+    const entries = (preview.entries ?? []).map(entry => formatPreviewValue(entry?.value ?? entry?.key));
+    if (preview.overflow) entries.push('…');
+    const prefix = preview.description || 'Set';
+    return `${prefix} {${entries.join(', ')}}`;
+  }
+
+  const properties = (preview.properties ?? []).map(property => `${property.name}: ${formatPropertyPreviewValue(property)}`);
+  if (preview.overflow) properties.push('…');
+  if (properties.length === 0) {
+    return preview.description && preview.description !== 'Object' ? preview.description : '{}';
+  }
+  return `{${properties.join(', ')}}`;
 }
 
 function formatConsoleValue(arg) {
@@ -381,6 +612,8 @@ function formatConsoleValue(arg) {
   if ('value' in arg && arg.value !== undefined) {
     return typeof arg.value === 'string' ? arg.value : JSON.stringify(arg.value);
   }
+  if (arg.preview) return formatPreviewValue(arg.preview);
+  if (arg.subtype === 'error') return formatConsoleErrorSummary(null, arg.description);
   if (typeof arg.description === 'string' && arg.description.length > 0) return arg.description;
   if (typeof arg.type === 'string' && arg.type.length > 0) return arg.type;
   return '[unserializable value]';
@@ -395,7 +628,7 @@ function formatConsoleApiEntry(event) {
 function formatExceptionEntry(event) {
   const description = event.exceptionDetails?.exception?.description;
   const firstLine = (typeof description === 'string' && description.length > 0)
-    ? description.split(/\r?\n/, 1)[0]
+    ? takeFirstRenderedLine(description)
     : event.exceptionDetails?.text || 'Uncaught exception';
   return `[exception] ${firstLine}`;
 }
@@ -417,49 +650,72 @@ function formatConsoleOutput(entries) {
     return 'No console or log entries captured since the current page loaded.';
   }
 
-  const droppedBeforeFormatting = Math.max(0, entries.length - MAX_CONSOLE_ENTRIES);
-  const sanitizedEntries = entries
+  const orderedEntries = entries
+    .slice()
+    .sort((left, right) => (left.timestamp - right.timestamp) || (left.arrivalOrder - right.arrivalOrder));
+
+  const droppedBeforeFormatting = Math.max(0, orderedEntries.length - MAX_CONSOLE_ENTRIES);
+  const visibleEntries = orderedEntries
     .slice(-MAX_CONSOLE_ENTRIES)
-    .map(entry => truncateConsoleText(sanitizeConsoleText(entry), MAX_CONSOLE_ENTRY_LENGTH));
-
-  let visibleEntries = sanitizedEntries.slice();
+    .map(entry => truncateConsoleText(sanitizeConsoleText(entry.text), MAX_CONSOLE_ENTRY_LENGTH));
   let droppedByOutputCap = 0;
-  while (visibleEntries.join('\n').length > MAX_CONSOLE_OUTPUT_LENGTH && visibleEntries.length > 0) {
-    visibleEntries.shift();
-    droppedByOutputCap += 1;
-  }
 
-  const summaryLines = [];
-  if (droppedBeforeFormatting > 0) {
-    summaryLines.push(`... ${droppedBeforeFormatting} older ${pluralize(droppedBeforeFormatting, 'entry', 'entries')} omitted.`);
-  }
-  if (droppedByOutputCap > 0) {
-    summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry', 'entries')} omitted after reaching the output cap.`);
-  }
-
-  while (visibleEntries.length > 0 && visibleEntries.concat(summaryLines).join('\n').length > MAX_CONSOLE_OUTPUT_LENGTH) {
-    visibleEntries.shift();
-    droppedByOutputCap += 1;
-    if (summaryLines.length > 0 && summaryLines[summaryLines.length - 1].includes('output cap')) {
-      summaryLines[summaryLines.length - 1] = `... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry', 'entries')} omitted after reaching the output cap.`;
-    } else {
+  while (true) {
+    const summaryLines = [];
+    if (droppedBeforeFormatting > 0) {
+      summaryLines.push(`... ${droppedBeforeFormatting} older ${pluralize(droppedBeforeFormatting, 'entry', 'entries')} omitted.`);
+    }
+    if (droppedByOutputCap > 0) {
       summaryLines.push(`... ${droppedByOutputCap} additional ${pluralize(droppedByOutputCap, 'entry', 'entries')} omitted after reaching the output cap.`);
     }
-  }
 
-  return visibleEntries.concat(summaryLines).join('\n');
+    const output = summaryLines.concat(visibleEntries).join('\n');
+    if (output.length <= MAX_CONSOLE_OUTPUT_LENGTH || visibleEntries.length === 0) {
+      return output;
+    }
+
+    visibleEntries.shift();
+    droppedByOutputCap += 1;
+  }
 }
 
 async function captureConsoleOutput(page) {
   const cdp = await page.context().newCDPSession(page);
   const entries = [];
+  let arrivalOrder = 0;
+  let useRuntimeConsoleReplay = true;
+
+  function recordEntry(text, timestamp) {
+    entries.push({
+      text,
+      timestamp: Number.isFinite(timestamp) ? timestamp : Number.POSITIVE_INFINITY,
+      arrivalOrder,
+    });
+    arrivalOrder += 1;
+  }
+
+  try {
+    const pageConsoleEntries = await page.evaluate(() => Array.isArray(globalThis.__taurusConsoleBuffer) ? globalThis.__taurusConsoleBuffer.slice() : null);
+    if (Array.isArray(pageConsoleEntries)) {
+      useRuntimeConsoleReplay = false;
+      for (const entry of pageConsoleEntries) {
+        const type = entry?.type === 'warning' ? 'warn' : entry?.type || 'log';
+        const body = typeof entry?.text === 'string' ? entry.text : '';
+        recordEntry(`[${type}] ${body}`.trimEnd(), entry?.timestamp);
+      }
+    }
+  } catch {
+    useRuntimeConsoleReplay = true;
+  }
 
   // Every console action attaches a fresh CDP client. Chromium replays buffered
   // console and exception events when Runtime.enable runs on a new session, so
   // this helper stays stateless across separate tool invocations.
-  cdp.on('Runtime.consoleAPICalled', event => entries.push(formatConsoleApiEntry(event)));
-  cdp.on('Runtime.exceptionThrown', event => entries.push(formatExceptionEntry(event)));
-  cdp.on('Log.entryAdded', event => entries.push(formatLogEntry(event.entry)));
+  if (useRuntimeConsoleReplay) {
+    cdp.on('Runtime.consoleAPICalled', event => recordEntry(formatConsoleApiEntry(event), event.timestamp));
+  }
+  cdp.on('Runtime.exceptionThrown', event => recordEntry(formatExceptionEntry(event), event.timestamp));
+  cdp.on('Log.entryAdded', event => recordEntry(formatLogEntry(event.entry), event.entry?.timestamp));
 
   try {
     await cdp.send('Runtime.enable');
@@ -494,6 +750,8 @@ async function ensurePrimaryPage(browser, viewport) {
   const ctx = contexts[0] || await browser.newContext({ viewport, userAgent: USER_AGENT });
   const pages = ctx.pages();
   const page = pages[0] || await ctx.newPage();
+  await page.addInitScript(installConsoleCaptureInPage);
+  await page.evaluate(installConsoleCaptureInPage).catch(() => {});
   const appliedViewport = await ensurePageViewport(page, viewport);
   return { page, viewport: appliedViewport };
 }
@@ -583,13 +841,13 @@ async function handleAction(input) {
         if (!input.url) throwValidationError('"url" is required.');
         const response = await page.goto(input.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         const status = response?.status() ?? 'unknown';
-        const title = await page.title();
+        const title = escapeLineIntegrityCharacters(await page.title());
         return `Navigated to ${input.url}\nTitle: ${title}\nStatus: ${status}`;
       }
 
       case 'snapshot': {
         const url = page.url();
-        const title = await page.title();
+        const title = escapeLineIntegrityCharacters(await page.title());
 
         // Use CDP to get the accessibility tree
         const cdp = await page.context().newCDPSession(page);
@@ -600,7 +858,7 @@ async function handleAction(input) {
           await cdp.detach();
         }
 
-        const tree = formatAXNodes(nodes);
+        const tree = escapeLineIntegrityCharacters(formatAXNodes(nodes));
         return `URL: ${url}\nTitle: ${title}\n\n${tree}`;
       }
 
@@ -696,7 +954,7 @@ async function handleAction(input) {
 
       case 'screenshot': {
         const buffer = await page.screenshot({ fullPage: false });
-        const title = await page.title();
+        const title = escapeLineIntegrityCharacters(await page.title());
         const url = page.url();
         const viewport = await getRealViewport(page);
         return JSON.stringify({
@@ -744,7 +1002,9 @@ async function handleAction(input) {
       case 'evaluate': {
         if (!input.expression) throwValidationError('"expression" is required.');
         const result = await page.evaluate(input.expression);
-        return typeof result === 'string' ? result : JSON.stringify(result, null, 2) ?? 'undefined';
+        return escapeLineIntegrityCharacters(
+          typeof result === 'string' ? result : JSON.stringify(result, null, 2) ?? 'undefined',
+        );
       }
 
       case 'press': {

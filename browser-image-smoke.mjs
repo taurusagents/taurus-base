@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
+const LINE_SEPARATOR = String.fromCharCode(0x2028);
+const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
+const NEXT_LINE = String.fromCharCode(0x85);
 
 function browser(input, { expectFailure = false } = {}) {
   const result = spawnSync('node', [BROWSER_CLI_PATH, JSON.stringify(input)], {
@@ -40,10 +43,33 @@ window.addEventListener("mouseup", event => { state.dragging = false; state.mous
 window.addEventListener("click", event => { state.clicks.push({ x: event.clientX, y: event.clientY, button: event.button }); });
 console.log("boot log", 42);
 console.log("unicode line integrity", "left" + lineSeparator + "middle" + paragraphSeparator + "right", "你好🙂");
+console.log("player state", { hp: 3, name: "hero" });
+console.log("inventory", [1, 2, 3]);
+console.log("buff map", new Map([["hp", 3]]));
 console.warn("a warning\\nwith newline\\tand tab\\u001b[31mRED\\u001b[0m");
+console.error(new Error("combat fail"));
 setTimeout(() => { throw new Error("boot crash"); }, 0);
 new Image().src = "http://127.0.0.1:9/tex.png";
 </script>`;
+  return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
+}
+
+function buildEscapedOutputPage() {
+  const title = `title${LINE_SEPARATOR}split${PARAGRAPH_SEPARATOR}again${NEXT_LINE}done`;
+  const aria = `label${LINE_SEPARATOR}split${PARAGRAPH_SEPARATOR}again${NEXT_LINE}done`;
+  const body = `body${LINE_SEPARATOR}split${PARAGRAPH_SEPARATOR}again${NEXT_LINE}done`;
+  const html = `<!doctype html><title>${title}</title><button aria-label="${aria}">Play</button><h1>${body}</h1><script>
+window.__unsafe = {
+  title: ${JSON.stringify(title)},
+  aria: ${JSON.stringify(aria)},
+  body: ${JSON.stringify(body)},
+};
+</script>`;
+  return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
+}
+
+function buildOrderingPage() {
+  const html = '<!doctype html><title>ordering</title><script>fetch("http://127.0.0.1:9/missing.js").catch(() => setTimeout(() => console.log("after fetch failure"), 50));</script>';
   return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
 }
 
@@ -51,22 +77,43 @@ function evaluateJson(expression) {
   return JSON.parse(browser({ action: 'evaluate', expression }));
 }
 
+function assertNoUnsafeLineSeparators(text, label) {
+  assert.equal(text.includes(LINE_SEPARATOR), false, `${label} should not contain raw 0x2028`);
+  assert.equal(text.includes(PARAGRAPH_SEPARATOR), false, `${label} should not contain raw 0x2029`);
+  assert.equal(text.includes(NEXT_LINE), false, `${label} should not contain raw 0x85`);
+}
+
+function assertEscapedUnsafeLineSeparators(text, label) {
+  assert.equal(text.includes('\\u2028'), true, `${label} should escape 0x2028`);
+  assert.equal(text.includes('\\u2029'), true, `${label} should escape 0x2029`);
+  assert.equal(text.includes('\\x85'), true, `${label} should escape 0x85`);
+}
+
+function assertAppearsBefore(text, earlier, later, label) {
+  const earlierIndex = text.indexOf(earlier);
+  const laterIndex = text.indexOf(later);
+  assert.equal(earlierIndex >= 0, true, `${label} should contain ${JSON.stringify(earlier)}`);
+  assert.equal(laterIndex >= 0, true, `${label} should contain ${JSON.stringify(later)}`);
+  assert.equal(earlierIndex < laterIndex, true, `${label} should keep ${JSON.stringify(earlier)} before ${JSON.stringify(later)}`);
+}
+
 function runSmoke() {
   const openOutput = browser({ action: 'open', url: buildProbePage() });
   assert.match(openOutput, /Title: browser smoke/);
 
   const consoleOutput = browser({ action: 'console' });
-  const lineSeparator = String.fromCharCode(0x2028);
-  const paragraphSeparator = String.fromCharCode(0x2029);
   assert.match(consoleOutput, /\[log\] boot log 42/);
   assert.match(consoleOutput, /\[log\] unicode line integrity left\\u2028middle\\u2029right 你好🙂/);
+  assert.match(consoleOutput, /\[log\] player state \{hp: 3, name: "hero"\}/);
+  assert.match(consoleOutput, /\[log\] inventory \[1, 2, 3\]/);
+  assert.match(consoleOutput, /\[log\] buff map Map\(1\) \{"hp" => 3\}/);
   assert.match(consoleOutput, /\[warn\] a warning\\nwith newline\\tand tabRED/);
+  assert.match(consoleOutput, /\[error\] Error: combat fail/);
   assert.match(consoleOutput, /\[exception\] Error: boot crash/);
   assert.match(consoleOutput, /\[network\].*127\.0\.0\.1:9\/tex\.png/);
   assert.doesNotMatch(consoleOutput, /\u001b\[/);
   assert.doesNotMatch(consoleOutput, /^\[warn\].*\nwith newline/m);
-  assert.equal(consoleOutput.includes(lineSeparator), false, 'console output should not contain raw 0x2028');
-  assert.equal(consoleOutput.includes(paragraphSeparator), false, 'console output should not contain raw 0x2029');
+  assertNoUnsafeLineSeparators(consoleOutput, 'console output');
   assert.equal(consoleOutput.includes('你好🙂'), true, 'console output should preserve non-control Unicode');
   assert.match(browser({ action: 'console' }), /\[log\] boot log 42/);
 
@@ -101,6 +148,30 @@ function runSmoke() {
   assert.match(
     browser({ action: 'click', x: -5, y: 10 }, { expectFailure: true }),
     /"x" is required and must be a non-negative integer\./,
+  );
+  assert.match(
+    browser({ action: 'click', x: null, y: 10 }, { expectFailure: true }),
+    /"x" is required and must be a non-negative integer\./,
+  );
+  assert.match(
+    browser({ action: 'mousemove', x: '25', y: 35 }, { expectFailure: true }),
+    /"x" is required and must be a non-negative integer\./,
+  );
+  assert.match(
+    browser({ action: 'mousedown', x: true, y: 10 }, { expectFailure: true }),
+    /"x" is required and must be a non-negative integer\./,
+  );
+  assert.match(
+    browser({ action: 'drag', x: 0, y: 0, x2: 10, y2: 10, steps: '4' }, { expectFailure: true }),
+    /"steps" is required and must be an integer\./,
+  );
+  assert.match(
+    browser({ action: 'drag', x: 0, y: 0, x2: 10, y2: 10, steps: null }, { expectFailure: true }),
+    /"steps" is required and must be an integer\./,
+  );
+  assert.match(
+    browser({ action: 'drag', x: 0, y: 0, x2: 10, y2: 10, steps: true }, { expectFailure: true }),
+    /"steps" is required and must be an integer\./,
   );
 
   const snapshot = browser({ action: 'snapshot' });
@@ -141,6 +212,33 @@ function runSmoke() {
   assert.deepEqual(webglProbe.pixels, [64, 128, 191, 255]);
   assert.equal(webglProbe.webgpuAdapter, 'null');
 
+  const escapedOpenOutput = browser({ action: 'open', url: buildEscapedOutputPage() });
+  assert.equal(escapedOpenOutput.includes('Title: title\\u2028split\\u2029again\\x85done'), true, 'open output should escape unsafe title separators');
+  assertNoUnsafeLineSeparators(escapedOpenOutput, 'open output');
+
+  const escapedSnapshot = browser({ action: 'snapshot' });
+  assert.equal(escapedSnapshot.includes('button "label\\u2028split\\u2029again\\x85done"'), true, 'snapshot should escape aria-label separators');
+  assert.equal(escapedSnapshot.includes('heading "body\\u2028split\\u2029again\\x85done"'), true, 'snapshot should escape body text separators');
+  assertEscapedUnsafeLineSeparators(escapedSnapshot, 'snapshot output');
+  assertNoUnsafeLineSeparators(escapedSnapshot, 'snapshot output');
+
+  const escapedEvaluate = browser({ action: 'evaluate', expression: 'window.__unsafe' });
+  assertEscapedUnsafeLineSeparators(escapedEvaluate, 'evaluate output');
+  assertNoUnsafeLineSeparators(escapedEvaluate, 'evaluate output');
+
+  const multilineEvaluate = browser({ action: 'evaluate', expression: '(() => "line 1\\nline 2")()' });
+  assert.equal(multilineEvaluate, 'line 1\nline 2');
+
+  const escapedScreenshot = JSON.parse(browser({ action: 'screenshot' }));
+  assert.equal(escapedScreenshot.__type, 'screenshot');
+  assertEscapedUnsafeLineSeparators(escapedScreenshot.text, 'screenshot text');
+  assertNoUnsafeLineSeparators(escapedScreenshot.text, 'screenshot text');
+
+  browser({ action: 'open', url: buildOrderingPage() });
+  browser({ action: 'wait', ms: 500 });
+  const orderedConsoleOutput = browser({ action: 'console' });
+  assertAppearsBefore(orderedConsoleOutput, '[network]', '[log] after fetch failure', 'ordered console output');
+
   browser({
     action: 'open',
     url: `data:text/html;charset=UTF-8,${encodeURIComponent('<!doctype html><title>console cap</title>')}`,
@@ -153,8 +251,9 @@ function runSmoke() {
     return JSON.stringify(true);
   })()`);
   const cappedConsoleOutput = browser({ action: 'console' });
-  assert.match(cappedConsoleOutput, /\.\.\. 10 older entries omitted\./);
-  assert.match(cappedConsoleOutput, /\.\.\. 1 additional entry omitted after reaching the output cap\./);
+  const cappedConsoleLines = cappedConsoleOutput.split('\n');
+  assert.equal(cappedConsoleLines[0], '... 10 older entries omitted.');
+  assert.equal(cappedConsoleLines[1], '... 1 additional entry omitted after reaching the output cap.');
   assert.equal(cappedConsoleOutput.includes('[log] cap-line-210'), true, 'newest capped console entry should survive output trimming');
   assert.equal(cappedConsoleOutput.includes('[log] cap-line-011'), false, 'oldest retained console entry should be dropped first at the output cap');
 
