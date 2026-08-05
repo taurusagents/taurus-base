@@ -70,15 +70,28 @@ jobs:
         run: |
           case "${{ matrix.image_key }}" in
             base)
-              docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
-                python3 --version &&
-                node --version &&
-                go version &&
-                rg --version &&
-                fd --version &&
-                playwright --version &&
-                node -e 'const { chromium } = require(\"playwright\"); (async () => { const browser = await chromium.launch({ headless: true }); await browser.close(); })().catch((error) => { console.error(error); process.exit(1); });'
-              "
+              # Builder-only seccomp relaxation so the smoke can exercise the
+              # browser sandbox probe syscalls in CI; this does not claim the
+              # published runtime matches the same seccomp profile.
+              # Comments must stay above the command: a comment placed between
+              # backslash-continued lines ends the command at that point.
+              docker run --rm \
+                --security-opt seccomp=unconfined \
+                -v "$PWD/browser-image-smoke.mjs:/tmp/browser-image-smoke.mjs:ro" \
+                "${{ matrix.smoke_tag }}" bash -lc "
+                  python3 --version &&
+                  node --version &&
+                  go version &&
+                  rg --version &&
+                  fd --version &&
+                  playwright --version &&
+                  dig -v &&
+                  /usr/bin/time --version &&
+                  ss --version &&
+                  pdftotext -v &&
+                  convert -version > /dev/null &&
+                  node /tmp/browser-image-smoke.mjs
+                "
               ;;
             subscription)
               docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
