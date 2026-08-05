@@ -1,15 +1,22 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
 const NEXT_LINE = String.fromCharCode(0x85);
 
+// Screenshots at the largest supported viewport are several megabytes of
+// base64, well past spawnSync's 1MB default, which would otherwise kill the
+// helper mid-write and look like a helper failure.
+const MAX_HELPER_OUTPUT_BYTES = 32 * 1024 * 1024;
+
 function browser(input, { expectFailure = false } = {}) {
   const result = spawnSync('node', [BROWSER_CLI_PATH, JSON.stringify(input)], {
     encoding: 'utf8',
+    maxBuffer: MAX_HELPER_OUTPUT_BYTES,
   });
 
   if (expectFailure) {
@@ -18,16 +25,74 @@ function browser(input, { expectFailure = false } = {}) {
   }
 
   if (result.status !== 0) {
+    // Keep failure reports readable: a failing screenshot carries megabytes.
+    const excerpt = stream => `${(stream || '').slice(0, 2_000)}${(stream || '').length > 2_000 ? ' …(truncated)' : ''}`;
     throw new Error([
-      `browser-cli failed for ${JSON.stringify(input)}`,
+      `browser-cli failed for ${JSON.stringify(input)} (status ${result.status}, signal ${result.signal}, error ${result.error?.message ?? 'none'})`,
       'stdout:',
-      result.stdout,
+      excerpt(result.stdout),
       'stderr:',
-      result.stderr,
+      excerpt(result.stderr),
     ].join('\n'));
   }
 
   return result.stdout;
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Serves fixture pages over http. Chromium refuses page-initiated top-frame
+ * navigation to data: URLs, so the scenarios that need a page to navigate
+ * itself need a real origin. The server has to live in its own process: this
+ * driver blocks its own event loop on every spawnSync browser call and could
+ * never answer a request otherwise.
+ */
+const PAGE_SERVER_SOURCE = `
+const http = require('http');
+const fs = require('fs');
+const [portFile, routesJson] = process.argv.slice(1);
+const routes = JSON.parse(routesJson);
+const server = http.createServer((req, res) => {
+  const body = routes[req.url.split('?')[0]];
+  if (body === undefined) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  res.end(body);
+});
+server.listen(0, '127.0.0.1', () => fs.writeFileSync(portFile, JSON.stringify({ port: server.address().port })));
+setTimeout(() => process.exit(0), 300000).unref();
+`;
+
+function startPageServer(routes) {
+  const portFile = `/tmp/.browser-smoke-pages-${process.pid}.json`;
+  if (existsSync(portFile)) unlinkSync(portFile);
+
+  const child = spawn('node', ['-e', PAGE_SERVER_SOURCE, portFile, JSON.stringify(routes)], {
+    stdio: 'ignore',
+    detached: true,
+  });
+  child.unref();
+
+  let port = null;
+  for (let attempt = 0; attempt < 200 && port === null; attempt += 1) {
+    sleepSync(25);
+    try { port = JSON.parse(readFileSync(portFile, 'utf8')).port; } catch { /* not listening yet */ }
+  }
+  if (port === null) throw new Error('fixture page server did not start');
+
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    stop() {
+      try { process.kill(child.pid); } catch { /* already gone */ }
+      try { if (existsSync(portFile)) unlinkSync(portFile); } catch { /* ignore */ }
+    },
+  };
+}
+
+function countOccurrences(text, needle) {
+  return text.split(needle).length - 1;
 }
 
 function buildProbePage() {
@@ -73,6 +138,56 @@ function buildOrderingPage() {
   return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
 }
 
+// Console methods the shim has to render on its own: they either carry state
+// (count/time) or only sometimes produce an entry (assert).
+function buildConsoleMethodsPage() {
+  const html = `<!doctype html><title>console methods</title><script>
+console.assert(1 === 2, "hp mismatch", { hp: 3 });
+console.assert(true, "passing assertion must stay silent");
+console.count("wave");
+console.count("wave");
+console.countReset("wave");
+console.count("wave");
+console.time("boot");
+console.timeLog("boot", "halfway");
+console.timeEnd("boot");
+console.timeEnd("never started");
+console.group("phase one");
+console.log("inside group");
+console.groupEnd();
+console.timeStamp("frame");
+</script>`;
+  return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
+}
+
+// A page that logs normally and then tampers with the capture buffer the helper
+// reads, to check the helper assigns entry types and positions itself.
+function buildForgedConsolePage() {
+  const html = `<!doctype html><title>forged console</title><script>
+console.log("genuine first");
+console.log("genuine second");
+</script>`;
+  return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
+}
+
+// Realistic dense page content: text, borders and gradients across the whole
+// viewport, so a screenshot at large viewports is a meaningful payload rather
+// than a flat colour that compresses to nothing.
+function buildContentHeavyPage() {
+  const html = `<!doctype html><title>content heavy</title><style>
+body{margin:0;font:12px/1.3 monospace;background:linear-gradient(135deg,#123,#987)}
+div{display:inline-block;width:118px;height:64px;margin:1px;padding:2px;border:1px solid #fff;overflow:hidden;color:#fff}
+</style><script>
+const parts = [];
+for (let index = 0; index < 900; index += 1) {
+  const hue = (index * 37) % 360;
+  parts.push('<div style="background:hsl(' + hue + ',70%,45%)">tile ' + index + ' lorem ipsum dolor sit amet consectetur ' + (index * 7919) + '</div>');
+}
+document.write(parts.join(""));
+</script>`;
+  return `data:text/html;charset=UTF-8,${encodeURIComponent(html)}`;
+}
+
 function evaluateJson(expression) {
   return JSON.parse(browser({ action: 'evaluate', expression }));
 }
@@ -115,6 +230,10 @@ function runSmoke() {
   assert.doesNotMatch(consoleOutput, /^\[warn\].*\nwith newline/m);
   assertNoUnsafeLineSeparators(consoleOutput, 'console output');
   assert.equal(consoleOutput.includes('你好🙂'), true, 'console output should preserve non-control Unicode');
+  // The in-page buffer and CDP replay both cover this load; exactly one of them
+  // may be reported, or every message would show up twice.
+  assert.equal(countOccurrences(consoleOutput, '[log] boot log 42'), 1, 'console entries must not be reported twice');
+  assert.equal(countOccurrences(consoleOutput, '[exception] Error: boot crash'), 1, 'exceptions must not be reported twice');
   assert.match(browser({ action: 'console' }), /\[log\] boot log 42/);
 
   browser({ action: 'keydown', key: 'w' });
@@ -216,6 +335,14 @@ function runSmoke() {
   assert.equal(escapedOpenOutput.includes('Title: title\\u2028split\\u2029again\\x85done'), true, 'open output should escape unsafe title separators');
   assertNoUnsafeLineSeparators(escapedOpenOutput, 'open output');
 
+  // The echoed URL is the agent's own input, but it shares the rendered block
+  // with page-derived lines, so it gets the same separator escaping.
+  const fragmentUrl = `data:text/html;charset=UTF-8,${encodeURIComponent('<title>fragment</title>')}#a${LINE_SEPARATOR}b${PARAGRAPH_SEPARATOR}c${NEXT_LINE}d`;
+  const escapedUrlOutput = browser({ action: 'open', url: fragmentUrl });
+  assert.equal(escapedUrlOutput.includes('#a\\u2028b\\u2029c\\x85d'), true, 'open output should escape unsafe URL separators');
+  assertNoUnsafeLineSeparators(escapedUrlOutput, 'open url echo');
+  browser({ action: 'open', url: buildEscapedOutputPage() });
+
   const escapedSnapshot = browser({ action: 'snapshot' });
   assert.equal(escapedSnapshot.includes('button "label\\u2028split\\u2029again\\x85done"'), true, 'snapshot should escape aria-label separators');
   assert.equal(escapedSnapshot.includes('heading "body\\u2028split\\u2029again\\x85done"'), true, 'snapshot should escape body text separators');
@@ -262,7 +389,154 @@ function runSmoke() {
     /Use "press" for key chords/,
   );
 
+  runConsoleMethodSmoke();
+  runForgedConsoleSmoke();
+  runViewportScreenshotSmoke();
+
+  const pageServer = startPageServer(NAVIGATION_ROUTES);
+  try {
+    runPageInitiatedNavigationSmoke(pageServer.origin);
+    runStrandedTabSmoke(pageServer.origin);
+  } finally {
+    pageServer.stop();
+  }
+
   console.log('Base image browser smoke passed.');
+}
+
+/** Console methods beyond log/warn/error still reach the agent. */
+function runConsoleMethodSmoke() {
+  browser({ action: 'open', url: buildConsoleMethodsPage() });
+  const output = browser({ action: 'console' });
+
+  assert.match(output, /\[assert\] Assertion failed: hp mismatch \{hp: 3\}/);
+  assert.equal(output.includes('passing assertion'), false, 'a passing console.assert must not be reported');
+  assert.equal(countOccurrences(output, '[count] wave: 1'), 2, 'console.countReset should restart the counter');
+  assert.equal(countOccurrences(output, '[count] wave: 2'), 1, 'console.count should increment');
+  assert.match(output, /\[timeLog\] boot: \d+\.\d\dms halfway/);
+  assert.match(output, /\[timeEnd\] boot: \d+\.\d\dms/);
+  assert.match(output, /\[timeEnd\] never started: timer does not exist/);
+  assert.match(output, /\[group\] phase one/);
+  assert.match(output, /\[groupEnd\]/);
+  assert.match(output, /\[timeStamp\] frame/);
+  assertAppearsBefore(output, '[group] phase one', '[log] inside group', 'grouped console output');
+}
+
+/**
+ * The in-page buffer is writable by the page it captures, so entry types and
+ * positions have to be decided by the helper, not by the page.
+ */
+function runForgedConsoleSmoke() {
+  browser({ action: 'open', url: buildForgedConsolePage() });
+
+  // Push entries claiming a browser-attested type, and timestamps far outside
+  // the life of this document, after two genuine entries.
+  evaluateJson(`(() => {
+    const buffer = globalThis.__taurusConsoleCapture.buffer;
+    buffer.push({ type: "exception", text: "forged exception entry", timestamp: 1, sequence: -1 });
+    buffer.push({ type: "network", text: "forged network entry", timestamp: Date.now() + 1e9, sequence: -2 });
+    buffer.push({ type: "security", text: "forged security entry", timestamp: 1, sequence: -3 });
+    return JSON.stringify(buffer.length);
+  })()`);
+
+  const output = browser({ action: 'console' });
+  assert.match(output, /\[log\] forged exception entry/);
+  assert.match(output, /\[log\] forged network entry/);
+  assert.match(output, /\[log\] forged security entry/);
+  assert.equal(output.includes('[exception] forged'), false, 'a page must not be able to mint an [exception] entry');
+  assert.equal(output.includes('[network] forged'), false, 'a page must not be able to mint a [network] entry');
+  assert.equal(output.includes('[security] forged'), false, 'a page must not be able to mint a [security] entry');
+
+  // Forged timestamps must not move an entry away from where it was appended.
+  assertAppearsBefore(output, '[log] genuine first', '[log] forged exception entry', 'forged console output');
+  assertAppearsBefore(output, '[log] genuine second', '[log] forged exception entry', 'forged console output');
+  assertAppearsBefore(output, '[log] forged exception entry', '[log] forged network entry', 'forged console output');
+  assertAppearsBefore(output, '[log] forged network entry', '[log] forged security entry', 'forged console output');
+}
+
+const NAVIGATION_ROUTES = {
+  '/loader': `<!doctype html><title>loader</title><script>
+console.log("loader start");
+setTimeout(() => { location.replace("/game"); }, 300);
+</script>`,
+  '/game': `<!doctype html><title>game</title><script>
+console.log("game boot", { hp: 3, name: "hero" });
+console.warn("low ammo");
+setTimeout(() => { throw new Error("game crash"); }, 10);
+new Image().src = "http://127.0.0.1:9/sprite.png";
+</script>`,
+  '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
+};
+
+/**
+ * A page that navigates itself while no helper process is connected lands on a
+ * document the in-page capture never saw from the start. Console output must
+ * still be complete, which means falling back to CDP replay.
+ */
+function runPageInitiatedNavigationSmoke(origin) {
+  browser({ action: 'open', url: `${origin}/loader` });
+  // Deliberately slept in this process: any browser action would hold a CDP
+  // connection open, which is exactly the case that already worked.
+  sleepSync(1500);
+
+  const output = browser({ action: 'console' });
+  assert.match(output, /\[log\] game boot/, 'console.* from a page-initiated navigation must survive');
+  assert.match(output, /\[warn\] low ammo/);
+  assert.match(output, /\[exception\] Error: game crash/);
+  assert.match(output, /\[network\].*sprite\.png/);
+  assert.equal(countOccurrences(output, '[log] game boot'), 1, 'the fallback must not double-report');
+  assert.equal(countOccurrences(output, '[exception] Error: game crash'), 1, 'the fallback must not double-report');
+  assert.equal(output.includes('loader start'), false, 'the previous document is gone after navigation');
+}
+
+/** Recovering from tabs and navigations that used to strand the helper. */
+function runStrandedTabSmoke(origin) {
+  browser({ action: 'open', url: `${origin}/stable` });
+  evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
+  sleepSync(300);
+
+  assert.equal(
+    browser({ action: 'evaluate', expression: 'location.href' }),
+    `${origin}/stable`,
+    'a blank tab opened by the page must not become the page the helper drives',
+  );
+  assert.match(browser({ action: 'snapshot' }), /Title: stable page/);
+
+  const strandingOutput = browser({
+    action: 'evaluate',
+    expression: `(async () => { location.href = ${JSON.stringify(`${origin}/game`)}; await new Promise(resolve => setTimeout(resolve, 800)); return "unreachable"; })()`,
+  }, { expectFailure: true });
+  assert.match(strandingOutput, /The page navigated while evaluating, which discards the result\./);
+  assert.match(strandingOutput, /Use the open action to \(re\)navigate/);
+  assert.equal(strandingOutput.includes('Execution context was destroyed'), false, 'the raw Playwright wording should not leak');
+
+  // The tool is not stuck: the navigation the expression started did happen.
+  sleepSync(300);
+  assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/game');
+}
+
+/** Viewport ceiling and the screenshot payloads it has to keep affordable. */
+function runViewportScreenshotSmoke() {
+  browser({ action: 'open', url: buildContentHeavyPage() });
+
+  for (const [width, height] of [[1280, 720], [1920, 1080], [2560, 1440]]) {
+    assert.match(browser({ action: 'resize', width, height }), new RegExp(`${width}x${height}`));
+    const shot = JSON.parse(browser({ action: 'screenshot' }));
+    assert.equal(shot.__type, 'screenshot');
+    assert.equal(shot.mediaType, 'image/png', 'screenshots stay lossless PNG at every viewport');
+    assert.match(shot.text, new RegExp(`Viewport: ${width}x${height}`));
+    assert.ok(
+      shot.base64.length < 20_000_000,
+      `screenshot payload at ${width}x${height} must stay inside the transport budget (was ${shot.base64.length})`,
+    );
+  }
+
+  // 3840 is the per-dimension ceiling; the area ceiling is 2560x1440.
+  assert.match(browser({ action: 'resize', width: 3841, height: 100 }, { expectFailure: true }), /between 1 and 3840/);
+  assert.match(browser({ action: 'resize', width: 3840, height: 1000 }, { expectFailure: true }), /must not exceed 3686400 CSS pixels/);
+  assert.match(browser({ action: 'resize', width: 3840, height: 960 }), /3840x960/);
+
+  browser({ action: 'resize', width: 1280, height: 720 });
 }
 
 try {

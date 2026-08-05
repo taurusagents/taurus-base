@@ -29,14 +29,34 @@ const STATE_FILE = '/tmp/.browser-cli.json';
 const CDP_PORT = 9222;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36';
 const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
-const MAX_VIEWPORT_DIM = 1568;
-// Keep screenshot JSON/base64 payloads below the Browser tool's 5,000,000-character
-// stdout transport budget. Random-noise probes showed 1280x900 remains safely under
-// the limit while larger common viewports such as 1440x900 can exceed it.
-const MAX_VIEWPORT_AREA = 1_152_000;
+const MAX_VIEWPORT_DIM = 3840;
+// Screenshots stay lossless PNG at every size, so the ceiling is purely a
+// transport question: a worst-case incompressible-noise PNG at 2560x1440 is
+// roughly 15M base64 characters, safely inside the Browser tool's 20,000,000
+// character stdout budget, and real pages encode far smaller. Shrinking the
+// image for the model is handled on the Taurus side, not here.
+const MAX_VIEWPORT_AREA = 3_686_400;
 const CONSOLE_SETTLE_MS = 300;
 const MAX_CONSOLE_ENTRIES = 200;
 const MAX_CONSOLE_ENTRY_LENGTH = 500;
+// The in-page console buffer is page-writable, so bound what we are willing to
+// pull out of it per capture: enough to cover the entries we could display,
+// small enough that a page cannot make the helper transfer an arbitrary payload.
+const MAX_PAGE_CONSOLE_ENTRIES_READ = 500;
+const MAX_PAGE_CONSOLE_ENTRY_READ_LENGTH = 2_000;
+// Console entry types the in-page shim can produce. Applied when reading the
+// buffer so a page cannot mint a type that reads as browser-attested.
+const SHIM_CONSOLE_ENTRY_TYPES = new Set([
+  'debug', 'log', 'info', 'warn', 'error', 'dir', 'dirxml', 'trace', 'table',
+  'group', 'groupCollapsed', 'groupEnd', 'assert', 'count', 'timeEnd', 'timeLog', 'timeStamp',
+]);
+// Wall-clock slack when clamping page-reported timestamps against the
+// browser-reported navigation start, which are sampled from different clocks a
+// few milliseconds apart.
+const NAVIGATION_START_TOLERANCE_MS = 1_000;
+// Fallback lower bound when the browser cannot tell us when the document
+// started: still bounds the past, just less tightly.
+const MAX_UNVERIFIED_DOCUMENT_AGE_MS = 24 * 60 * 60 * 1_000;
 // Deliberately match the Taurus app repo's shell output limit so helper-side
 // trimming and shell-side transport truncation stay aligned.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
@@ -218,6 +238,16 @@ function throwValidationError(message) {
   throw new Error(message);
 }
 
+/**
+ * Recognises the family of Playwright/CDP failures that mean "the JavaScript
+ * context you were talking to no longer exists", which in practice is always a
+ * navigation racing the call.
+ */
+function isExecutionContextDestroyedError(err) {
+  const message = err && typeof err === 'object' && 'message' in err ? String(err.message) : String(err);
+  return /execution context was destroyed|cannot find context with specified id|frame was detached|navigating and changing the document/i.test(message);
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -385,13 +415,35 @@ function truncateConsoleText(text, maxLength) {
   return `${text.slice(0, maxLength - 1)}…`;
 }
 
-function installConsoleCaptureInPage() {
-  if (globalThis.__taurusConsoleCaptureInstalled) return;
+/**
+ * Installed in the page so console arguments can be rendered while the real
+ * objects are still alive (CDP only replays previews to a session that was
+ * already attached when the call happened, so a reconnecting helper would
+ * otherwise print "Object" instead of {hp: 3, name: "hero"}).
+ *
+ * `installedAtDocumentStart` records whether this copy was installed before any
+ * page script ran. Only then does the buffer describe the whole document, and
+ * only then may the reader prefer it over CDP replay.
+ */
+function installConsoleCaptureInPage(installedAtDocumentStart) {
+  if (globalThis.__taurusConsoleCapture) return;
 
   const ENTRY_LIMIT = 1_000;
   const originalConsole = globalThis.console;
   const buffer = [];
+  const counters = new Map();
+  const timers = new Map();
   let sequence = 0;
+
+  function nowMs() {
+    try {
+      return typeof performance === 'object' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
+    } catch {
+      return Date.now();
+    }
+  }
 
   function appendEntry(type, text) {
     buffer.push({
@@ -485,27 +537,40 @@ function installConsoleCaptureInPage() {
     }
   }
 
-  function wrapConsoleMethod(methodName, type = methodName) {
+  function renderArguments(args) {
+    return args.map(arg => formatValue(arg)).join(' ');
+  }
+
+  function labelOf(args) {
+    return args.length === 0 || args[0] === undefined ? 'default' : String(args[0]);
+  }
+
+  /**
+   * `render` turns a console call into the entry text, or returns null when the
+   * call should not produce an entry (console.time, a passing assertion, ...).
+   * The page's own console call always runs, whatever we do with it.
+   */
+  function wrapConsoleMethod(methodName, render = renderArguments) {
     const original = typeof originalConsole[methodName] === 'function'
       ? originalConsole[methodName].bind(originalConsole)
       : null;
     if (!original) return;
 
     originalConsole[methodName] = (...args) => {
-      if (methodName === 'clear') {
-        buffer.length = 0;
-        sequence = 0;
-        return original(...args);
+      try {
+        const text = render(args);
+        if (text !== null) appendEntry(methodName, text);
+      } catch {
+        /* capture must never break the page's own console call */
       }
-
-      const rendered = args.map(arg => formatValue(arg)).join(' ');
-      appendEntry(type, rendered);
       return original(...args);
     };
   }
 
-  globalThis.__taurusConsoleCaptureInstalled = true;
-  globalThis.__taurusConsoleBuffer = buffer;
+  globalThis.__taurusConsoleCapture = {
+    installedAtDocumentStart: installedAtDocumentStart === true,
+    buffer,
+  };
 
   wrapConsoleMethod('debug');
   wrapConsoleMethod('log');
@@ -516,7 +581,51 @@ function installConsoleCaptureInPage() {
   wrapConsoleMethod('dirxml');
   wrapConsoleMethod('trace');
   wrapConsoleMethod('table');
-  wrapConsoleMethod('clear');
+  // Grouping is rendered flat: the entry text is what the group header said,
+  // and groupEnd is kept as a marker so nesting is still visible in sequence.
+  wrapConsoleMethod('group');
+  wrapConsoleMethod('groupCollapsed');
+  wrapConsoleMethod('groupEnd', () => '');
+  wrapConsoleMethod('assert', args => {
+    const [condition, ...rest] = args;
+    if (condition) return null;
+    const detail = renderArguments(rest);
+    return detail ? `Assertion failed: ${detail}` : 'Assertion failed';
+  });
+  wrapConsoleMethod('count', args => {
+    const label = labelOf(args);
+    const next = (counters.get(label) ?? 0) + 1;
+    counters.set(label, next);
+    return `${label}: ${next}`;
+  });
+  wrapConsoleMethod('countReset', args => {
+    counters.delete(labelOf(args));
+    return null;
+  });
+  wrapConsoleMethod('time', args => {
+    timers.set(labelOf(args), nowMs());
+    return null;
+  });
+  wrapConsoleMethod('timeEnd', args => {
+    const label = labelOf(args);
+    if (!timers.has(label)) return `${label}: timer does not exist`;
+    const elapsed = nowMs() - timers.get(label);
+    timers.delete(label);
+    return `${label}: ${elapsed.toFixed(2)}ms`;
+  });
+  wrapConsoleMethod('timeLog', args => {
+    const label = labelOf(args);
+    if (!timers.has(label)) return `${label}: timer does not exist`;
+    const elapsed = nowMs() - timers.get(label);
+    const detail = renderArguments(args.slice(1));
+    return `${label}: ${elapsed.toFixed(2)}ms${detail ? ` ${detail}` : ''}`;
+  });
+  wrapConsoleMethod('timeStamp', args => labelOf(args));
+  wrapConsoleMethod('clear', () => {
+    buffer.length = 0;
+    sequence = 0;
+    return null;
+  });
 }
 
 function pluralize(count, singular, plural = `${singular}s`) {
@@ -679,11 +788,85 @@ function formatConsoleOutput(entries) {
   }
 }
 
+/**
+ * Reads the in-page console buffer. Everything here is page-writable, so the
+ * shape is validated and bounded on the way out; meaning is assigned later, on
+ * this side of the boundary.
+ */
+async function readPageConsoleCapture(page, maxEntries, maxEntryLength) {
+  return page.evaluate(([entryLimit, textLimit]) => {
+    const capture = globalThis.__taurusConsoleCapture;
+    if (!capture || !Array.isArray(capture.buffer)) return null;
+    const entries = capture.buffer.slice(-entryLimit).map(entry => ({
+      type: typeof entry?.type === 'string' ? entry.type : '',
+      text: typeof entry?.text === 'string' ? entry.text.slice(0, textLimit) : '',
+      timestamp: typeof entry?.timestamp === 'number' ? entry.timestamp : null,
+    }));
+    return { installedAtDocumentStart: capture.installedAtDocumentStart === true, entries };
+  }, [maxEntries, maxEntryLength]).catch(() => null);
+}
+
+/**
+ * Window that page-reported console timestamps are clamped into, so a page
+ * cannot position a forged entry among browser-attested ones by choosing an
+ * arbitrary timestamp. Navigation start comes from the browser's Performance
+ * metrics rather than the page's `performance.timeOrigin`, which the page can
+ * redefine.
+ */
+async function resolveShimTimestampWindow(cdp) {
+  let documentAgeMs = null;
+  try {
+    await cdp.send('Performance.enable');
+    const { metrics } = await cdp.send('Performance.getMetrics');
+    const values = new Map((metrics ?? []).map(metric => [metric.name, metric.value]));
+    // Both are monotonic seconds; their difference is the age of the document.
+    const navigationStart = values.get('NavigationStart');
+    const monotonicNow = values.get('Timestamp');
+    if (Number.isFinite(navigationStart) && Number.isFinite(monotonicNow) && monotonicNow >= navigationStart) {
+      documentAgeMs = (monotonicNow - navigationStart) * 1_000;
+    }
+  } catch {
+    /* fall back to the loose bound below */
+  }
+
+  const latest = Date.now();
+  const earliest = documentAgeMs === null
+    ? latest - MAX_UNVERIFIED_DOCUMENT_AGE_MS
+    : latest - documentAgeMs - NAVIGATION_START_TOLERANCE_MS;
+  return { earliest, latest };
+}
+
+/**
+ * Turns the page-reported timestamps of one buffer into timestamps worth
+ * sorting browser-attested entries against.
+ *
+ * Two rules, both of which genuine entries already satisfy: a timestamp lies
+ * within the life of the current document, and timestamps never go backwards
+ * along the buffer, which is append-only and stamped at append time. Enforcing
+ * them means a page can neither lift an entry out of its document's time
+ * window, nor move an entry away from the position it was appended at.
+ */
+function clampShimTimestamps(entries, window) {
+  let previous = window.earliest;
+  return entries.map(entry => {
+    const raw = Number.isFinite(entry.timestamp) ? entry.timestamp : previous;
+    const clamped = Math.min(Math.max(raw, previous), window.latest);
+    previous = clamped;
+    return clamped;
+  });
+}
+
+/** Renders one page-buffer entry, refusing any type the shim cannot produce. */
+function formatShimConsoleEntry(entry) {
+  const type = SHIM_CONSOLE_ENTRY_TYPES.has(entry.type) ? entry.type : 'log';
+  return `[${type}] ${entry.text}`.trimEnd();
+}
+
 async function captureConsoleOutput(page) {
   const cdp = await page.context().newCDPSession(page);
   const entries = [];
+  const replayedConsoleEntries = [];
   let arrivalOrder = 0;
-  let useRuntimeConsoleReplay = true;
 
   function recordEntry(text, timestamp) {
     entries.push({
@@ -694,26 +877,16 @@ async function captureConsoleOutput(page) {
     arrivalOrder += 1;
   }
 
-  try {
-    const pageConsoleEntries = await page.evaluate(() => Array.isArray(globalThis.__taurusConsoleBuffer) ? globalThis.__taurusConsoleBuffer.slice() : null);
-    if (Array.isArray(pageConsoleEntries)) {
-      useRuntimeConsoleReplay = false;
-      for (const entry of pageConsoleEntries) {
-        const type = entry?.type === 'warning' ? 'warn' : entry?.type || 'log';
-        const body = typeof entry?.text === 'string' ? entry.text : '';
-        recordEntry(`[${type}] ${body}`.trimEnd(), entry?.timestamp);
-      }
-    }
-  } catch {
-    useRuntimeConsoleReplay = true;
-  }
-
   // Every console action attaches a fresh CDP client. Chromium replays buffered
   // console and exception events when Runtime.enable runs on a new session, so
-  // this helper stays stateless across separate tool invocations.
-  if (useRuntimeConsoleReplay) {
-    cdp.on('Runtime.consoleAPICalled', event => recordEntry(formatConsoleApiEntry(event), event.timestamp));
-  }
+  // this helper stays stateless across separate tool invocations. Replayed
+  // console calls are held aside rather than recorded straight away: whether we
+  // use them or the richer in-page buffer can only be decided after reading the
+  // page, and using both would report every message twice.
+  cdp.on('Runtime.consoleAPICalled', event => replayedConsoleEntries.push({
+    text: formatConsoleApiEntry(event),
+    timestamp: event.timestamp,
+  }));
   cdp.on('Runtime.exceptionThrown', event => recordEntry(formatExceptionEntry(event), event.timestamp));
   cdp.on('Log.entryAdded', event => recordEntry(formatLogEntry(event.entry), event.entry?.timestamp));
 
@@ -721,6 +894,29 @@ async function captureConsoleOutput(page) {
     await cdp.send('Runtime.enable');
     await cdp.send('Log.enable');
     await sleep(CONSOLE_SETTLE_MS);
+
+    // The in-page buffer only describes the whole document when it was installed
+    // before any page script ran. After a page-initiated navigation the helper
+    // may have installed it late into an already-running document (or not at
+    // all), and only CDP replay still has the earlier messages — so prefer
+    // previews when they are complete, and completeness otherwise.
+    const pageCapture = await readPageConsoleCapture(
+      page,
+      MAX_PAGE_CONSOLE_ENTRIES_READ,
+      MAX_PAGE_CONSOLE_ENTRY_READ_LENGTH,
+    );
+    if (pageCapture?.installedAtDocumentStart) {
+      const timestampWindow = await resolveShimTimestampWindow(cdp);
+      const timestamps = clampShimTimestamps(pageCapture.entries, timestampWindow);
+      pageCapture.entries.forEach((entry, index) => {
+        recordEntry(formatShimConsoleEntry(entry), timestamps[index]);
+      });
+    } else {
+      for (const entry of replayedConsoleEntries) {
+        recordEntry(entry.text, entry.timestamp);
+      }
+    }
+
     return formatConsoleOutput(entries);
   } finally {
     await cdp.detach().catch(() => {});
@@ -745,13 +941,28 @@ async function getRealViewport(page) {
     || DEFAULT_VIEWPORT;
 }
 
+function isBlankPage(page) {
+  const url = page.url();
+  return url === '' || url === 'about:blank';
+}
+
 async function ensurePrimaryPage(browser, viewport) {
   const contexts = browser.contexts();
   const ctx = contexts[0] || await browser.newContext({ viewport, userAgent: USER_AGENT });
   const pages = ctx.pages();
-  const page = pages[0] || await ctx.newPage();
-  await page.addInitScript(installConsoleCaptureInPage);
-  await page.evaluate(installConsoleCaptureInPage).catch(() => {});
+  // Prefer the first page that has navigated somewhere. A page can open extra
+  // tabs (window.open) and the order Playwright reports CDP targets in is not
+  // guaranteed, so taking pages[0] blindly can strand every later call on a
+  // fresh about:blank tab while the page the agent is working on sits next to
+  // it. Falling back to the first page keeps a genuinely blank session — the
+  // freshly launched browser — working.
+  const page = pages.find(candidate => !isBlankPage(candidate)) || pages[0] || await ctx.newPage();
+  // Installed twice on purpose: at document start for every future document of
+  // this page (the registration only lives as long as this CDP connection), and
+  // immediately for the document already loaded. Only the first form can claim
+  // to have seen the whole document, so only it passes `true`.
+  await page.addInitScript(installConsoleCaptureInPage, true);
+  await page.evaluate(installConsoleCaptureInPage, false).catch(() => {});
   const appliedViewport = await ensurePageViewport(page, viewport);
   return { page, viewport: appliedViewport };
 }
@@ -842,7 +1053,10 @@ async function handleAction(input) {
         const response = await page.goto(input.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         const status = response?.status() ?? 'unknown';
         const title = escapeLineIntegrityCharacters(await page.title());
-        return `Navigated to ${input.url}\nTitle: ${title}\nStatus: ${status}`;
+        // The URL is the agent's own input rather than page-controlled, but it
+        // is echoed into the same rendered block, so it gets the same treatment.
+        const url = escapeLineIntegrityCharacters(input.url);
+        return `Navigated to ${url}\nTitle: ${title}\nStatus: ${status}`;
       }
 
       case 'snapshot': {
@@ -1001,7 +1215,21 @@ async function handleAction(input) {
 
       case 'evaluate': {
         if (!input.expression) throwValidationError('"expression" is required.');
-        const result = await page.evaluate(input.expression);
+        let result;
+        try {
+          result = await page.evaluate(input.expression);
+        } catch (err) {
+          // An expression that navigates (location.href/reload, form submit)
+          // destroys the very context it is running in, so the result can never
+          // come back. Say what to do instead of surfacing Playwright's wording.
+          if (isExecutionContextDestroyedError(err)) {
+            throw new Error(
+              'The page navigated while evaluating, which discards the result. '
+              + 'Use the open action to (re)navigate, then retry the evaluate on the new page.',
+            );
+          }
+          throw err;
+        }
         return escapeLineIntegrityCharacters(
           typeof result === 'string' ? result : JSON.stringify(result, null, 2) ?? 'undefined',
         );

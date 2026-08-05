@@ -191,9 +191,13 @@ were applied at create time. Do not switch to `seccomp=unconfined`,
 
 Helper-level validation failures and unknown actions exit nonzero so Taurus can
 surface them as tool errors. The `resize` action accepts viewport dimensions
-only in the range `1..1568` per axis, and also requires
-`width × height <= 1,152,000` so screenshot JSON/base64 payloads stay within
-the Browser tool's current 5,000,000-character output budget.
+only in the range `1..3840` per axis, and also requires
+`width × height <= 3,686,400` (2560x1440). Screenshots stay lossless PNG at
+every viewport: even a worst-case incompressible-noise page at that ceiling
+encodes to roughly 14.5M base64 characters, inside the Browser tool's
+20,000,000-character output budget, and real pages are far smaller. Fitting the
+image to what a model can read is the Taurus application's job, not the
+helper's.
 
 ## Notes
 
