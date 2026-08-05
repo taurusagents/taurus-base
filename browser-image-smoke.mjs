@@ -413,6 +413,7 @@ function runSmoke() {
   try {
     runPageInitiatedNavigationSmoke(pageServer.origin);
     runStrandedTabSmoke(pageServer.origin);
+    runSessionResetSmoke(pageServer.origin);
   } finally {
     pageServer.stop();
   }
@@ -566,6 +567,44 @@ function runStrandedTabSmoke(origin) {
     '/game',
     'the navigation the expression started should still have happened',
   );
+}
+
+/**
+ * How many pages the browser is holding, asked of the browser itself: the
+ * helper only ever exposes the one page it drives, so leftover tabs are
+ * invisible from the actions alone.
+ */
+function countBrowserPageTargets() {
+  const probe = spawnSync('node', ['-e', `
+    fetch('http://127.0.0.1:9222/json/list')
+      .then(response => response.json())
+      .then(targets => console.log(targets.filter(target => target.type === 'page').length))
+      .catch(() => console.log(-1));
+  `], { encoding: 'utf8' });
+  return Number((probe.stdout || '').trim());
+}
+
+/**
+ * Closing the browser has to end the session. Chromium restores the previous
+ * session's tabs from the profile, so without help every tab a page ever
+ * opened would come back on the next launch and pile up for the life of the
+ * container.
+ */
+function runSessionResetSmoke(origin) {
+  browser({ action: 'open', url: `${origin}/stable` });
+  for (let index = 0; index < 3; index += 1) {
+    evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
+  }
+  sleepSync(300);
+  assert.ok(countBrowserPageTargets() > 1, 'the scenario needs the page to have opened extra tabs');
+
+  browser({ action: 'close' });
+  browser({ action: 'open', url: `${origin}/stable` });
+
+  assert.equal(countBrowserPageTargets(), 1, 'a new browser session must not inherit the closed session\'s tabs');
+  assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/stable');
+  const shot = JSON.parse(browser({ action: 'screenshot' }));
+  assert.ok(shot.base64.length > 0, 'the recovered session must still be able to produce a screenshot');
 }
 
 /** Viewport ceiling and the screenshot payloads it has to keep affordable. */

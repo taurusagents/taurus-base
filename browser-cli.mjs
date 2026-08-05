@@ -63,6 +63,12 @@ const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
 // Foregrounding the page is a precondition for rendering, not the action
 // itself: give up quickly rather than letting an unresponsive tab stall a call.
 const BRING_TO_FRONT_TIMEOUT_MS = 2_000;
+// Closing the browser is only done once per session, so waiting a few seconds
+// for it to exit is cheap next to attaching to a half-dead browser.
+const BROWSER_EXIT_POLL_ATTEMPTS = 50;
+const BROWSER_EXIT_POLL_INTERVAL_MS = 100;
+// Discarding a restored tab must not become the slowest part of a launch.
+const PAGE_CLOSE_TIMEOUT_MS = 2_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
@@ -205,11 +211,46 @@ function clearState() {
   try { unlinkSync(STATE_FILE); } catch { /* ignore */ }
 }
 
-function closeBrowserProcess() {
+const BROWSER_PROCESS_PATTERN = `chrome.*--remote-debugging-port=${CDP_PORT}`;
+
+function signalBrowserProcess(signalArgs) {
   try {
-    execFileSync('pkill', ['-u', BROWSER_USER, '-f', `chrome.*--remote-debugging-port=${CDP_PORT}`], { stdio: 'ignore' });
+    execFileSync('pkill', [...signalArgs, '-u', BROWSER_USER, '-f', BROWSER_PROCESS_PATTERN], { stdio: 'ignore' });
   } catch {
-    /* browser already gone */
+    /* no matching process */
+  }
+}
+
+function isBrowserProcessRunning() {
+  try {
+    execFileSync('pgrep', ['-u', BROWSER_USER, '-f', BROWSER_PROCESS_PATTERN], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Terminates the browser and waits for it to actually be gone.
+ *
+ * Waiting matters: the next launch binds the same debugging port, and a browser
+ * that is still shutting down still answers on it. The helper would then attach
+ * to the dying session — inheriting its tabs and losing whatever it does next —
+ * instead of to the fresh browser it just started.
+ */
+async function closeBrowserProcess() {
+  signalBrowserProcess([]);
+
+  for (let attempt = 0; attempt < BROWSER_EXIT_POLL_ATTEMPTS; attempt += 1) {
+    if (!isBrowserProcessRunning()) return;
+    await sleep(BROWSER_EXIT_POLL_INTERVAL_MS);
+  }
+
+  // Refused to leave on request; stop asking.
+  signalBrowserProcess(['-9']);
+  for (let attempt = 0; attempt < BROWSER_EXIT_POLL_ATTEMPTS; attempt += 1) {
+    if (!isBrowserProcessRunning()) return;
+    await sleep(BROWSER_EXIT_POLL_INTERVAL_MS);
   }
 }
 
@@ -1102,9 +1143,28 @@ async function ensureBrowser() {
 
   const browser = await chromium.connectOverCDP(cdpUrl);
   const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
+  await discardOtherPages(page);
 
   saveState({ cdpUrl, viewport });
   return { browser, page };
+}
+
+/**
+ * Leaves a freshly launched browser with the single page this helper drives.
+ *
+ * Chromium restores the tabs of the previous session from the profile, so
+ * without this every tab a page ever opened comes back on the next launch and
+ * they accumulate for the life of the container. That matters beyond tidiness:
+ * only one tab is foregrounded and painted, and the helper can only ever drive
+ * one page, so the rest are invisible clutter that changes which page gets
+ * picked. Deliberately only done when a browser is launched — tabs opened
+ * during a live session are left alone.
+ */
+async function discardOtherPages(primaryPage) {
+  for (const other of primaryPage.context().pages()) {
+    if (other === primaryPage) continue;
+    await withTimeout(other.close(), PAGE_CLOSE_TIMEOUT_MS).catch(() => {});
+  }
 }
 
 // ── Actions ──
@@ -1113,7 +1173,7 @@ async function handleAction(input) {
   const { action } = input;
 
   if (action === 'close') {
-    closeBrowserProcess();
+    await closeBrowserProcess();
     clearState();
     return 'Browser closed.';
   }
