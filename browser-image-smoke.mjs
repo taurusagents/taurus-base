@@ -96,19 +96,40 @@ function countOccurrences(text, needle) {
 }
 
 /**
- * Polls `produce` until it returns `expected`, then returns whatever it last
- * produced. Used where the browser needs a moment to reach a state (a new tab
- * committing its first document, say) — a helper that never reaches it simply
- * fails the assertion after the deadline, so this cannot hide a regression.
+ * The URLs of the pages the browser is holding, asked of the browser itself:
+ * the helper only ever exposes the one page it drives, so the rest are
+ * invisible from the actions alone.
  */
-function waitForValue(produce, expected, { timeoutMs = 5_000, intervalMs = 100 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  let latest = produce();
-  while (latest !== expected && Date.now() < deadline) {
-    sleepSync(intervalMs);
-    latest = produce();
+function listBrowserPageTargets() {
+  const probe = spawnSync('node', ['-e', `
+    fetch('http://127.0.0.1:9222/json/list', { signal: AbortSignal.timeout(2000) })
+      .then(response => response.json())
+      .then(targets => console.log(JSON.stringify(targets.filter(target => target.type === 'page').map(target => target.url))))
+      .catch(() => console.log('null'));
+  `], { encoding: 'utf8' });
+  try {
+    const parsed = JSON.parse((probe.stdout || '').trim());
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
-  return latest;
+}
+
+/**
+ * Waits for the browser to reach a starting state — a tab it was told to open
+ * having committed its first document, say. Deliberately used for setup only,
+ * never for the behaviour under test: polling the behaviour would hand a broken
+ * helper repeated chances to look right by accident.
+ */
+function waitForPageTargets(predicate, label, { timeoutMs = 5_000, intervalMs = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let urls = listBrowserPageTargets();
+  while (!(urls && predicate(urls)) && Date.now() < deadline) {
+    sleepSync(intervalMs);
+    urls = listBrowserPageTargets();
+  }
+  assert.ok(urls && predicate(urls), `${label} (browser tabs: ${JSON.stringify(urls)})`);
+  return urls;
 }
 
 function buildProbePage() {
@@ -516,8 +537,12 @@ function runStrandedTabSmoke(origin) {
   browser({ action: 'open', url: 'about:blank' });
   evaluateJson(`JSON.stringify(window.open(${JSON.stringify(`${origin}/stable`)}, "_blank") ? "opened" : "blocked")`);
   const drivenPage = () => browser({ action: 'evaluate', expression: 'location.href' });
+  waitForPageTargets(
+    urls => urls.includes('about:blank') && urls.includes(`${origin}/stable`),
+    'the page should have opened a second tab alongside the blank one',
+  );
   assert.equal(
-    waitForValue(drivenPage, `${origin}/stable`),
+    drivenPage(),
     `${origin}/stable`,
     'the helper must drive the tab that has content, not the blank one it started on',
   );
@@ -546,9 +571,12 @@ function runStrandedTabSmoke(origin) {
   // a new tab) leaves a target nothing can attach to; without recovery the
   // whole browser becomes unreachable and every later call times out.
   evaluateJson(`JSON.stringify(window.open("data:text/html,%3Ctitle%3Estuck%3C/title%3E", "_blank") ? "opened" : "blocked")`);
-  sleepSync(500);
+  waitForPageTargets(
+    urls => urls.includes(''),
+    'the refused tab should be present as a target that never committed a document',
+  );
   assert.equal(
-    waitForValue(drivenPage, `${origin}/stable`),
+    drivenPage(),
     `${origin}/stable`,
     'the helper must recover from a tab it cannot attach to, and stay on the page it was driving',
   );
@@ -561,27 +589,26 @@ function runStrandedTabSmoke(origin) {
   assert.match(strandingOutput, /Use the open action to \(re\)navigate/);
   assert.equal(strandingOutput.includes('Execution context was destroyed'), false, 'the raw Playwright wording should not leak');
 
-  // The tool is not stuck: the navigation the expression started did happen.
+  // The same wording thrown by the page itself is the page's own error, not a
+  // navigation: it has to reach the agent unchanged, or a real failure is
+  // replaced by an explanation that does not apply to it.
+  const lookalikeOutput = browser({
+    action: 'evaluate',
+    expression: 'throw new Error("frame was detached")',
+  }, { expectFailure: true });
+  assert.match(lookalikeOutput, /frame was detached/);
   assert.equal(
-    waitForValue(() => browser({ action: 'evaluate', expression: 'location.pathname' }), '/game'),
-    '/game',
+    lookalikeOutput.includes('The page navigated while evaluating'),
+    false,
+    'an error thrown by the page must not be reported as a navigation',
+  );
+
+  // The tool is not stuck: the navigation the expression started did happen.
+  waitForPageTargets(
+    urls => urls.includes(`${origin}/game`),
     'the navigation the expression started should still have happened',
   );
-}
-
-/**
- * How many pages the browser is holding, asked of the browser itself: the
- * helper only ever exposes the one page it drives, so leftover tabs are
- * invisible from the actions alone.
- */
-function countBrowserPageTargets() {
-  const probe = spawnSync('node', ['-e', `
-    fetch('http://127.0.0.1:9222/json/list')
-      .then(response => response.json())
-      .then(targets => console.log(targets.filter(target => target.type === 'page').length))
-      .catch(() => console.log(-1));
-  `], { encoding: 'utf8' });
-  return Number((probe.stdout || '').trim());
+  assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/game');
 }
 
 /**
@@ -596,12 +623,12 @@ function runSessionResetSmoke(origin) {
     evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
   }
   sleepSync(300);
-  assert.ok(countBrowserPageTargets() > 1, 'the scenario needs the page to have opened extra tabs');
+  assert.ok((listBrowserPageTargets() ?? []).length > 1, 'the scenario needs the page to have opened extra tabs');
 
   browser({ action: 'close' });
   browser({ action: 'open', url: `${origin}/stable` });
 
-  assert.equal(countBrowserPageTargets(), 1, 'a new browser session must not inherit the closed session\'s tabs');
+  assert.equal((listBrowserPageTargets() ?? []).length, 1, 'a new browser session must not inherit the closed session\'s tabs');
   assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/stable');
   const shot = JSON.parse(browser({ action: 'screenshot' }));
   assert.ok(shot.base64.length > 0, 'the recovered session must still be able to produce a screenshot');

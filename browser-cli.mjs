@@ -283,13 +283,30 @@ function throwValidationError(message) {
 }
 
 /**
- * Recognises the family of Playwright/CDP failures that mean "the JavaScript
- * context you were talking to no longer exists", which in practice is always a
- * navigation racing the call.
+ * Playwright's own wording for "the JavaScript context you were talking to no
+ * longer exists", which in practice is always a navigation racing the call.
+ *
+ * Anchored deliberately. A page can throw an error whose message says exactly
+ * the same thing, and Playwright renders a thrown Error as
+ * `page.evaluate: Error: <the page's text>` — so the form *without* that inner
+ * prefix is the one where the browser, not the page, is speaking. Matching the
+ * phrase anywhere would replace a page's real error text with a navigation
+ * explanation that does not apply to it.
  */
+const EXECUTION_CONTEXT_DESTROYED_PATTERN = new RegExp(
+  '^page\\.evaluate: (?:'
+  + 'Execution context was destroyed'
+  + '|Cannot find context with specified id'
+  + '|Frame was detached'
+  + '|Target (?:page, context or browser has been )?closed'
+  + '|Navigating and changing the document'
+  + ')',
+  'i',
+);
+
 function isExecutionContextDestroyedError(err) {
   const message = err && typeof err === 'object' && 'message' in err ? String(err.message) : String(err);
-  return /execution context was destroyed|cannot find context with specified id|frame was detached|navigating and changing the document/i.test(message);
+  return EXECUTION_CONTEXT_DESTROYED_PATTERN.test(message);
 }
 
 function sleep(ms) {
