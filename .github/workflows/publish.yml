@@ -70,10 +70,12 @@ jobs:
         run: |
           case "${{ matrix.image_key }}" in
             base)
+              # Builder-only seccomp relaxation so the smoke can exercise the
+              # browser sandbox probe syscalls in CI; this does not claim the
+              # published runtime matches the same seccomp profile.
+              # Comments must stay above the command: a comment placed between
+              # backslash-continued lines ends the command at that point.
               docker run --rm \
-                # Builder-only seccomp relaxation so the smoke can exercise the
-                # browser sandbox probe syscalls in CI; this does not claim the
-                # published runtime matches the same seccomp profile.
                 --security-opt seccomp=unconfined \
                 -v "$PWD/browser-image-smoke.mjs:/tmp/browser-image-smoke.mjs:ro" \
                 "${{ matrix.smoke_tag }}" bash -lc "
