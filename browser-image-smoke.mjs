@@ -5,8 +5,18 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
 const BROWSER_STATE_PATH = '/tmp/.browser-cli.json';
-const BROWSER_ACTION_LOCK_PATH = '/tmp/.browser-cli.action.lock';
-const BROWSER_PROCESS_PATTERN = 'chrome.*--remote-debugging-port=9222';
+const SMOKE_SESSION_PREFIX = '__browser-smoke__:';
+const SMOKE_SESSION_NAMES = [
+  'isolated-alpha',
+  'isolated-beta',
+  'ttl-a',
+  'ttl-b',
+  'lease-a',
+  'evict-a',
+  'evict-b',
+  'evict-c',
+  'oversized-output',
+];
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
 const NEXT_LINE = String.fromCharCode(0x85);
@@ -50,7 +60,11 @@ function nextIsolatedNonce() {
   return `nonce-${isolatedNonceCounter}`;
 }
 
-function isolatedBrowser(sessionKey, input, { expectFailure = false, env } = {}) {
+function smokeSessionKey(name) {
+  return `${SMOKE_SESSION_PREFIX}${name}`;
+}
+
+function callIsolatedBrowser(sessionKey, input, { expectFailure = false, env } = {}) {
   const nonce = nextIsolatedNonce();
   const rawOutput = browser({
     ...input,
@@ -65,8 +79,13 @@ function isolatedBrowser(sessionKey, input, { expectFailure = false, env } = {})
   assert.equal(envelope.__taurusBrowserResult, 1, `expected an isolated browser envelope for ${sessionKey}`);
   assert.equal(envelope.nonce, nonce, `expected the helper to echo nonce ${nonce}`);
   assert.equal(typeof envelope.output, 'string', true, 'isolated browser output should be textual');
+  assert.equal(typeof envelope.outputTruncated, 'boolean', true, 'isolated browser envelopes must declare whether helper-side truncation happened');
   assert.equal(envelope.isError, expectFailure, `unexpected isolated browser error state for ${sessionKey}: ${envelope.output}`);
-  return envelope;
+  return { rawOutput, envelope };
+}
+
+function isolatedBrowser(sessionKey, input, options) {
+  return callIsolatedBrowser(sessionKey, input, options).envelope;
 }
 
 function isolatedText(sessionKey, input, options) {
@@ -116,6 +135,7 @@ function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
         const envelope = JSON.parse(stdout);
         assert.equal(envelope.__taurusBrowserResult, 1, 'expected an isolated browser envelope from the async helper');
         assert.equal(envelope.nonce, nonce, `expected the async helper to echo nonce ${nonce}`);
+        assert.equal(typeof envelope.outputTruncated, 'boolean', true, 'async isolated-browser envelopes must declare whether helper-side truncation happened');
         resolve(envelope);
       } catch (error) {
         reject(error);
@@ -130,17 +150,22 @@ function sleepSync(ms) {
 
 /**
  * The smoke suite gets rerun in long-lived containers, including after a failed
- * attempt that may have left Chromium or helper state behind. Start and end from
- * a hard reset so each run proves the current code instead of inheriting tabs,
- * sessions, or stale locks from an earlier failure.
+ * attempt that may have left behind the sessions this suite uses. Reset by
+ * asking the helper to close only those known sessions under its own lock, so a
+ * rerun starts clean without deleting shared state or breaking another lock
+ * holder's inode out from under it.
  */
 function resetBrowserFixtureState() {
-  spawnSync('pkill', ['-9', '-u', 'browser', '-f', BROWSER_PROCESS_PATTERN], { stdio: 'ignore' });
-  for (const path of [BROWSER_STATE_PATH, BROWSER_ACTION_LOCK_PATH]) {
+  try {
+    browser({ action: 'close' });
+  } catch {
+    /* ignore a missing or already-broken shared smoke session during cleanup */
+  }
+  for (const sessionName of SMOKE_SESSION_NAMES) {
     try {
-      if (existsSync(path)) unlinkSync(path);
+      isolatedText(smokeSessionKey(sessionName), { action: 'close' });
     } catch {
-      /* ignore cleanup races during fixture reset */
+      /* ignore a missing or already-broken isolated smoke session during cleanup */
     }
   }
 }
@@ -798,8 +823,8 @@ function runSessionResetSmoke(origin) {
 }
 
 async function runIsolatedSessionSmoke(origin) {
-  const alphaSession = 'isolated-alpha';
-  const betaSession = 'isolated-beta';
+  const alphaSession = smokeSessionKey('isolated-alpha');
+  const betaSession = smokeSessionKey('isolated-beta');
 
   assert.match(isolatedText(alphaSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
   assert.match(isolatedText(betaSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
@@ -868,41 +893,61 @@ async function runIsolatedSessionSmoke(origin) {
   browser({ action: 'close' });
 
   const ttlEnv = { TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '100' };
-  isolatedText('ttl-a', { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
-  isolatedText('ttl-a', { action: 'evaluate', expression: 'document.title = "ttl a"' }, { env: ttlEnv });
+  const ttlSessionA = smokeSessionKey('ttl-a');
+  const ttlSessionB = smokeSessionKey('ttl-b');
+  isolatedText(ttlSessionA, { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
+  isolatedText(ttlSessionA, { action: 'evaluate', expression: 'document.title = "ttl a"' }, { env: ttlEnv });
   sleepSync(250);
-  isolatedText('ttl-b', { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
+  isolatedText(ttlSessionB, { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
   assert.equal(
-    isolatedText('ttl-a', { action: 'evaluate', expression: 'location.href' }, { env: ttlEnv }),
+    isolatedText(ttlSessionA, { action: 'evaluate', expression: 'location.href' }, { env: ttlEnv }),
     'about:blank',
     'an idle isolated session should be reaped after the configured TTL expires',
   );
 
-  isolatedText('lease-a', { action: 'open', url: `${origin}/stable` });
+  const leaseSession = smokeSessionKey('lease-a');
+  isolatedText(leaseSession, { action: 'open', url: `${origin}/stable` });
   const state = JSON.parse(readFileSync(BROWSER_STATE_PATH, 'utf8'));
-  state.sessions['lease-a'].inFlight.push({
+  state.sessions[leaseSession].inFlight.push({
     leaseId: 'stale-but-live-pid',
     pid: process.pid,
     startedAt: new Date(Date.now() - (11 * 60 * 1_000)).toISOString(),
   });
   writeFileSync(BROWSER_STATE_PATH, JSON.stringify(state), 'utf8');
   assert.equal(
-    isolatedText('lease-a', { action: 'close' }),
+    isolatedText(leaseSession, { action: 'close' }),
     'Browser session closed.',
     'a lease older than the expiry window should not keep a session blocked just because its PID now belongs to some other live process',
   );
 
+  const oversizedOutputSession = smokeSessionKey('oversized-output');
+  isolatedText(oversizedOutputSession, { action: 'open', url: `${origin}/stable` });
+  const oversizedOutput = callIsolatedBrowser(oversizedOutputSession, {
+    action: 'evaluate',
+    expression: '"0123456789".repeat(25_000)',
+  });
+  assert.equal(oversizedOutput.envelope.isError, false);
+  assert.equal(oversizedOutput.envelope.outputTruncated, true, 'oversized isolated text output should be truncated by the helper before the shell can truncate the envelope');
+  assert.match(oversizedOutput.envelope.output, /Browser helper truncated the rest of this output/);
+  assert.ok(
+    Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') < 100_000,
+    'the serialized isolated-browser envelope should stay below the daemon shell\'s default capture ceiling',
+  );
+
   const evictionEnv = { TAURUS_BROWSER_MAX_SESSIONS: '2', TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '21600000' };
-  isolatedText('evict-a', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
-  isolatedText('evict-a', { action: 'evaluate', expression: 'document.title = "evict a"' }, { env: evictionEnv });
-  isolatedText('evict-b', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
-  isolatedText('evict-b', { action: 'evaluate', expression: 'document.title = "evict b"' }, { env: evictionEnv });
-  isolatedText('evict-c', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
-  isolatedText('evict-c', { action: 'evaluate', expression: 'document.title = "evict c"' }, { env: evictionEnv });
-  assert.equal(isolatedText('evict-b', { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict b');
-  assert.equal(isolatedText('evict-c', { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict c');
+  const evictSessionA = smokeSessionKey('evict-a');
+  const evictSessionB = smokeSessionKey('evict-b');
+  const evictSessionC = smokeSessionKey('evict-c');
+  isolatedText(evictSessionA, { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText(evictSessionA, { action: 'evaluate', expression: 'document.title = "evict a"' }, { env: evictionEnv });
+  isolatedText(evictSessionB, { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText(evictSessionB, { action: 'evaluate', expression: 'document.title = "evict b"' }, { env: evictionEnv });
+  isolatedText(evictSessionC, { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText(evictSessionC, { action: 'evaluate', expression: 'document.title = "evict c"' }, { env: evictionEnv });
+  assert.equal(isolatedText(evictSessionB, { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict b');
+  assert.equal(isolatedText(evictSessionC, { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict c');
   assert.equal(
-    isolatedText('evict-a', { action: 'evaluate', expression: 'location.href' }, { env: evictionEnv }),
+    isolatedText(evictSessionA, { action: 'evaluate', expression: 'location.href' }, { env: evictionEnv }),
     'about:blank',
     'when the session cap is reached, the least recently used idle session should be evicted first',
   );

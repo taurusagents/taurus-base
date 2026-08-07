@@ -60,6 +60,13 @@ const MAX_UNVERIFIED_DOCUMENT_AGE_MS = 24 * 60 * 60 * 1_000;
 // Deliberately match the Taurus app repo's shell output limit so helper-side
 // trimming and shell-side transport truncation stay aligned.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
+// Ordinary Browser text actions travel through the daemon shell's default
+// 100,000-byte capture budget, unlike screenshots which get a dedicated larger
+// allowance. Keep the serialized protocol envelope comfortably below that cap so
+// the daemon always receives a parseable nonce-matched envelope from a matched
+// helper instead of a shell-truncated JSON fragment.
+const MAX_TEXT_PROTOCOL_STDOUT_BYTES = 80_000;
+const TRUNCATED_PROTOCOL_OUTPUT_SUFFIX = '\n\n[Browser helper truncated the rest of this output to keep the protocol envelope within Taurus transport limits.]';
 // Best-effort guard for the one shared default session used by manual CLI
 // callers. When that session opens extra tabs, foregrounding its own page keeps
 // screenshots and snapshots usable without reintroducing cross-run interference
@@ -617,6 +624,66 @@ function sanitizeConsoleText(text) {
 function truncateConsoleText(text, maxLength) {
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 1)}…`;
+}
+
+/**
+ * The daemon only trusts a nonce-matched JSON envelope. If shell-side capture
+ * truncates that JSON first, a matched helper looks indistinguishable from a
+ * mismatched one. Trim oversized text outputs here instead, while preserving an
+ * explicit in-band marker and a boolean flag the daemon can turn into a clear
+ * partial-output notice.
+ */
+function buildBoundedProtocolTextEnvelope(nonce, isError, output) {
+  const baseEnvelope = {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce,
+    isError,
+    output,
+    outputTruncated: false,
+  };
+  if (Buffer.byteLength(JSON.stringify(baseEnvelope), 'utf8') <= MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
+    return baseEnvelope;
+  }
+
+  const truncatedEnvelope = {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce,
+    isError,
+    output: TRUNCATED_PROTOCOL_OUTPUT_SUFFIX,
+    outputTruncated: true,
+  };
+  if (Buffer.byteLength(JSON.stringify(truncatedEnvelope), 'utf8') > MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
+    throw new Error('Browser protocol truncation marker does not fit within the text transport budget.');
+  }
+
+  let low = 0;
+  let high = output.length;
+  let bestOutput = TRUNCATED_PROTOCOL_OUTPUT_SUFFIX;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidateOutput = `${output.slice(0, mid)}${TRUNCATED_PROTOCOL_OUTPUT_SUFFIX}`;
+    const candidateEnvelope = {
+      __taurusBrowserResult: BROWSER_RESULT_MARKER,
+      nonce,
+      isError,
+      output: candidateOutput,
+      outputTruncated: true,
+    };
+    if (Buffer.byteLength(JSON.stringify(candidateEnvelope), 'utf8') <= MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
+      bestOutput = candidateOutput;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce,
+    isError,
+    output: bestOutput,
+    outputTruncated: true,
+  };
 }
 
 /**
@@ -1678,6 +1745,7 @@ function buildProtocolEnvelope(nonce, outcome) {
       nonce,
       isError: false,
       output: outcome.text,
+      outputTruncated: false,
       screenshot: {
         base64: outcome.base64,
         mediaType: outcome.mediaType,
@@ -1686,21 +1754,11 @@ function buildProtocolEnvelope(nonce, outcome) {
     };
   }
 
-  return {
-    __taurusBrowserResult: BROWSER_RESULT_MARKER,
-    nonce,
-    isError: false,
-    output: String(outcome),
-  };
+  return buildBoundedProtocolTextEnvelope(nonce, false, String(outcome));
 }
 
 function buildProtocolErrorEnvelope(nonce, message) {
-  return {
-    __taurusBrowserResult: BROWSER_RESULT_MARKER,
-    nonce,
-    isError: true,
-    output: `Browser error: ${message}`,
-  };
+  return buildBoundedProtocolTextEnvelope(nonce, true, `Browser error: ${message}`);
 }
 
 function renderHelperSuccessOutput(sessionRequest, outcome) {
