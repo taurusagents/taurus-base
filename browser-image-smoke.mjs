@@ -13,10 +13,11 @@ const NEXT_LINE = String.fromCharCode(0x85);
 // helper mid-write and look like a helper failure.
 const MAX_HELPER_OUTPUT_BYTES = 32 * 1024 * 1024;
 
-function browser(input, { expectFailure = false } = {}) {
+function browser(input, { expectFailure = false, env } = {}) {
   const result = spawnSync('node', [BROWSER_CLI_PATH, JSON.stringify(input)], {
     encoding: 'utf8',
     maxBuffer: MAX_HELPER_OUTPUT_BYTES,
+    env: env ? { ...process.env, ...env } : process.env,
   });
 
   if (expectFailure) {
@@ -37,6 +38,87 @@ function browser(input, { expectFailure = false } = {}) {
   }
 
   return result.stdout;
+}
+
+let isolatedNonceCounter = 0;
+
+function nextIsolatedNonce() {
+  isolatedNonceCounter += 1;
+  return `nonce-${isolatedNonceCounter}`;
+}
+
+function isolatedBrowser(sessionKey, input, { expectFailure = false, env } = {}) {
+  const nonce = nextIsolatedNonce();
+  const rawOutput = browser({
+    ...input,
+    _taurus: {
+      browserProtocolVersion: 2,
+      sessionKey,
+      nonce,
+    },
+  }, { env });
+
+  const envelope = JSON.parse(rawOutput);
+  assert.equal(envelope.__taurusBrowserResult, 1, `expected an isolated browser envelope for ${sessionKey}`);
+  assert.equal(envelope.nonce, nonce, `expected the helper to echo nonce ${nonce}`);
+  assert.equal(typeof envelope.output, 'string', true, 'isolated browser output should be textual');
+  assert.equal(envelope.isError, expectFailure, `unexpected isolated browser error state for ${sessionKey}: ${envelope.output}`);
+  return envelope;
+}
+
+function isolatedText(sessionKey, input, options) {
+  return isolatedBrowser(sessionKey, input, options).output;
+}
+
+function isolatedScreenshot(sessionKey, options) {
+  const envelope = isolatedBrowser(sessionKey, { action: 'screenshot' }, options);
+  assert.equal(envelope.isError, false, `isolated screenshot for ${sessionKey} should succeed`);
+  assert.equal(envelope.screenshot?.mediaType, 'image/png');
+  assert.ok(envelope.screenshot?.base64.length > 0, 'isolated screenshot payload should not be empty');
+  return envelope;
+}
+
+function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
+  const nonce = nextIsolatedNonce();
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', [BROWSER_CLI_PATH, JSON.stringify({
+      ...input,
+      _taurus: {
+        browserProtocolVersion: 2,
+        sessionKey,
+        nonce,
+      },
+    })], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: env ? { ...process.env, ...env } : process.env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+    });
+    child.on('error', reject);
+    child.on('exit', code => {
+      if (code !== 0) {
+        reject(new Error(`isolated helper exited ${code}: ${stderr || stdout}`));
+        return;
+      }
+      try {
+        const envelope = JSON.parse(stdout);
+        assert.equal(envelope.__taurusBrowserResult, 1, 'expected an isolated browser envelope from the async helper');
+        assert.equal(envelope.nonce, nonce, `expected the async helper to echo nonce ${nonce}`);
+        resolve(envelope);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
 }
 
 function sleepSync(ms) {
@@ -249,7 +331,7 @@ function assertAppearsBefore(text, earlier, later, label) {
   assert.equal(earlierIndex < laterIndex, true, `${label} should keep ${JSON.stringify(earlier)} before ${JSON.stringify(later)}`);
 }
 
-function runSmoke() {
+async function runSmoke() {
   const openOutput = browser({ action: 'open', url: buildProbePage() });
   assert.match(openOutput, /Title: browser smoke/);
 
@@ -436,6 +518,7 @@ function runSmoke() {
     runStrandedTabSmoke(pageServer.origin);
     runExternalBlankTabSmoke(pageServer.origin);
     runSessionResetSmoke(pageServer.origin);
+    await runIsolatedSessionSmoke(pageServer.origin);
   } finally {
     pageServer.stop();
   }
@@ -698,6 +781,103 @@ function runSessionResetSmoke(origin) {
   assert.ok(shot.base64.length > 0, 'the recovered session must still be able to produce a screenshot');
 }
 
+async function runIsolatedSessionSmoke(origin) {
+  const alphaSession = 'isolated-alpha';
+  const betaSession = 'isolated-beta';
+
+  assert.match(isolatedText(alphaSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(isolatedText(betaSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(
+    isolatedBrowser(alphaSession, { action: 'resize', width: 9999, height: 1 }, { expectFailure: true }).output,
+    /between 1 and 3840/,
+  );
+
+  assert.equal(
+    isolatedText(alphaSession, {
+      action: 'evaluate',
+      expression: '(() => { document.title = "alpha page"; localStorage.setItem("runner", "alpha"); return location.pathname + "|" + document.title + "|" + localStorage.getItem("runner"); })()',
+    }),
+    '/stable|alpha page|alpha',
+  );
+  assert.equal(
+    isolatedText(betaSession, {
+      action: 'evaluate',
+      expression: '(() => { document.title = "beta page"; return String(localStorage.getItem("runner")); })()',
+    }),
+    'null',
+    'a second run should not see the first run\'s localStorage',
+  );
+  assert.equal(
+    isolatedText(betaSession, {
+      action: 'evaluate',
+      expression: '(() => { localStorage.setItem("runner", "beta"); return document.title = "beta page"; })()',
+    }),
+    'beta page',
+  );
+  assert.equal(
+    isolatedText(alphaSession, { action: 'evaluate', expression: 'localStorage.getItem("runner")' }),
+    'alpha',
+    'the first run should keep its own localStorage value after another run writes a different one',
+  );
+
+  assert.match(isolatedText(alphaSession, { action: 'resize', width: 800, height: 600 }), /800x600/);
+  assert.match(isolatedText(betaSession, { action: 'resize', width: 1024, height: 768 }), /1024x768/);
+  assert.equal(
+    isolatedText(alphaSession, { action: 'evaluate', expression: 'JSON.stringify({ width: window.innerWidth, title: document.title })' }),
+    '{"width":800,"title":"alpha page"}',
+  );
+  assert.equal(
+    isolatedText(betaSession, { action: 'evaluate', expression: 'JSON.stringify({ width: window.innerWidth, title: document.title })' }),
+    '{"width":1024,"title":"beta page"}',
+  );
+
+  const [alphaShot, betaShot] = await Promise.all([
+    isolatedBrowserAsync(alphaSession, { action: 'screenshot' }),
+    isolatedBrowserAsync(betaSession, { action: 'screenshot' }),
+  ]);
+  assert.match(alphaShot.output, /alpha page/);
+  assert.match(alphaShot.output, /Viewport: 800x600/);
+  assert.match(betaShot.output, /beta page/);
+  assert.match(betaShot.output, /Viewport: 1024x768/);
+
+  assert.equal(isolatedText(alphaSession, { action: 'close' }), 'Browser session closed.');
+  assert.equal(isolatedText(betaSession, { action: 'evaluate', expression: 'document.title' }), 'beta page');
+  assert.equal(
+    isolatedText(alphaSession, { action: 'evaluate', expression: 'location.href' }),
+    'about:blank',
+    'closing one isolated session should not affect another, and the closed run should restart from a blank page',
+  );
+
+  assert.equal(isolatedText(betaSession, { action: 'close' }), 'Browser session closed.');
+  browser({ action: 'close' });
+
+  const ttlEnv = { TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '100' };
+  isolatedText('ttl-a', { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
+  isolatedText('ttl-a', { action: 'evaluate', expression: 'document.title = "ttl a"' }, { env: ttlEnv });
+  sleepSync(250);
+  isolatedText('ttl-b', { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
+  assert.equal(
+    isolatedText('ttl-a', { action: 'evaluate', expression: 'location.href' }, { env: ttlEnv }),
+    'about:blank',
+    'an idle isolated session should be reaped after the configured TTL expires',
+  );
+
+  const evictionEnv = { TAURUS_BROWSER_MAX_SESSIONS: '2', TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '21600000' };
+  isolatedText('evict-a', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText('evict-a', { action: 'evaluate', expression: 'document.title = "evict a"' }, { env: evictionEnv });
+  isolatedText('evict-b', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText('evict-b', { action: 'evaluate', expression: 'document.title = "evict b"' }, { env: evictionEnv });
+  isolatedText('evict-c', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText('evict-c', { action: 'evaluate', expression: 'document.title = "evict c"' }, { env: evictionEnv });
+  assert.equal(isolatedText('evict-b', { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict b');
+  assert.equal(isolatedText('evict-c', { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict c');
+  assert.equal(
+    isolatedText('evict-a', { action: 'evaluate', expression: 'location.href' }, { env: evictionEnv }),
+    'about:blank',
+    'when the session cap is reached, the least recently used idle session should be evicted first',
+  );
+}
+
 /** Viewport ceiling and the screenshot payloads it has to keep affordable. */
 function runViewportScreenshotSmoke() {
   browser({ action: 'open', url: buildContentHeavyPage() });
@@ -723,7 +903,7 @@ function runViewportScreenshotSmoke() {
 }
 
 try {
-  runSmoke();
+  await runSmoke();
 } finally {
   browser({ action: 'close' });
 }

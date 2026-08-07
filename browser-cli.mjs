@@ -24,6 +24,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { execFileSync, spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 
 const STATE_FILE = '/tmp/.browser-cli.json';
 const CDP_PORT = 9222;
@@ -193,25 +194,149 @@ function assertBrowserSandboxPrerequisites() {
 
 function loadState() {
   try {
-    if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    if (existsSync(STATE_FILE)) {
+      return normalizeState(JSON.parse(readFileSync(STATE_FILE, 'utf-8')));
+    }
   } catch { /* corrupt state */ }
-  return null;
+  return normalizeState(null);
 }
 
 function saveState(state) {
-  const viewport = normalizeViewport(state?.viewport) || DEFAULT_VIEWPORT;
-  const nextState = { viewport };
-  if (typeof state?.cdpUrl === 'string' && state.cdpUrl.length > 0) {
-    nextState.cdpUrl = state.cdpUrl;
-  }
-  writeFileSync(STATE_FILE, JSON.stringify(nextState), 'utf-8');
+  writeFileSync(STATE_FILE, JSON.stringify(normalizeState(state)), 'utf-8');
 }
 
 function clearState() {
   try { unlinkSync(STATE_FILE); } catch { /* ignore */ }
 }
 
+function readPositiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function normalizeTimestamp(value, fallback) {
+  return isNonEmptyString(value) ? value : fallback;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function createLease() {
+  return {
+    leaseId: randomUUID(),
+    pid: process.pid,
+    startedAt: nowIso(),
+  };
+}
+
+function normalizeLease(value) {
+  const pid = Number(value?.pid);
+  if (!isNonEmptyString(value?.leaseId) || !Number.isInteger(pid) || pid < 1) {
+    return null;
+  }
+  return {
+    leaseId: value.leaseId,
+    pid,
+    startedAt: normalizeTimestamp(value?.startedAt, nowIso()),
+  };
+}
+
+function normalizeSession(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (!isNonEmptyString(value.browserContextId) || !isNonEmptyString(value.targetId)) return null;
+
+  return {
+    browserContextId: value.browserContextId,
+    targetId: value.targetId,
+    viewport: normalizeViewport(value.viewport) || DEFAULT_VIEWPORT,
+    createdAt: normalizeTimestamp(value.createdAt, nowIso()),
+    lastSeenAt: normalizeTimestamp(value.lastSeenAt, nowIso()),
+    inFlight: Array.isArray(value.inFlight)
+      ? value.inFlight.map(normalizeLease).filter(Boolean)
+      : [],
+  };
+}
+
+function normalizeState(value) {
+  const legacyViewport = normalizeViewport(value?.legacy?.viewport)
+    || normalizeViewport(value?.viewport)
+    || DEFAULT_VIEWPORT;
+  const legacy = {
+    viewport: legacyViewport,
+    lastSeenAt: normalizeTimestamp(value?.legacy?.lastSeenAt, nowIso()),
+    active: value?.legacy?.active === true || (isNonEmptyString(value?.cdpUrl) && value?.schemaVersion !== STATE_SCHEMA_VERSION),
+  };
+
+  const sessions = {};
+  const sourceSessions = value?.sessions && typeof value.sessions === 'object' ? value.sessions : null;
+  if (sourceSessions) {
+    for (const [sessionKey, sessionValue] of Object.entries(sourceSessions)) {
+      if (!isNonEmptyString(sessionKey)) continue;
+      const normalizedSession = normalizeSession(sessionValue);
+      if (normalizedSession) {
+        sessions[sessionKey] = normalizedSession;
+      }
+    }
+  }
+
+  return {
+    schemaVersion: STATE_SCHEMA_VERSION,
+    cdpUrl: isNonEmptyString(value?.cdpUrl) ? value.cdpUrl : null,
+    legacy,
+    sessions,
+  };
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pruneDeadSessionLeases(state) {
+  for (const session of Object.values(state.sessions)) {
+    session.inFlight = session.inFlight.filter(lease => isProcessAlive(lease.pid));
+  }
+}
+
+function sessionHasActiveLease(session, leaseId = null) {
+  return session.inFlight.some(lease => lease.leaseId !== leaseId);
+}
+
+function removeSessionLease(session, leaseId) {
+  session.inFlight = session.inFlight.filter(lease => lease.leaseId !== leaseId);
+}
+
+function getSessionLastSeenMs(session) {
+  const parsed = Date.parse(session.lastSeenAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 const BROWSER_PROCESS_PATTERN = `chrome.*--remote-debugging-port=${CDP_PORT}`;
+const BROWSER_RESULT_MARKER = 1;
+const BROWSER_PROTOCOL_VERSION = 2;
+const STATE_SCHEMA_VERSION = 2;
+const BROWSER_ACTION_LOCK = '/tmp/.browser-cli.action.lock';
+const DEFAULT_SESSION_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
+const DEFAULT_BROWSER_MAX_SESSIONS = 8;
+const SESSION_IDLE_TTL_MS = readPositiveIntegerEnv(
+  'TAURUS_BROWSER_SESSION_IDLE_TTL_MS',
+  DEFAULT_SESSION_IDLE_TTL_MS,
+);
+const MAX_BROWSER_SESSIONS = readPositiveIntegerEnv(
+  'TAURUS_BROWSER_MAX_SESSIONS',
+  DEFAULT_BROWSER_MAX_SESSIONS,
+);
 
 function signalBrowserProcess(signalArgs) {
   try {
@@ -1016,10 +1141,6 @@ async function captureConsoleOutput(page) {
   }
 }
 
-function getPersistedViewport(state) {
-  return normalizeViewport(state?.viewport) || DEFAULT_VIEWPORT;
-}
-
 async function ensurePageViewport(page, viewport) {
   const current = page.viewportSize();
   if (!current || current.width !== viewport.width || current.height !== viewport.height) {
@@ -1039,7 +1160,57 @@ function isBlankPage(page) {
   return url === '' || url === 'about:blank';
 }
 
-async function ensurePrimaryPage(browser, viewport) {
+function getLegacyViewport(state) {
+  return normalizeViewport(state?.legacy?.viewport) || DEFAULT_VIEWPORT;
+}
+
+function getSessionViewport(session) {
+  return normalizeViewport(session?.viewport) || DEFAULT_VIEWPORT;
+}
+
+async function acquireBrowserActionLock() {
+  const lockCommand = [
+    '-lc',
+    'exec 9>>"$1"; flock -x 9; printf ready; cat >/dev/null',
+    'bash',
+    BROWSER_ACTION_LOCK,
+  ];
+  const child = spawn('bash', lockCommand, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  return await new Promise((resolve, reject) => {
+    let ready = false;
+    let stderr = '';
+
+    const onExit = (code, signal) => {
+      if (!ready) {
+        reject(new Error(`Could not acquire the browser action lock (code ${code ?? 'null'}, signal ${signal ?? 'none'}): ${stderr.trim() || 'no error output'}`));
+      }
+    };
+
+    child.once('exit', onExit);
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+    });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      if (ready || !chunk.includes('ready')) return;
+      ready = true;
+      child.removeListener('exit', onExit);
+      resolve({
+        async release() {
+          if (child.killed || child.exitCode !== null) return;
+          child.stdin.end();
+          await new Promise(resolveRelease => {
+            child.once('exit', () => resolveRelease());
+          });
+        },
+      });
+    });
+  });
+}
+
+async function ensureLegacyPage(browser, viewport) {
   const contexts = browser.contexts();
   const ctx = contexts[0] || await browser.newContext({ viewport, userAgent: USER_AGENT });
   const pages = ctx.pages();
@@ -1068,11 +1239,10 @@ async function ensurePrimaryPage(browser, viewport) {
 
 // ── Launch or connect to Chromium ──
 
-async function connectAndPreparePage(cdpUrl, desiredViewport, timeout) {
+async function connectToBrowser(cdpUrl, timeout) {
   const browser = await chromium.connectOverCDP(cdpUrl, { timeout });
-  const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
-  saveState({ cdpUrl, viewport });
-  return { browser, page };
+  const rootCdp = await browser.newBrowserCDPSession();
+  return { browser, rootCdp };
 }
 
 /**
@@ -1104,27 +1274,21 @@ async function discardUncommittedPageTargets(cdpUrl) {
   }
 }
 
-async function ensureBrowser() {
-  const state = loadState();
-  const desiredViewport = getPersistedViewport(state);
-
-  // Try reconnecting to existing browser
-  if (state?.cdpUrl) {
+async function ensureBrowserConnection(state) {
+  if (state.cdpUrl) {
     try {
-      return await connectAndPreparePage(state.cdpUrl, desiredViewport, 3000);
+      return { ...(await connectToBrowser(state.cdpUrl, 3000)), launchedFresh: false };
     } catch {
-      // Either the browser died, or it is alive but holds a target that cannot
-      // be attached to. Clear the latter out and give the running browser one
-      // more chance before falling back to launching a new one.
       try {
         if (await discardUncommittedPageTargets(state.cdpUrl)) {
-          return await connectAndPreparePage(state.cdpUrl, desiredViewport, 5000);
+          return { ...(await connectToBrowser(state.cdpUrl, 5000)), launchedFresh: false };
         }
       } catch {
         /* still unreachable — fall through to a fresh launch */
       }
-      // Drop the stale connection details but preserve the last viewport choice.
-      saveState({ viewport: desiredViewport });
+      state.cdpUrl = null;
+      state.sessions = {};
+      state.legacy.active = false;
     }
   }
 
@@ -1166,12 +1330,14 @@ async function ensureBrowser() {
     await sleep(200);
   }
 
-  const browser = await chromium.connectOverCDP(cdpUrl);
-  const { page, viewport } = await ensurePrimaryPage(browser, desiredViewport);
-  await discardOtherPages(page);
+  const { browser, rootCdp } = await connectToBrowser(cdpUrl, 0);
+  state.cdpUrl = cdpUrl;
+  return { browser, rootCdp, launchedFresh: true };
+}
 
-  saveState({ cdpUrl, viewport });
-  return { browser, page };
+async function closeConnection(browser, rootCdp) {
+  await rootCdp?.detach?.().catch(() => {});
+  await browser?.close?.().catch(() => {});
 }
 
 /**
@@ -1192,233 +1358,542 @@ async function discardOtherPages(primaryPage) {
   }
 }
 
+async function discardAllPages(browser) {
+  for (const context of browser.contexts()) {
+    for (const page of context.pages()) {
+      await withTimeout(page.close(), PAGE_CLOSE_TIMEOUT_MS).catch(() => {});
+    }
+  }
+}
+
+async function findPageByTargetId(browser, targetId) {
+  for (const context of browser.contexts()) {
+    for (const page of context.pages()) {
+      const cdp = await page.context().newCDPSession(page);
+      try {
+        const { targetInfo } = await cdp.send('Target.getTargetInfo');
+        if (targetInfo?.targetId === targetId) {
+          return page;
+        }
+      } catch {
+        /* ignore pages that disappeared while enumerating */
+      } finally {
+        await cdp.detach().catch(() => {});
+      }
+    }
+  }
+  return null;
+}
+
+async function waitForPageByTargetId(browser, targetId, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const page = await findPageByTargetId(browser, targetId);
+    if (page) return page;
+    await sleep(100);
+  }
+  return null;
+}
+
+async function createIsolatedSession(rootCdp, viewport) {
+  const { browserContextId } = await rootCdp.send('Target.createBrowserContext', {});
+  const { targetId } = await rootCdp.send('Target.createTarget', {
+    url: 'about:blank',
+    browserContextId,
+  });
+  const timestamp = nowIso();
+  return {
+    browserContextId,
+    targetId,
+    viewport,
+    createdAt: timestamp,
+    lastSeenAt: timestamp,
+    inFlight: [],
+  };
+}
+
+async function replaceIsolatedTarget(rootCdp, session) {
+  const { targetId } = await rootCdp.send('Target.createTarget', {
+    url: 'about:blank',
+    browserContextId: session.browserContextId,
+  });
+  session.targetId = targetId;
+}
+
+async function recreateIsolatedSession(rootCdp, session) {
+  const replacement = await createIsolatedSession(rootCdp, getSessionViewport(session));
+  session.browserContextId = replacement.browserContextId;
+  session.targetId = replacement.targetId;
+  session.createdAt = replacement.createdAt;
+  session.lastSeenAt = replacement.lastSeenAt;
+  session.inFlight = replacement.inFlight;
+}
+
+async function prepareIsolatedPage(browser, rootCdp, session) {
+  let page = await findPageByTargetId(browser, session.targetId);
+  if (!page) {
+    const { browserContextIds } = await rootCdp.send('Target.getBrowserContexts');
+    if (browserContextIds.includes(session.browserContextId)) {
+      await replaceIsolatedTarget(rootCdp, session);
+    } else {
+      await recreateIsolatedSession(rootCdp, session);
+    }
+    page = await waitForPageByTargetId(browser, session.targetId);
+  }
+  if (!page) {
+    throw new Error('Could not attach to the isolated browser page for this run.');
+  }
+
+  // Background tabs already render correctly in the current headless Chromium,
+  // so isolated sessions deliberately do not steal the foreground from each
+  // other. Forcing each run's page to the front would recreate the very cross-
+  // run interference this isolation work is meant to remove.
+  await page.addInitScript(installConsoleCaptureInPage, true);
+  await page.evaluate(installConsoleCaptureInPage, false).catch(() => {});
+  const viewport = await ensurePageViewport(page, getSessionViewport(session));
+  session.viewport = viewport;
+  return page;
+}
+
+async function disposeSession(rootCdp, state, sessionKey) {
+  const session = state.sessions[sessionKey];
+  if (!session) return false;
+  await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+  delete state.sessions[sessionKey];
+  return true;
+}
+
+async function reapIdleSessions(rootCdp, state, protectedSessionKey, nowMs) {
+  for (const [sessionKey, session] of Object.entries(state.sessions)) {
+    if (sessionKey === protectedSessionKey || session.inFlight.length > 0) continue;
+    if (nowMs - getSessionLastSeenMs(session) > SESSION_IDLE_TTL_MS) {
+      await disposeSession(rootCdp, state, sessionKey);
+    }
+  }
+}
+
+async function evictOverflowSessions(rootCdp, state, protectedSessionKey, creatingNewSession) {
+  const comparison = creatingNewSession
+    ? () => Object.keys(state.sessions).length >= MAX_BROWSER_SESSIONS
+    : () => Object.keys(state.sessions).length > MAX_BROWSER_SESSIONS;
+  while (comparison()) {
+    const candidate = Object.entries(state.sessions)
+      .filter(([sessionKey, session]) => sessionKey !== protectedSessionKey && session.inFlight.length === 0)
+      .sort((left, right) => getSessionLastSeenMs(left[1]) - getSessionLastSeenMs(right[1]))[0];
+    if (!candidate) {
+      throw new Error(`This container already has ${MAX_BROWSER_SESSIONS} active browser sessions. Close an idle browser session or wait for another Browser call to finish, then retry.`);
+    }
+    await disposeSession(rootCdp, state, candidate[0]);
+  }
+}
+
+async function closeBrowserIfUnused(state) {
+  if (Object.keys(state.sessions).length === 0 && !state.legacy.active) {
+    await closeBrowserProcess();
+    state.cdpUrl = null;
+  }
+}
+
 // ── Actions ──
 
-async function handleAction(input) {
+async function performActionOnPage(input, page, options = {}) {
   const { action } = input;
+  switch (action) {
+    case 'open': {
+      if (!input.url) throwValidationError('"url" is required.');
+      const response = await page.goto(input.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const status = response?.status() ?? 'unknown';
+      const title = escapeLineIntegrityCharacters(await page.title());
+      const url = escapeLineIntegrityCharacters(input.url);
+      return `Navigated to ${url}\nTitle: ${title}\nStatus: ${status}`;
+    }
 
-  if (action === 'close') {
-    await closeBrowserProcess();
-    clearState();
-    return 'Browser closed.';
+    case 'snapshot': {
+      const url = page.url();
+      const title = escapeLineIntegrityCharacters(await page.title());
+      const cdp = await page.context().newCDPSession(page);
+      let nodes;
+      try {
+        ({ nodes } = await cdp.send('Accessibility.getFullAXTree'));
+      } finally {
+        await cdp.detach().catch(() => {});
+      }
+      const tree = escapeLineIntegrityCharacters(formatAXNodes(nodes));
+      return `URL: ${url}\nTitle: ${title}\n\n${tree}`;
+    }
+
+    case 'console':
+      return await captureConsoleOutput(page);
+
+    case 'click': {
+      if (typeof input.selector === 'string' && input.selector.length > 0) {
+        await page.click(input.selector, { timeout: 5000 });
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        return `Clicked: ${input.selector}`;
+      }
+
+      const x = requireInteger(input, 'x');
+      const y = requireInteger(input, 'y');
+      await page.mouse.click(x, y);
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      return `Clicked at (${x}, ${y})`;
+    }
+
+    case 'type': {
+      if (!input.selector) throwValidationError('"selector" is required.');
+      if (input.text === undefined) throwValidationError('"text" is required.');
+      await page.fill(input.selector, input.text, { timeout: 5000 });
+      return `Typed into ${input.selector}: "${input.text}"`;
+    }
+
+    case 'select': {
+      if (!input.selector) throwValidationError('"selector" is required.');
+      if (!input.values?.length) throwValidationError('"values" is required.');
+      await page.selectOption(input.selector, input.values, { timeout: 5000 });
+      return `Selected ${input.values.join(', ')} in ${input.selector}`;
+    }
+
+    case 'hover': {
+      if (!input.selector) throwValidationError('"selector" is required.');
+      await page.hover(input.selector, { timeout: 5000 });
+      return `Hovered: ${input.selector}`;
+    }
+
+    case 'keydown': {
+      await page.keyboard.down(input.key);
+      return `Key down: ${input.key}`;
+    }
+
+    case 'keyup': {
+      await page.keyboard.up(input.key);
+      return `Key up: ${input.key}`;
+    }
+
+    case 'mousemove': {
+      const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mousemove');
+      await page.mouse.move(x, y);
+      return `Mouse moved to (${x}, ${y})`;
+    }
+
+    case 'mousedown': {
+      const button = input.button ?? 'left';
+      validateMouseButton(button);
+      if (hasOwnInput(input, 'x') || hasOwnInput(input, 'y')) {
+        const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mousedown');
+        await page.mouse.move(x, y);
+      }
+      await page.mouse.down({ button });
+      return `Mouse down: ${button}`;
+    }
+
+    case 'mouseup': {
+      const button = input.button ?? 'left';
+      validateMouseButton(button);
+      if (hasOwnInput(input, 'x') || hasOwnInput(input, 'y')) {
+        const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mouseup');
+        await page.mouse.move(x, y);
+      }
+      await page.mouse.up({ button });
+      return `Mouse up: ${button}`;
+    }
+
+    case 'drag': {
+      const { x, y } = requireCoordinatePair(input, 'x', 'y', 'drag');
+      const { x2, y2 } = requireCoordinatePair(input, 'x2', 'y2', 'drag');
+      const steps = input.steps === undefined ? DEFAULT_DRAG_STEPS : requireInteger(input, 'steps');
+      if (steps < 1 || steps > MAX_DRAG_STEPS) {
+        throwValidationError(`"steps" must be an integer between 1 and ${MAX_DRAG_STEPS}.`);
+      }
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x2, y2, { steps });
+      await page.mouse.up();
+      return `Dragged from (${x}, ${y}) to (${x2}, ${y2}) in ${steps} step${steps === 1 ? '' : 's'}`;
+    }
+
+    case 'screenshot': {
+      const buffer = await page.screenshot({ fullPage: false });
+      const title = escapeLineIntegrityCharacters(await page.title());
+      const url = page.url();
+      const viewport = await getRealViewport(page);
+      return {
+        __type: 'screenshot',
+        text: `Screenshot of "${title}" (${url})\nViewport: ${viewport.width}x${viewport.height}, ${buffer.length} bytes`,
+        base64: buffer.toString('base64'),
+        mediaType: 'image/png',
+      };
+    }
+
+    case 'resize': {
+      const viewport = normalizeViewport(input);
+      if (!viewport) {
+        throwValidationError(getViewportValidationError(Number(input.width), Number(input.height)));
+      }
+      await page.setViewportSize(viewport);
+      const appliedViewport = await getRealViewport(page);
+      await options.onViewportChanged?.(appliedViewport);
+      return `Viewport resized to ${appliedViewport.width}x${appliedViewport.height}`;
+    }
+
+    case 'scroll': {
+      const delta = input.direction === 'up' ? -(input.amount ?? 300) : (input.amount ?? 300);
+      await page.mouse.wheel(0, delta);
+      await sleep(300);
+      return `Scrolled ${input.direction ?? 'down'} by ${Math.abs(delta)}px`;
+    }
+
+    case 'back': {
+      await page.goBack({ waitUntil: 'domcontentloaded' });
+      return `Navigated back to: ${page.url()}`;
+    }
+
+    case 'forward': {
+      await page.goForward({ waitUntil: 'domcontentloaded' });
+      return `Navigated forward to: ${page.url()}`;
+    }
+
+    case 'wait': {
+      const ms = input.ms ?? 1000;
+      await sleep(ms);
+      return `Waited ${ms}ms`;
+    }
+
+    case 'evaluate': {
+      if (!input.expression) throwValidationError('"expression" is required.');
+      let result;
+      try {
+        result = await page.evaluate(input.expression);
+      } catch (err) {
+        if (isExecutionContextDestroyedError(err)) {
+          throw new Error(
+            'The page navigated while evaluating, which discards the result. '
+            + 'Use the open action to (re)navigate, then retry the evaluate on the new page.',
+          );
+        }
+        throw err;
+      }
+      return escapeLineIntegrityCharacters(
+        typeof result === 'string' ? result : JSON.stringify(result, null, 2) ?? 'undefined',
+      );
+    }
+
+    case 'press': {
+      if (!input.key) throwValidationError('"key" is required.');
+      if (input.selector) {
+        await page.press(input.selector, input.key, { timeout: 5000 });
+      } else {
+        await page.keyboard.press(input.key);
+      }
+      return `Pressed: ${input.key}${input.selector ? ` on ${input.selector}` : ''}`;
+    }
+
+    case 'upload': {
+      if (!input.selector) throwValidationError('"selector" is required.');
+      if (!input.files?.length) throwValidationError('"files" is required (array of paths).');
+      await page.setInputFiles(input.selector, input.files, { timeout: 5000 });
+      return `Uploaded ${input.files.length} file(s) to ${input.selector}: ${input.files.join(', ')}`;
+    }
+
+    default:
+      throwValidationError(`Unknown action "${action}"`);
+  }
+}
+
+async function handleLegacyAction(input) {
+  if (input.action === 'close') {
+    const lock = await acquireBrowserActionLock();
+    try {
+      await closeBrowserProcess();
+      clearState();
+      return 'Browser closed.';
+    } finally {
+      await lock.release();
+    }
   }
 
   validateActionInput(input);
 
-  const { browser, page } = await ensureBrowser();
+  const lock = await acquireBrowserActionLock();
+  let browser = null;
+  let rootCdp = null;
+  let page = null;
+  let state = null;
+  let launchedFresh = false;
+  try {
+    state = loadState();
+    pruneDeadSessionLeases(state);
+    ({ browser, rootCdp, launchedFresh } = await ensureBrowserConnection(state));
+    await reapIdleSessions(rootCdp, state, null, Date.now());
+    const prepared = await ensureLegacyPage(browser, getLegacyViewport(state));
+    page = prepared.page;
+    if (launchedFresh) {
+      await discardOtherPages(page);
+    }
+    state.legacy.active = true;
+    state.legacy.lastSeenAt = nowIso();
+    state.legacy.viewport = prepared.viewport;
+    saveState(state);
+  } catch (err) {
+    await closeConnection(browser, rootCdp);
+    throw err;
+  } finally {
+    await lock.release();
+  }
 
   try {
-    switch (action) {
-      case 'open': {
-        if (!input.url) throwValidationError('"url" is required.');
-        const response = await page.goto(input.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        const status = response?.status() ?? 'unknown';
-        const title = escapeLineIntegrityCharacters(await page.title());
-        // The URL is the agent's own input rather than page-controlled, but it
-        // is echoed into the same rendered block, so it gets the same treatment.
-        const url = escapeLineIntegrityCharacters(input.url);
-        return `Navigated to ${url}\nTitle: ${title}\nStatus: ${status}`;
-      }
-
-      case 'snapshot': {
-        const url = page.url();
-        const title = escapeLineIntegrityCharacters(await page.title());
-
-        // Use CDP to get the accessibility tree
-        const cdp = await page.context().newCDPSession(page);
-        let nodes;
+    const outcome = await performActionOnPage(input, page, {
+      async onViewportChanged(viewport) {
+        const resizeLock = await acquireBrowserActionLock();
         try {
-          ({ nodes } = await cdp.send('Accessibility.getFullAXTree'));
+          const resizeState = loadState();
+          resizeState.legacy.active = true;
+          resizeState.legacy.lastSeenAt = nowIso();
+          resizeState.legacy.viewport = viewport;
+          saveState(resizeState);
         } finally {
-          await cdp.detach();
+          await resizeLock.release();
         }
-
-        const tree = escapeLineIntegrityCharacters(formatAXNodes(nodes));
-        return `URL: ${url}\nTitle: ${title}\n\n${tree}`;
-      }
-
-      case 'console': {
-        return await captureConsoleOutput(page);
-      }
-
-      case 'click': {
-        if (typeof input.selector === 'string' && input.selector.length > 0) {
-          await page.click(input.selector, { timeout: 5000 });
-          await page.waitForLoadState('domcontentloaded').catch(() => {});
-          return `Clicked: ${input.selector}`;
-        }
-
-        const x = requireInteger(input, 'x');
-        const y = requireInteger(input, 'y');
-        await page.mouse.click(x, y);
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        return `Clicked at (${x}, ${y})`;
-      }
-
-      case 'type': {
-        if (!input.selector) throwValidationError('"selector" is required.');
-        if (input.text === undefined) throwValidationError('"text" is required.');
-        await page.fill(input.selector, input.text, { timeout: 5000 });
-        return `Typed into ${input.selector}: "${input.text}"`;
-      }
-
-      case 'select': {
-        if (!input.selector) throwValidationError('"selector" is required.');
-        if (!input.values?.length) throwValidationError('"values" is required.');
-        await page.selectOption(input.selector, input.values, { timeout: 5000 });
-        return `Selected ${input.values.join(', ')} in ${input.selector}`;
-      }
-
-      case 'hover': {
-        if (!input.selector) throwValidationError('"selector" is required.');
-        await page.hover(input.selector, { timeout: 5000 });
-        return `Hovered: ${input.selector}`;
-      }
-
-      case 'keydown': {
-        await page.keyboard.down(input.key);
-        return `Key down: ${input.key}`;
-      }
-
-      case 'keyup': {
-        await page.keyboard.up(input.key);
-        return `Key up: ${input.key}`;
-      }
-
-      case 'mousemove': {
-        const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mousemove');
-        await page.mouse.move(x, y);
-        return `Mouse moved to (${x}, ${y})`;
-      }
-
-      case 'mousedown': {
-        const button = input.button ?? 'left';
-        validateMouseButton(button);
-        if (hasOwnInput(input, 'x') || hasOwnInput(input, 'y')) {
-          const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mousedown');
-          await page.mouse.move(x, y);
-        }
-        await page.mouse.down({ button });
-        return `Mouse down: ${button}`;
-      }
-
-      case 'mouseup': {
-        const button = input.button ?? 'left';
-        validateMouseButton(button);
-        if (hasOwnInput(input, 'x') || hasOwnInput(input, 'y')) {
-          const { x, y } = requireCoordinatePair(input, 'x', 'y', 'mouseup');
-          await page.mouse.move(x, y);
-        }
-        await page.mouse.up({ button });
-        return `Mouse up: ${button}`;
-      }
-
-      case 'drag': {
-        const { x, y } = requireCoordinatePair(input, 'x', 'y', 'drag');
-        const { x2, y2 } = requireCoordinatePair(input, 'x2', 'y2', 'drag');
-        const steps = input.steps === undefined ? DEFAULT_DRAG_STEPS : requireInteger(input, 'steps');
-        if (steps < 1 || steps > MAX_DRAG_STEPS) {
-          throwValidationError(`"steps" must be an integer between 1 and ${MAX_DRAG_STEPS}.`);
-        }
-        await page.mouse.move(x, y);
-        await page.mouse.down();
-        await page.mouse.move(x2, y2, { steps });
-        await page.mouse.up();
-        return `Dragged from (${x}, ${y}) to (${x2}, ${y2}) in ${steps} step${steps === 1 ? '' : 's'}`;
-      }
-
-      case 'screenshot': {
-        const buffer = await page.screenshot({ fullPage: false });
-        const title = escapeLineIntegrityCharacters(await page.title());
-        const url = page.url();
-        const viewport = await getRealViewport(page);
-        return JSON.stringify({
-          __type: 'screenshot',
-          text: `Screenshot of "${title}" (${url})\nViewport: ${viewport.width}x${viewport.height}, ${buffer.length} bytes`,
-          base64: buffer.toString('base64'),
-          mediaType: 'image/png',
-        });
-      }
-
-      case 'resize': {
-        const viewport = normalizeViewport(input);
-        if (!viewport) {
-          throwValidationError(getViewportValidationError(Number(input.width), Number(input.height)));
-        }
-        await page.setViewportSize(viewport);
-        const appliedViewport = await getRealViewport(page);
-        saveState({ ...loadState(), viewport: appliedViewport });
-        return `Viewport resized to ${appliedViewport.width}x${appliedViewport.height}`;
-      }
-
-      case 'scroll': {
-        const delta = input.direction === 'up' ? -(input.amount ?? 300) : (input.amount ?? 300);
-        await page.mouse.wheel(0, delta);
-        await sleep(300);
-        return `Scrolled ${input.direction ?? 'down'} by ${Math.abs(delta)}px`;
-      }
-
-      case 'back': {
-        await page.goBack({ waitUntil: 'domcontentloaded' });
-        return `Navigated back to: ${page.url()}`;
-      }
-
-      case 'forward': {
-        await page.goForward({ waitUntil: 'domcontentloaded' });
-        return `Navigated forward to: ${page.url()}`;
-      }
-
-      case 'wait': {
-        const ms = input.ms ?? 1000;
-        await sleep(ms);
-        return `Waited ${ms}ms`;
-      }
-
-      case 'evaluate': {
-        if (!input.expression) throwValidationError('"expression" is required.');
-        let result;
-        try {
-          result = await page.evaluate(input.expression);
-        } catch (err) {
-          // An expression that navigates (location.href/reload, form submit)
-          // destroys the very context it is running in, so the result can never
-          // come back. Say what to do instead of surfacing Playwright's wording.
-          if (isExecutionContextDestroyedError(err)) {
-            throw new Error(
-              'The page navigated while evaluating, which discards the result. '
-              + 'Use the open action to (re)navigate, then retry the evaluate on the new page.',
-            );
-          }
-          throw err;
-        }
-        return escapeLineIntegrityCharacters(
-          typeof result === 'string' ? result : JSON.stringify(result, null, 2) ?? 'undefined',
-        );
-      }
-
-      case 'press': {
-        if (!input.key) throwValidationError('"key" is required.');
-        if (input.selector) {
-          await page.press(input.selector, input.key, { timeout: 5000 });
-        } else {
-          await page.keyboard.press(input.key);
-        }
-        return `Pressed: ${input.key}${input.selector ? ` on ${input.selector}` : ''}`;
-      }
-
-      case 'upload': {
-        if (!input.selector) throwValidationError('"selector" is required.');
-        if (!input.files?.length) throwValidationError('"files" is required (array of paths).');
-        await page.setInputFiles(input.selector, input.files, { timeout: 5000 });
-        return `Uploaded ${input.files.length} file(s) to ${input.selector}: ${input.files.join(', ')}`;
-      }
-
-      default:
-        throwValidationError(`Unknown action "${action}"`);
-    }
+      },
+    });
+    return typeof outcome === 'string' ? outcome : JSON.stringify(outcome);
   } finally {
-    // Disconnect CDP but leave Chromium running
-    browser.close().catch(() => {});
+    await closeConnection(browser, rootCdp);
+  }
+}
+
+function getIsolationControl(input) {
+  const control = input?._taurus;
+  if (!control || typeof control !== 'object') return null;
+  if (control.browserProtocolVersion !== BROWSER_PROTOCOL_VERSION) return null;
+  if (!isNonEmptyString(control.sessionKey) || !isNonEmptyString(control.nonce)) return null;
+  return control;
+}
+
+function buildIsolatedEnvelope(control, outcome) {
+  if (outcome && typeof outcome === 'object' && outcome.__type === 'screenshot') {
+    return {
+      __taurusBrowserResult: BROWSER_RESULT_MARKER,
+      nonce: control.nonce,
+      isError: false,
+      output: outcome.text,
+      screenshot: {
+        base64: outcome.base64,
+        mediaType: outcome.mediaType,
+        text: outcome.text,
+      },
+    };
+  }
+
+  return {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce: control.nonce,
+    isError: false,
+    output: String(outcome),
+  };
+}
+
+function buildIsolatedErrorEnvelope(control, message) {
+  return {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce: control.nonce,
+    isError: true,
+    output: `Browser error: ${message}`,
+  };
+}
+
+async function handleIsolatedClose(control) {
+  const lock = await acquireBrowserActionLock();
+  let browser = null;
+  let rootCdp = null;
+  try {
+    const state = loadState();
+    pruneDeadSessionLeases(state);
+    if (state.sessions[control.sessionKey]) {
+      ({ browser, rootCdp } = await ensureBrowserConnection(state));
+      const session = state.sessions[control.sessionKey];
+      if (sessionHasActiveLease(session)) {
+        throw new Error('This run already has another Browser call in flight. Wait for it to finish before closing the browser session.');
+      }
+      await disposeSession(rootCdp, state, control.sessionKey);
+    }
+    await closeBrowserIfUnused(state);
+    saveState(state);
+    return 'Browser session closed.';
+  } finally {
+    await closeConnection(browser, rootCdp);
+    await lock.release();
+  }
+}
+
+async function handleIsolatedAction(input, control) {
+  if (input.action === 'close') {
+    return await handleIsolatedClose(control);
+  }
+
+  validateActionInput(input);
+
+  const lease = createLease();
+  const lock = await acquireBrowserActionLock();
+  let browser = null;
+  let rootCdp = null;
+  let page = null;
+  let session = null;
+  let launchedFresh = false;
+  try {
+    const state = loadState();
+    pruneDeadSessionLeases(state);
+    ({ browser, rootCdp, launchedFresh } = await ensureBrowserConnection(state));
+    if (launchedFresh && !state.legacy.active) {
+      await discardAllPages(browser);
+    }
+    await reapIdleSessions(rootCdp, state, control.sessionKey, Date.now());
+
+    session = state.sessions[control.sessionKey];
+    await evictOverflowSessions(rootCdp, state, control.sessionKey, !session);
+    if (!session) {
+      session = await createIsolatedSession(rootCdp, DEFAULT_VIEWPORT);
+      state.sessions[control.sessionKey] = session;
+    }
+    if (sessionHasActiveLease(session)) {
+      throw new Error('This run already has another Browser call in flight. Wait for it to finish before issuing another Browser action.');
+    }
+
+    page = await prepareIsolatedPage(browser, rootCdp, session);
+    session.lastSeenAt = nowIso();
+    session.inFlight.push(lease);
+    saveState(state);
+  } catch (err) {
+    await closeConnection(browser, rootCdp);
+    throw err;
+  } finally {
+    await lock.release();
+  }
+
+  let viewportAfter = null;
+  try {
+    return await performActionOnPage(input, page, {
+      async onViewportChanged(viewport) {
+        viewportAfter = viewport;
+      },
+    });
+  } finally {
+    const finalizeLock = await acquireBrowserActionLock();
+    try {
+      const finalizeState = loadState();
+      pruneDeadSessionLeases(finalizeState);
+      const currentSession = finalizeState.sessions[control.sessionKey];
+      if (currentSession) {
+        removeSessionLease(currentSession, lease.leaseId);
+        currentSession.lastSeenAt = nowIso();
+        if (viewportAfter) {
+          currentSession.viewport = viewportAfter;
+        }
+      }
+      saveState(finalizeState);
+    } finally {
+      await closeConnection(browser, rootCdp);
+      await finalizeLock.release();
+    }
   }
 }
 
@@ -1481,9 +1956,20 @@ function formatAXNodes(nodes) {
 
 try {
   const input = JSON.parse(process.argv[2] || '{}');
-  const result = await handleAction(input);
-  process.stdout.write(result);
+  const control = getIsolationControl(input);
+  if (control) {
+    try {
+      const result = await handleIsolatedAction(input, control);
+      process.stdout.write(JSON.stringify(buildIsolatedEnvelope(control, result)));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stdout.write(JSON.stringify(buildIsolatedErrorEnvelope(control, message)));
+    }
+  } else {
+    const result = await handleLegacyAction(input);
+    process.stdout.write(result);
+  }
 } catch (err) {
-  process.stderr.write(`Browser error: ${err.message}\n`);
+  process.stderr.write(`Browser error: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 }
