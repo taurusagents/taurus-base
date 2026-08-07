@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
 const BROWSER_STATE_PATH = '/tmp/.browser-cli.json';
@@ -17,6 +17,8 @@ const SMOKE_SESSION_NAMES = [
   'evict-b',
   'evict-c',
   'oversized-output',
+  'hostile-wedge',
+  'hostile-survivor',
 ];
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
@@ -79,8 +81,8 @@ function callIsolatedBrowser(sessionKey, input, { expectFailure = false, env } =
   const envelope = JSON.parse(rawOutput);
   assert.equal(envelope.__taurusBrowserResult, 1, `expected an isolated browser envelope for ${sessionKey}`);
   assert.equal(envelope.nonce, nonce, `expected the helper to echo nonce ${nonce}`);
-  assert.equal(typeof envelope.output, 'string', true, 'isolated browser output should be textual');
-  assert.equal(typeof envelope.outputTruncated, 'boolean', true, 'isolated browser envelopes must declare whether helper-side truncation happened');
+  assert.equal(typeof envelope.output, 'string', 'isolated browser output should be textual');
+  assert.equal(typeof envelope.outputTruncated, 'boolean', 'isolated browser envelopes must declare whether helper-side truncation happened');
   assert.equal(envelope.isError, expectFailure, `unexpected isolated browser error state for ${sessionKey}: ${envelope.output}`);
   return { rawOutput, envelope };
 }
@@ -136,7 +138,7 @@ function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
         const envelope = JSON.parse(stdout);
         assert.equal(envelope.__taurusBrowserResult, 1, 'expected an isolated browser envelope from the async helper');
         assert.equal(envelope.nonce, nonce, `expected the async helper to echo nonce ${nonce}`);
-        assert.equal(typeof envelope.outputTruncated, 'boolean', true, 'async isolated-browser envelopes must declare whether helper-side truncation happened');
+        assert.equal(typeof envelope.outputTruncated, 'boolean', 'async isolated-browser envelopes must declare whether helper-side truncation happened');
         resolve(envelope);
       } catch (error) {
         reject(error);
@@ -149,17 +151,31 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function runLockedStateScript(script, args = [], { input } = {}) {
+  const result = spawnSync(
+    'flock',
+    ['-x', BROWSER_ACTION_LOCK_PATH, 'node', '-e', script, BROWSER_STATE_PATH, ...args],
+    { encoding: 'utf8', input },
+  );
+  if (result.status !== 0) {
+    throw new Error(`locked state helper failed: ${result.stderr || result.stdout || result.error?.message || 'unknown error'}`);
+  }
+  return result.stdout || '';
+}
+
 function getPersistedSessions() {
   try {
     // The helper rewrites its state file while holding a flock on this lock
     // path. Read under the same lock so the smoke never mistakes a torn rewrite
     // for "no default session" and tears down someone else's idle browser.
-    const stateRead = spawnSync(
-      'bash',
-      ['-lc', 'exec 9>>"$1"; flock -x 9; cat "$2" 2>/dev/null || true', 'bash', BROWSER_ACTION_LOCK_PATH, BROWSER_STATE_PATH],
-      { encoding: 'utf8' },
-    );
-    const state = JSON.parse(stateRead.stdout || '{}');
+    const state = JSON.parse(runLockedStateScript(`
+      const fs = require('fs');
+      try {
+        process.stdout.write(fs.readFileSync(process.argv[1], 'utf8'));
+      } catch {
+        process.stdout.write('{}');
+      }
+    `) || '{}');
     return state && typeof state === 'object' && state.sessions && typeof state.sessions === 'object'
       ? state.sessions
       : {};
@@ -180,6 +196,7 @@ function defaultSessionExists() {
  * holder's inode out from under it.
  */
 function resetBrowserFixtureState({ closeDefaultSession } = {}) {
+  closeBrowserTargetsMatching(/^http:\/\/127\.0\.0\.1:\d+\/wedge$/);
   if (closeDefaultSession) {
     try {
       browser({ action: 'close' });
@@ -248,16 +265,11 @@ function countOccurrences(text, needle) {
   return text.split(needle).length - 1;
 }
 
-/**
- * The URLs of the pages the browser is holding, asked of the browser itself:
- * the helper only ever exposes the one page it drives, so the rest are
- * invisible from the actions alone.
- */
-function listBrowserPageTargets() {
+function listBrowserTargets() {
   const probe = spawnSync('node', ['-e', `
     fetch('http://127.0.0.1:9222/json/list', { signal: AbortSignal.timeout(2000) })
       .then(response => response.json())
-      .then(targets => console.log(JSON.stringify(targets.filter(target => target.type === 'page').map(target => target.url))))
+      .then(targets => console.log(JSON.stringify(Array.isArray(targets) ? targets : null)))
       .catch(() => console.log('null'));
   `], { encoding: 'utf8' });
   try {
@@ -265,6 +277,43 @@ function listBrowserPageTargets() {
     return Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * The URLs of the pages the browser is holding, asked of the browser itself:
+ * the helper only ever exposes the one page it drives, so the rest are
+ * invisible from the actions alone.
+ */
+function listBrowserPageTargets() {
+  const targets = listBrowserTargets();
+  return targets ? targets.filter(target => target.type === 'page').map(target => target.url) : null;
+}
+
+function closeBrowserTargetsByUrl(url) {
+  const targets = listBrowserTargets() ?? [];
+  for (const target of targets) {
+    if (target?.type !== 'page' || target?.url !== url || typeof target?.id !== 'string') continue;
+    const closeResult = spawnSync('node', ['-e', `
+      fetch(${JSON.stringify(`http://127.0.0.1:9222/json/close/${target.id}`)}, { method: 'PUT', signal: AbortSignal.timeout(2000) })
+        .then(() => console.log('closed'))
+        .catch(error => console.log('failed:' + error.message));
+    `], { encoding: 'utf8' });
+    assert.equal((closeResult.stdout || '').trim(), 'closed', `could not close browser target ${target.id} for ${url}`);
+  }
+}
+
+function closeBrowserTargetsMatching(pattern) {
+  const targets = listBrowserTargets() ?? [];
+  for (const target of targets) {
+    if (target?.type !== 'page' || typeof target?.url !== 'string' || typeof target?.id !== 'string') continue;
+    if (!pattern.test(target.url)) continue;
+    const closeResult = spawnSync('node', ['-e', `
+      fetch(${JSON.stringify(`http://127.0.0.1:9222/json/close/${target.id}`)}, { method: 'PUT', signal: AbortSignal.timeout(2000) })
+        .then(() => console.log('closed'))
+        .catch(error => console.log('failed:' + error.message));
+    `], { encoding: 'utf8' });
+    assert.equal((closeResult.stdout || '').trim(), 'closed', `could not close browser target ${target.id} for ${target.url}`);
   }
 }
 
@@ -598,6 +647,7 @@ async function runSmoke() {
       runExternalBlankTabSmoke(pageServer.origin);
       runSessionResetSmoke(pageServer.origin);
     }
+    runHostilePageIsolationSmoke(pageServer.origin);
     await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
   } finally {
     pageServer.stop();
@@ -669,7 +719,46 @@ setTimeout(() => { throw new Error("game crash"); }, 10);
 new Image().src = "http://127.0.0.1:9/sprite.png";
 </script>`,
   '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
+  '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>',
 };
+
+function runHostilePageIsolationSmoke(origin) {
+  const wedgedSession = smokeSessionKey('hostile-wedge');
+  const survivingSession = smokeSessionKey('hostile-survivor');
+
+  assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(isolatedText(wedgedSession, { action: 'open', url: `${origin}/wedge` }), /wedge page/);
+  sleepSync(500);
+
+  const failure = isolatedBrowser(
+    survivingSession,
+    { action: 'evaluate', expression: 'location.pathname' },
+    { expectFailure: true },
+  );
+  assert.match(
+    failure.output,
+    /Could not attach to the existing Chromium instance in this container while it is still running/,
+  );
+  const persistedSessions = getPersistedSessions();
+  assert.equal(Boolean(persistedSessions[wedgedSession]), true, 'a wedged session must stay recorded instead of wiping all session state');
+  assert.equal(Boolean(persistedSessions[survivingSession]), true, 'another run\'s session record must survive a hostile page in a different run');
+  assert.equal(
+    (listBrowserPageTargets() ?? []).includes(`${origin}/stable`),
+    true,
+    'another run\'s page must remain open after a hostile page makes connectOverCDP fail',
+  );
+
+  closeBrowserTargetsByUrl(`${origin}/wedge`);
+  waitForPageTargets(
+    urls => !urls.includes(`${origin}/wedge`) && urls.includes(`${origin}/stable`),
+    'closing the hostile page outside Playwright should leave the surviving page intact',
+  );
+  assert.equal(
+    isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }),
+    '/stable',
+    'after the hostile page is removed, the surviving run should continue on its original page',
+  );
+}
 
 /**
  * A page that navigates itself while no helper process is connected lands on a
@@ -945,13 +1034,19 @@ async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
 
   const leaseSession = smokeSessionKey('lease-a');
   isolatedText(leaseSession, { action: 'open', url: `${origin}/stable` });
-  const state = JSON.parse(readFileSync(BROWSER_STATE_PATH, 'utf8'));
-  state.sessions[leaseSession].inFlight.push({
-    leaseId: 'stale-but-live-pid',
-    pid: process.pid,
-    startedAt: new Date(Date.now() - (11 * 60 * 1_000)).toISOString(),
-  });
-  writeFileSync(BROWSER_STATE_PATH, JSON.stringify(state), 'utf8');
+  runLockedStateScript(`
+    const fs = require('fs');
+    const statePath = process.argv[1];
+    const sessionKey = process.argv[2];
+    const pid = Number(process.argv[3]);
+    const startedAt = process.argv[4];
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (!state?.sessions?.[sessionKey]) {
+      throw new Error('lease smoke fixture: missing session ' + sessionKey);
+    }
+    state.sessions[sessionKey].inFlight.push({ leaseId: 'stale-but-live-pid', pid, startedAt });
+    fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+  `, [leaseSession, String(process.pid), new Date(Date.now() - (11 * 60 * 1_000)).toISOString()]);
   assert.equal(
     isolatedText(leaseSession, { action: 'close' }),
     'Browser session closed.',
@@ -962,14 +1057,14 @@ async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
   isolatedText(oversizedOutputSession, { action: 'open', url: `${origin}/stable` });
   const oversizedOutput = callIsolatedBrowser(oversizedOutputSession, {
     action: 'evaluate',
-    expression: '"0123456789".repeat(25_000)',
+    expression: '"0123456789".repeat(3_000_000)',
   });
   assert.equal(oversizedOutput.envelope.isError, false);
   assert.equal(oversizedOutput.envelope.outputTruncated, true, 'oversized isolated text output should be truncated by the helper before the shell can truncate the envelope');
   assert.match(oversizedOutput.envelope.output, /Browser helper truncated the rest of this output/);
   assert.ok(
-    Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') < 100_000,
-    'the serialized isolated-browser envelope should stay below the daemon shell\'s default capture ceiling',
+    Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') < 25_000_000,
+    'the serialized isolated-browser envelope should stay below Taurus\'s preserved Browser output cap',
   );
 
   isolatedText(oversizedOutputSession, {

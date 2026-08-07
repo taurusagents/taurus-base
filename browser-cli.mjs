@@ -20,6 +20,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'fs';
 import { execFileSync, spawn } from 'child_process';
@@ -57,15 +58,15 @@ const NAVIGATION_START_TOLERANCE_MS = 1_000;
 // Fallback lower bound when the browser cannot tell us when the document
 // started: still bounds the past, just less tightly.
 const MAX_UNVERIFIED_DOCUMENT_AGE_MS = 24 * 60 * 60 * 1_000;
-// Deliberately match the Taurus app repo's shell output limit so helper-side
-// trimming and shell-side transport truncation stay aligned.
+// Console output is trimmed for readability before it ever reaches the protocol
+// envelope. The envelope itself has a much larger separate transport budget.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
-// Ordinary Browser text actions travel through the daemon shell's default
-// 100,000-byte capture budget, unlike screenshots which get a dedicated larger
-// allowance. Keep the serialized protocol envelope comfortably below that cap so
-// the daemon always receives a parseable nonce-matched envelope from a matched
-// helper instead of a shell-truncated JSON fragment.
-const MAX_TEXT_PROTOCOL_STDOUT_BYTES = 80_000;
+// Browser tool calls preserve exact helper output up to Taurus's 25,000,000-byte
+// hard cap, spilling large payloads to a private artifact when needed. Keep text
+// envelopes just below that hard cap so matched daemon/helper pairs preserve the
+// whole envelope, while still leaving headroom for JSON overhead and avoiding the
+// shell's byte-cap kill path.
+const MAX_TEXT_PROTOCOL_STDOUT_BYTES = 24_000_000;
 const TRUNCATED_PROTOCOL_OUTPUT_SUFFIX = '\n\n[Browser helper truncated the rest of this output to keep the protocol envelope within Taurus transport limits.]';
 const TRUNCATED_SCREENSHOT_FIELD_SUFFIX = '…[truncated]';
 const MAX_SCREENSHOT_TITLE_SUMMARY_CHARS = 2_048;
@@ -81,9 +82,15 @@ const BROWSER_EXIT_POLL_ATTEMPTS = 50;
 const BROWSER_EXIT_POLL_INTERVAL_MS = 100;
 // Discarding a restored tab must not become the slowest part of a launch.
 const PAGE_CLOSE_TIMEOUT_MS = 2_000;
+const LOCKED_BROWSER_CONNECTION_TIMEOUT_MS = 15_000;
+const LOCKED_PAGE_SETUP_TIMEOUT_MS = 5_000;
+const FRESH_BROWSER_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
+const MAX_WAIT_MS = 60_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
+const SESSION_KEY_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
+const INVALID_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const BROWSER_USER = process.env.TAURUS_BROWSER_USER || 'taurus-browser';
 const BROWSER_HOME = process.env.TAURUS_BROWSER_HOME || `/home/${BROWSER_USER}`;
 const BROWSER_PROFILE_DIR = `${BROWSER_HOME}/.config/chromium-profile`;
@@ -213,7 +220,10 @@ function loadState() {
 }
 
 function saveState(state) {
-  writeFileSync(STATE_FILE, JSON.stringify(normalizeState(state)), 'utf-8');
+  const normalizedState = normalizeState(state);
+  const tempPath = `${STATE_FILE}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tempPath, JSON.stringify(normalizedState), 'utf-8');
+  renameSync(tempPath, STATE_FILE);
 }
 
 function readPositiveIntegerEnv(name, fallback) {
@@ -225,6 +235,10 @@ function readPositiveIntegerEnv(name, fallback) {
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.length > 0;
+}
+
+function isValidSessionKey(value) {
+  return isNonEmptyString(value) && SESSION_KEY_PATTERN.test(value) && !INVALID_SESSION_KEYS.has(value);
 }
 
 function normalizeTimestamp(value, fallback) {
@@ -272,11 +286,11 @@ function normalizeSession(value) {
 }
 
 function normalizeState(value) {
-  const sessions = {};
+  const sessions = Object.create(null);
   const sourceSessions = value?.sessions && typeof value.sessions === 'object' ? value.sessions : null;
   if (sourceSessions) {
     for (const [sessionKey, sessionValue] of Object.entries(sourceSessions)) {
-      if (!isNonEmptyString(sessionKey)) continue;
+      if (!isValidSessionKey(sessionKey)) continue;
       const normalizedSession = normalizeSession(sessionValue);
       if (normalizedSession) {
         sessions[sessionKey] = normalizedSession;
@@ -314,8 +328,8 @@ function pruneDeadSessionLeases(state, nowMs = Date.now()) {
   }
 }
 
-function sessionHasActiveLease(session, leaseId = null) {
-  return session.inFlight.some(lease => lease.leaseId !== leaseId);
+function sessionHasActiveLease(session) {
+  return session.inFlight.length > 0;
 }
 
 function removeSessionLease(session, leaseId) {
@@ -578,6 +592,16 @@ function validateActionInput(input) {
     case 'keydown':
     case 'keyup': {
       validateSingleKeyAction(input.action, input.key);
+      break;
+    }
+
+    case 'wait': {
+      if (input.ms !== undefined) {
+        const ms = requireInteger(input, 'ms');
+        if (ms < 0 || ms > MAX_WAIT_MS) {
+          throwValidationError(`"ms" must be an integer between 0 and ${MAX_WAIT_MS}.`);
+        }
+      }
       break;
     }
   }
@@ -1260,17 +1284,21 @@ function getSessionViewport(session) {
 }
 
 async function acquireBrowserActionLock() {
-  const lockCommand = [
-    '-lc',
-    'exec 9>>"$1"; flock -x 9; printf ready; cat >/dev/null',
-    'bash',
+  const readyToken = `__taurus_browser_lock_ready_${randomUUID()}__`;
+  const child = spawn('flock', [
+    '-x',
     BROWSER_ACTION_LOCK,
-  ];
-  const child = spawn('bash', lockCommand, { stdio: ['pipe', 'pipe', 'pipe'] });
+    'bash',
+    '-c',
+    'printf %s "$1"; cat >/dev/null',
+    'bash',
+    readyToken,
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
   return await new Promise((resolve, reject) => {
     let ready = false;
     let stderr = '';
+    let stdout = '';
 
     const onExit = (code, signal) => {
       if (!ready) {
@@ -1279,13 +1307,19 @@ async function acquireBrowserActionLock() {
     };
 
     child.once('exit', onExit);
+    child.once('error', err => {
+      if (!ready) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', chunk => {
       stderr += chunk;
     });
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => {
-      if (ready || !chunk.includes('ready')) return;
+      stdout += chunk;
+      if (ready || !stdout.includes(readyToken)) return;
       ready = true;
       child.removeListener('exit', onExit);
       resolve({
@@ -1350,8 +1384,13 @@ async function ensureBrowserConnection(state) {
       } catch {
         /* still unreachable — fall through to a fresh launch */
       }
+      if (isBrowserProcessRunning()) {
+        throw new Error(
+          'Could not attach to the existing Chromium instance in this container while it is still running. '
+          + 'Another browser page may be unresponsive. Close the affected browser session or recreate the container if the problem persists.',
+        );
+      }
       state.cdpUrl = null;
-      state.sessions = {};
     }
   }
 
@@ -1393,7 +1432,7 @@ async function ensureBrowserConnection(state) {
     await sleep(200);
   }
 
-  const { browser, rootCdp } = await connectToBrowser(cdpUrl, 0);
+  const { browser, rootCdp } = await connectToBrowser(cdpUrl, FRESH_BROWSER_CONNECT_TIMEOUT_MS);
   state.cdpUrl = cdpUrl;
   return { browser, rootCdp, launchedFresh: true };
 }
@@ -1483,7 +1522,7 @@ async function recreateIsolatedSession(rootCdp, session) {
   session.inFlight = replacement.inFlight;
 }
 
-async function prepareIsolatedPage(browser, rootCdp, session, sessionKey) {
+async function prepareIsolatedPage(browser, rootCdp, session, persistSession) {
   let page = await findPageByTargetId(browser, session.targetId);
   if (!page) {
     const { browserContextIds } = await rootCdp.send('Target.getBrowserContexts');
@@ -1492,12 +1531,17 @@ async function prepareIsolatedPage(browser, rootCdp, session, sessionKey) {
     } else {
       await recreateIsolatedSession(rootCdp, session);
     }
+    persistSession();
     page = await waitForPageByTargetId(browser, session.targetId);
   }
   if (!page) {
     throw new Error('Could not attach to the isolated browser page for this run.');
   }
 
+  return page;
+}
+
+async function primeIsolatedPage(page, session, sessionKey) {
   if (sessionKey === DEFAULT_SHARED_SESSION_KEY) {
     await withTimeout(page.bringToFront(), BRING_TO_FRONT_TIMEOUT_MS).catch(() => {});
   }
@@ -1505,10 +1549,9 @@ async function prepareIsolatedPage(browser, rootCdp, session, sessionKey) {
   // Forcing every run's page to the front would recreate the very cross-run
   // interference this isolation work is meant to remove.
   await page.addInitScript(installConsoleCaptureInPage, true);
-  await page.evaluate(installConsoleCaptureInPage, false).catch(() => {});
+  await withTimeout(page.evaluate(installConsoleCaptureInPage, false), BRING_TO_FRONT_TIMEOUT_MS).catch(() => {});
   const viewport = await ensurePageViewport(page, getSessionViewport(session));
   session.viewport = viewport;
-  return page;
 }
 
 async function disposeSession(rootCdp, state, sessionKey) {
@@ -1711,7 +1754,10 @@ async function performActionOnPage(input, page, options = {}) {
     }
 
     case 'wait': {
-      const ms = input.ms ?? 1000;
+      const ms = input.ms === undefined ? 1000 : requireInteger(input, 'ms');
+      if (ms < 0 || ms > MAX_WAIT_MS) {
+        throwValidationError(`"ms" must be an integer between 0 and ${MAX_WAIT_MS}.`);
+      }
       await sleep(ms);
       return `Waited ${ms}ms`;
     }
@@ -1760,8 +1806,15 @@ async function performActionOnPage(input, page, options = {}) {
 function getProtocolControl(input) {
   const control = input?._taurus;
   if (!control || typeof control !== 'object') return null;
-  if (control.browserProtocolVersion !== BROWSER_PROTOCOL_VERSION) return null;
-  if (!isNonEmptyString(control.sessionKey) || !isNonEmptyString(control.nonce)) return null;
+  if (control.browserProtocolVersion !== BROWSER_PROTOCOL_VERSION) {
+    throw new Error(`Unsupported Taurus browser protocol version: ${String(control.browserProtocolVersion)}`);
+  }
+  if (!isValidSessionKey(control.sessionKey)) {
+    throw new Error('Browser session keys must be 1-200 characters of letters, digits, colon, underscore, or hyphen, and may not be reserved object property names.');
+  }
+  if (!isNonEmptyString(control.nonce)) {
+    throw new Error('Browser protocol nonce is required.');
+  }
   return control;
 }
 
@@ -1814,12 +1867,17 @@ async function handleSessionClose(sessionRequest) {
     const state = loadState();
     pruneDeadSessionLeases(state);
     if (state.sessions[sessionRequest.sessionKey]) {
-      ({ browser, rootCdp } = await ensureBrowserConnection(state));
+      ({ browser, rootCdp } = await withTimeout(
+        ensureBrowserConnection(state),
+        LOCKED_BROWSER_CONNECTION_TIMEOUT_MS,
+      ));
       const session = state.sessions[sessionRequest.sessionKey];
-      if (sessionHasActiveLease(session)) {
+      if (session && sessionHasActiveLease(session)) {
         throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before closing the browser session.');
       }
-      await disposeSession(rootCdp, state, sessionRequest.sessionKey);
+      if (session) {
+        await disposeSession(rootCdp, state, sessionRequest.sessionKey);
+      }
     }
     await closeBrowserIfUnused(state);
     saveState(state);
@@ -1843,11 +1901,15 @@ async function handleSessionAction(input, sessionRequest) {
   let rootCdp = null;
   let page = null;
   let session = null;
+  let createdSessionKey = null;
   let launchedFresh = false;
   try {
     const state = loadState();
     pruneDeadSessionLeases(state);
-    ({ browser, rootCdp, launchedFresh } = await ensureBrowserConnection(state));
+    ({ browser, rootCdp, launchedFresh } = await withTimeout(
+      ensureBrowserConnection(state),
+      LOCKED_BROWSER_CONNECTION_TIMEOUT_MS,
+    ));
     if (launchedFresh) {
       await discardAllPages(browser);
     }
@@ -1858,12 +1920,21 @@ async function handleSessionAction(input, sessionRequest) {
     if (!session) {
       session = await createIsolatedSession(rootCdp, DEFAULT_VIEWPORT);
       state.sessions[sessionRequest.sessionKey] = session;
+      createdSessionKey = sessionRequest.sessionKey;
+      saveState(state);
     }
     if (sessionHasActiveLease(session)) {
       throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before issuing another Browser action.');
     }
 
-    page = await prepareIsolatedPage(browser, rootCdp, session, sessionRequest.sessionKey);
+    page = await withTimeout(
+      prepareIsolatedPage(browser, rootCdp, session, () => saveState(state)),
+      LOCKED_PAGE_SETUP_TIMEOUT_MS,
+    );
+    await withTimeout(
+      primeIsolatedPage(page, session, sessionRequest.sessionKey),
+      LOCKED_PAGE_SETUP_TIMEOUT_MS,
+    );
     if (launchedFresh) {
       await discardOtherPages(page);
     }
@@ -1871,6 +1942,13 @@ async function handleSessionAction(input, sessionRequest) {
     session.inFlight.push(lease);
     saveState(state);
   } catch (err) {
+    if (rootCdp && createdSessionKey) {
+      const cleanupState = loadState();
+      if (cleanupState.sessions[createdSessionKey]?.browserContextId === session?.browserContextId) {
+        await disposeSession(rootCdp, cleanupState, createdSessionKey);
+        saveState(cleanupState);
+      }
+    }
     await closeConnection(browser, rootCdp);
     throw err;
   } finally {
