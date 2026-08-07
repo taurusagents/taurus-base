@@ -1992,8 +1992,8 @@ async function recoverUnavailableBrowserForClose(state, sessionKey) {
     for (const candidateKey of recoveryCandidates) {
       const candidateSession = state.sessions[candidateKey];
       if (!candidateSession) continue;
-      await closeDevtoolsTarget(cdpUrl, candidateSession.targetId);
-      if (candidateKey !== sessionKey) {
+      const targetClosed = await closeDevtoolsTarget(cdpUrl, candidateSession.targetId);
+      if (targetClosed && candidateKey !== sessionKey) {
         collateralTargetsClosed += 1;
       }
       if (!await canAttachToBrowserWithBackoff(cdpUrl)) {
@@ -2005,6 +2005,8 @@ async function recoverUnavailableBrowserForClose(state, sessionKey) {
       try {
         ({ browser, rootCdp } = await connectToBrowser(cdpUrl, ATTACH_RECOVERY_TIMEOUT_MS));
         await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+      } catch {
+        continue;
       } finally {
         await closeConnection(browser, rootCdp);
       }
