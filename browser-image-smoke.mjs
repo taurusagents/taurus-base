@@ -290,19 +290,6 @@ function listBrowserPageTargets() {
   return targets ? targets.filter(target => target.type === 'page').map(target => target.url) : null;
 }
 
-function closeBrowserTargetsByUrl(url) {
-  const targets = listBrowserTargets() ?? [];
-  for (const target of targets) {
-    if (target?.type !== 'page' || target?.url !== url || typeof target?.id !== 'string') continue;
-    const closeResult = spawnSync('node', ['-e', `
-      fetch(${JSON.stringify(`http://127.0.0.1:9222/json/close/${target.id}`)}, { method: 'PUT', signal: AbortSignal.timeout(2000) })
-        .then(() => console.log('closed'))
-        .catch(error => console.log('failed:' + error.message));
-    `], { encoding: 'utf8' });
-    assert.equal((closeResult.stdout || '').trim(), 'closed', `could not close browser target ${target.id} for ${url}`);
-  }
-}
-
 function closeBrowserTargetsMatching(pattern) {
   const targets = listBrowserTargets() ?? [];
   for (const target of targets) {
@@ -730,6 +717,11 @@ function runHostilePageIsolationSmoke(origin) {
   assert.match(isolatedText(wedgedSession, { action: 'open', url: `${origin}/wedge` }), /wedge page/);
   sleepSync(500);
 
+  // This assertion pins current Chromium attach behaviour: today a single page
+  // spinning its renderer makes connectOverCDP fail for the whole browser. If a
+  // future Chromium or Playwright release makes attach robust to that page, this
+  // smoke should be updated to prove the improved behaviour instead of restoring
+  // the old container-wide denial.
   const failure = isolatedBrowser(
     survivingSession,
     { action: 'evaluate', expression: 'location.pathname' },
@@ -748,16 +740,27 @@ function runHostilePageIsolationSmoke(origin) {
     'another run\'s page must remain open after a hostile page makes connectOverCDP fail',
   );
 
-  closeBrowserTargetsByUrl(`${origin}/wedge`);
-  waitForPageTargets(
-    urls => !urls.includes(`${origin}/wedge`) && urls.includes(`${origin}/stable`),
-    'closing the hostile page outside Playwright should leave the surviving page intact',
+  assert.match(
+    isolatedText(wedgedSession, { action: 'close' }),
+    /Browser session closed/,
+    'Browser close should remain a working recovery path even when attach is blocked',
   );
+  const sessionsAfterRecovery = getPersistedSessions();
+  assert.equal(Boolean(sessionsAfterRecovery[wedgedSession]), false, 'closing the wedged session should remove its persisted session record');
+
+  const recoveredLocation = isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' });
+  if (recoveredLocation === '/stable') {
+    assert.equal(recoveredLocation, '/stable', 'closing the wedged session should preserve other runs when Chromium can stay alive');
+    return;
+  }
+
   assert.equal(
-    isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }),
-    '/stable',
-    'after the hostile page is removed, the surviving run should continue on its original page',
+    recoveredLocation,
+    'about:blank',
+    'if recovery had to restart Chromium, the surviving run should self-heal into a fresh blank page instead of staying unusable',
   );
+  assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.equal(isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }), '/stable');
 }
 
 /**
@@ -1057,14 +1060,14 @@ async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
   isolatedText(oversizedOutputSession, { action: 'open', url: `${origin}/stable` });
   const oversizedOutput = callIsolatedBrowser(oversizedOutputSession, {
     action: 'evaluate',
-    expression: '"0123456789".repeat(3_000_000)',
+    expression: '"0123456789".repeat(1_000_000)',
   });
   assert.equal(oversizedOutput.envelope.isError, false);
   assert.equal(oversizedOutput.envelope.outputTruncated, true, 'oversized isolated text output should be truncated by the helper before the shell can truncate the envelope');
   assert.match(oversizedOutput.envelope.output, /Browser helper truncated the rest of this output/);
   assert.ok(
-    Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') < 25_000_000,
-    'the serialized isolated-browser envelope should stay below Taurus\'s preserved Browser output cap',
+    Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') <= 4_000_000,
+    'the serialized isolated-browser envelope should stay inside the helper\'s bounded text-envelope budget',
   );
 
   isolatedText(oversizedOutputSession, {

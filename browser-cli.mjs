@@ -61,16 +61,18 @@ const MAX_UNVERIFIED_DOCUMENT_AGE_MS = 24 * 60 * 60 * 1_000;
 // Console output is trimmed for readability before it ever reaches the protocol
 // envelope. The envelope itself has a much larger separate transport budget.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
-// Browser tool calls preserve exact helper output up to Taurus's 25,000,000-byte
-// hard cap, spilling large payloads to a private artifact when needed. Keep text
-// envelopes just below that hard cap so matched daemon/helper pairs preserve the
-// whole envelope, while still leaving headroom for JSON overhead and avoiding the
-// shell's byte-cap kill path.
-const MAX_TEXT_PROTOCOL_STDOUT_BYTES = 24_000_000;
+// Text Browser results are expected to stay comfortably below a megabyte in real
+// use. Keep the protocol envelope itself to a modest size so one hostile page
+// cannot make either the helper or the daemon allocate tens of megabytes just to
+// carry a forged wall of text.
+const MAX_TEXT_PROTOCOL_STDOUT_BYTES = 4_000_000;
 const TRUNCATED_PROTOCOL_OUTPUT_SUFFIX = '\n\n[Browser helper truncated the rest of this output to keep the protocol envelope within Taurus transport limits.]';
 const TRUNCATED_SCREENSHOT_FIELD_SUFFIX = '…[truncated]';
 const MAX_SCREENSHOT_TITLE_SUMMARY_CHARS = 2_048;
 const MAX_SCREENSHOT_URL_SUMMARY_CHARS = 4_096;
+const DEVTOOLS_HTTP_TIMEOUT_MS = 2_000;
+const ATTACH_RETRY_TIMEOUT_MS = 3_000;
+const ATTACH_RECOVERY_TIMEOUT_MS = 5_000;
 // Best-effort guard for the one shared default session used by manual CLI
 // callers. When that session opens extra tabs, foregrounding its own page keeps
 // screenshots and snapshots usable without reintroducing cross-run interference
@@ -463,6 +465,21 @@ function isExecutionContextDestroyedError(err) {
   return EXECUTION_CONTEXT_DESTROYED_PATTERN.test(message);
 }
 
+class BrowserAttachBlockedError extends Error {
+  constructor() {
+    super(
+      'Could not attach to the existing Chromium instance in this container while it is still running. '
+      + 'Another browser page may be unresponsive. Use the Browser close action on the affected session to force that page closed. '
+      + 'If Browser still cannot recover after that, recreate the container.',
+    );
+    this.name = 'BrowserAttachBlockedError';
+  }
+}
+
+function isBrowserAttachBlockedError(err) {
+  return err instanceof BrowserAttachBlockedError;
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -693,6 +710,71 @@ function buildScreenshotSummary(title, url, viewport, byteLength) {
  * explicit in-band marker and a boolean flag the daemon can turn into a clear
  * partial-output notice.
  */
+function jsonStringUnitInfo(text, index) {
+  const code = text.charCodeAt(index);
+  if (code === 0x22 || code === 0x5C) {
+    return { byteLength: 2, codeUnitLength: 1 };
+  }
+
+  switch (code) {
+    case 0x08:
+    case 0x09:
+    case 0x0A:
+    case 0x0C:
+    case 0x0D:
+      return { byteLength: 2, codeUnitLength: 1 };
+    default:
+      break;
+  }
+
+  if (code <= 0x1F) {
+    return { byteLength: 6, codeUnitLength: 1 };
+  }
+
+  if (code >= 0xD800 && code <= 0xDBFF) {
+    const next = text.charCodeAt(index + 1);
+    if (next >= 0xDC00 && next <= 0xDFFF) {
+      return { byteLength: 4, codeUnitLength: 2 };
+    }
+    return { byteLength: 6, codeUnitLength: 1 };
+  }
+
+  if (code >= 0xDC00 && code <= 0xDFFF) {
+    return { byteLength: 6, codeUnitLength: 1 };
+  }
+
+  if (code <= 0x7F) {
+    return { byteLength: 1, codeUnitLength: 1 };
+  }
+  if (code <= 0x7FF) {
+    return { byteLength: 2, codeUnitLength: 1 };
+  }
+  return { byteLength: 3, codeUnitLength: 1 };
+}
+
+function jsonStringContentByteLength(text) {
+  let total = 0;
+  for (let index = 0; index < text.length;) {
+    const unit = jsonStringUnitInfo(text, index);
+    total += unit.byteLength;
+    index += unit.codeUnitLength;
+  }
+  return total;
+}
+
+function truncateJsonStringContentToByteBudget(text, byteBudget) {
+  let total = 0;
+  let end = 0;
+  for (let index = 0; index < text.length;) {
+    const unit = jsonStringUnitInfo(text, index);
+    if (total + unit.byteLength > byteBudget) break;
+    total += unit.byteLength;
+    index += unit.codeUnitLength;
+    end = index;
+  }
+  return text.slice(0, end);
+}
+
 function buildBoundedProtocolTextEnvelope(nonce, isError, output) {
   const baseEnvelope = {
     __taurusBrowserResult: BROWSER_RESULT_MARKER,
@@ -701,7 +783,15 @@ function buildBoundedProtocolTextEnvelope(nonce, isError, output) {
     output,
     outputTruncated: false,
   };
-  if (Buffer.byteLength(JSON.stringify(baseEnvelope), 'utf8') <= MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
+  const emptyBaseEnvelope = {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce,
+    isError,
+    output: '',
+    outputTruncated: false,
+  };
+  const baseEnvelopeOverhead = Buffer.byteLength(JSON.stringify(emptyBaseEnvelope), 'utf8');
+  if (baseEnvelopeOverhead + jsonStringContentByteLength(output) <= MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
     return baseEnvelope;
   }
 
@@ -712,38 +802,32 @@ function buildBoundedProtocolTextEnvelope(nonce, isError, output) {
     output: TRUNCATED_PROTOCOL_OUTPUT_SUFFIX,
     outputTruncated: true,
   };
-  if (Buffer.byteLength(JSON.stringify(truncatedEnvelope), 'utf8') > MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
-    throw new Error('Browser protocol truncation marker does not fit within the text transport budget.');
-  }
-
-  let low = 0;
-  let high = output.length;
-  let bestOutput = TRUNCATED_PROTOCOL_OUTPUT_SUFFIX;
-  while (low <= high) {
-    const mid = Math.floor((low + high) / 2);
-    const candidateOutput = `${output.slice(0, mid)}${TRUNCATED_PROTOCOL_OUTPUT_SUFFIX}`;
-    const candidateEnvelope = {
-      __taurusBrowserResult: BROWSER_RESULT_MARKER,
-      nonce,
-      isError,
-      output: candidateOutput,
-      outputTruncated: true,
-    };
-    if (Buffer.byteLength(JSON.stringify(candidateEnvelope), 'utf8') <= MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
-      bestOutput = candidateOutput;
-      low = mid + 1;
-    } else {
-      high = mid - 1;
-    }
-  }
-
-  return {
+  const emptyTruncatedEnvelope = {
     __taurusBrowserResult: BROWSER_RESULT_MARKER,
     nonce,
     isError,
-    output: bestOutput,
+    output: '',
     outputTruncated: true,
   };
+  const truncatedEnvelopeOverhead = Buffer.byteLength(JSON.stringify(emptyTruncatedEnvelope), 'utf8');
+  const suffixByteLength = jsonStringContentByteLength(TRUNCATED_PROTOCOL_OUTPUT_SUFFIX);
+  const availableOutputBytes = MAX_TEXT_PROTOCOL_STDOUT_BYTES - truncatedEnvelopeOverhead - suffixByteLength;
+  if (availableOutputBytes < 0) {
+    throw new Error('Browser protocol truncation marker does not fit within the text transport budget.');
+  }
+
+  const keptOutput = truncateJsonStringContentToByteBudget(output, availableOutputBytes);
+  const boundedEnvelope = {
+    __taurusBrowserResult: BROWSER_RESULT_MARKER,
+    nonce,
+    isError,
+    output: `${keptOutput}${TRUNCATED_PROTOCOL_OUTPUT_SUFFIX}`,
+    outputTruncated: true,
+  };
+  if (Buffer.byteLength(JSON.stringify(boundedEnvelope), 'utf8') > MAX_TEXT_PROTOCOL_STDOUT_BYTES) {
+    throw new Error('Browser protocol truncation exceeded the text transport budget.');
+  }
+  return boundedEnvelope;
 }
 
 /**
@@ -1343,6 +1427,42 @@ async function connectToBrowser(cdpUrl, timeout) {
   return { browser, rootCdp };
 }
 
+async function listDevtoolsTargets(cdpUrl) {
+  try {
+    const response = await fetch(`${cdpUrl}/json/list`, { signal: AbortSignal.timeout(DEVTOOLS_HTTP_TIMEOUT_MS) });
+    if (!response.ok) return [];
+    const targets = await response.json();
+    return Array.isArray(targets) ? targets : [];
+  } catch {
+    return [];
+  }
+}
+
+async function closeDevtoolsTarget(cdpUrl, targetId) {
+  try {
+    const response = await fetch(`${cdpUrl}/json/close/${targetId}`, {
+      method: 'PUT',
+      signal: AbortSignal.timeout(DEVTOOLS_HTTP_TIMEOUT_MS),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function canAttachToBrowser(cdpUrl, timeoutMs) {
+  let browser = null;
+  let rootCdp = null;
+  try {
+    ({ browser, rootCdp } = await connectToBrowser(cdpUrl, timeoutMs));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await closeConnection(browser, rootCdp);
+  }
+}
+
 /**
  * Closes page targets that never committed a document — a tab the page opened
  * whose navigation the browser then refused (`window.open` to a data: URL, for
@@ -1355,40 +1475,28 @@ async function connectToBrowser(cdpUrl, timeout) {
  * second try.
  */
 async function discardUncommittedPageTargets(cdpUrl) {
-  try {
-    const response = await fetch(`${cdpUrl}/json/list`, { signal: AbortSignal.timeout(2_000) });
-    if (!response.ok) return false;
-
-    const targets = await response.json();
-    const uncommitted = (Array.isArray(targets) ? targets : [])
-      .filter(target => target?.type === 'page' && typeof target.id === 'string' && !target.url);
-
-    for (const target of uncommitted) {
-      await fetch(`${cdpUrl}/json/close/${target.id}`, { signal: AbortSignal.timeout(2_000) }).catch(() => {});
-    }
-    return uncommitted.length > 0;
-  } catch {
-    return false;
+  const targets = await listDevtoolsTargets(cdpUrl);
+  const uncommitted = targets.filter(target => target?.type === 'page' && typeof target.id === 'string' && !target.url);
+  for (const target of uncommitted) {
+    await closeDevtoolsTarget(cdpUrl, target.id);
   }
+  return uncommitted.length > 0;
 }
 
 async function ensureBrowserConnection(state) {
   if (state.cdpUrl) {
     try {
-      return { ...(await connectToBrowser(state.cdpUrl, 3000)), launchedFresh: false };
+      return { ...(await connectToBrowser(state.cdpUrl, ATTACH_RETRY_TIMEOUT_MS)), launchedFresh: false };
     } catch {
       try {
         if (await discardUncommittedPageTargets(state.cdpUrl)) {
-          return { ...(await connectToBrowser(state.cdpUrl, 5000)), launchedFresh: false };
+          return { ...(await connectToBrowser(state.cdpUrl, ATTACH_RECOVERY_TIMEOUT_MS)), launchedFresh: false };
         }
       } catch {
         /* still unreachable — fall through to a fresh launch */
       }
       if (isBrowserProcessRunning()) {
-        throw new Error(
-          'Could not attach to the existing Chromium instance in this container while it is still running. '
-          + 'Another browser page may be unresponsive. Close the affected browser session or recreate the container if the problem persists.',
-        );
+        throw new BrowserAttachBlockedError();
       }
       state.cdpUrl = null;
     }
@@ -1478,8 +1586,8 @@ async function findPageByTargetId(browser, targetId) {
   return null;
 }
 
-async function waitForPageByTargetId(browser, targetId, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
+async function waitForPageByTargetId(browser, targetId, deadlineMs) {
+  const deadline = deadlineMs;
   while (Date.now() < deadline) {
     const page = await findPageByTargetId(browser, targetId);
     if (page) return page;
@@ -1522,7 +1630,7 @@ async function recreateIsolatedSession(rootCdp, session) {
   session.inFlight = replacement.inFlight;
 }
 
-async function prepareIsolatedPage(browser, rootCdp, session, persistSession) {
+async function prepareIsolatedPage(browser, rootCdp, session, persistSession, deadlineMs) {
   let page = await findPageByTargetId(browser, session.targetId);
   if (!page) {
     const { browserContextIds } = await rootCdp.send('Target.getBrowserContexts');
@@ -1532,7 +1640,7 @@ async function prepareIsolatedPage(browser, rootCdp, session, persistSession) {
       await recreateIsolatedSession(rootCdp, session);
     }
     persistSession();
-    page = await waitForPageByTargetId(browser, session.targetId);
+    page = await waitForPageByTargetId(browser, session.targetId, deadlineMs);
   }
   if (!page) {
     throw new Error('Could not attach to the isolated browser page for this run.');
@@ -1859,6 +1967,35 @@ function renderHelperSuccessOutput(sessionRequest, outcome) {
   return JSON.stringify(buildProtocolEnvelope(sessionRequest.nonce, outcome));
 }
 
+async function recoverUnavailableBrowserForClose(state, sessionKey) {
+  const session = state.sessions[sessionKey];
+  if (!session) {
+    return 'No browser session was found to close.';
+  }
+
+  const cdpUrl = state.cdpUrl;
+  if (cdpUrl && await closeDevtoolsTarget(cdpUrl, session.targetId)) {
+    delete state.sessions[sessionKey];
+    if (Object.keys(state.sessions).length === 0) {
+      await closeBrowserProcess();
+      state.cdpUrl = null;
+    } else if (!await canAttachToBrowser(cdpUrl, ATTACH_RETRY_TIMEOUT_MS)) {
+      await closeBrowserProcess();
+      state.cdpUrl = null;
+      saveState(state);
+      return 'Browser session closed by restarting Chromium after another page made normal browser attachment stop working. Remaining sessions will reopen on their next Browser call.';
+    }
+    saveState(state);
+    return 'Browser session closed after forcing its browser page target to shut down because Chromium could not be attached normally.';
+  }
+
+  delete state.sessions[sessionKey];
+  await closeBrowserProcess();
+  state.cdpUrl = null;
+  saveState(state);
+  return 'Browser session closed by restarting Chromium because the browser could not be attached normally. Remaining sessions will reopen on their next Browser call.';
+}
+
 async function handleSessionClose(sessionRequest) {
   const lock = await acquireBrowserActionLock();
   let browser = null;
@@ -1866,18 +2003,27 @@ async function handleSessionClose(sessionRequest) {
   try {
     const state = loadState();
     pruneDeadSessionLeases(state);
-    if (state.sessions[sessionRequest.sessionKey]) {
+    if (!state.sessions[sessionRequest.sessionKey]) {
+      return 'No browser session was found to close.';
+    }
+    try {
       ({ browser, rootCdp } = await withTimeout(
         ensureBrowserConnection(state),
         LOCKED_BROWSER_CONNECTION_TIMEOUT_MS,
       ));
-      const session = state.sessions[sessionRequest.sessionKey];
-      if (session && sessionHasActiveLease(session)) {
-        throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before closing the browser session.');
+    } catch (err) {
+      if (isBrowserAttachBlockedError(err)) {
+        return await recoverUnavailableBrowserForClose(state, sessionRequest.sessionKey);
       }
-      if (session) {
-        await disposeSession(rootCdp, state, sessionRequest.sessionKey);
-      }
+      throw err;
+    }
+
+    const session = state.sessions[sessionRequest.sessionKey];
+    if (session && sessionHasActiveLease(session)) {
+      throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before closing the browser session.');
+    }
+    if (session) {
+      await disposeSession(rootCdp, state, sessionRequest.sessionKey);
     }
     await closeBrowserIfUnused(state);
     saveState(state);
@@ -1903,6 +2049,10 @@ async function handleSessionAction(input, sessionRequest) {
   let session = null;
   let createdSessionKey = null;
   let launchedFresh = false;
+  const pageSetup = {
+    abandoned: false,
+    deadlineMs: 0,
+  };
   try {
     const state = loadState();
     pruneDeadSessionLeases(state);
@@ -1927,8 +2077,17 @@ async function handleSessionAction(input, sessionRequest) {
       throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before issuing another Browser action.');
     }
 
+    pageSetup.deadlineMs = Date.now() + LOCKED_PAGE_SETUP_TIMEOUT_MS;
     page = await withTimeout(
-      prepareIsolatedPage(browser, rootCdp, session, () => saveState(state)),
+      prepareIsolatedPage(
+        browser,
+        rootCdp,
+        session,
+        () => {
+          if (!pageSetup.abandoned) saveState(state);
+        },
+        pageSetup.deadlineMs,
+      ),
       LOCKED_PAGE_SETUP_TIMEOUT_MS,
     );
     await withTimeout(
@@ -1942,6 +2101,7 @@ async function handleSessionAction(input, sessionRequest) {
     session.inFlight.push(lease);
     saveState(state);
   } catch (err) {
+    pageSetup.abandoned = true;
     if (rootCdp && createdSessionKey) {
       const cleanupState = loadState();
       if (cleanupState.sessions[createdSessionKey]?.browserContextId === session?.browserContextId) {
@@ -1952,6 +2112,7 @@ async function handleSessionAction(input, sessionRequest) {
     await closeConnection(browser, rootCdp);
     throw err;
   } finally {
+    pageSetup.abandoned = true;
     await lock.release();
   }
 
