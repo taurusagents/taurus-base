@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
+const BROWSER_STATE_PATH = '/tmp/.browser-cli.json';
+const BROWSER_ACTION_LOCK_PATH = '/tmp/.browser-cli.action.lock';
+const BROWSER_PROCESS_PATTERN = 'chrome.*--remote-debugging-port=9222';
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
 const NEXT_LINE = String.fromCharCode(0x85);
@@ -123,6 +126,23 @@ function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * The smoke suite gets rerun in long-lived containers, including after a failed
+ * attempt that may have left Chromium or helper state behind. Start and end from
+ * a hard reset so each run proves the current code instead of inheriting tabs,
+ * sessions, or stale locks from an earlier failure.
+ */
+function resetBrowserFixtureState() {
+  spawnSync('pkill', ['-9', '-u', 'browser', '-f', BROWSER_PROCESS_PATTERN], { stdio: 'ignore' });
+  for (const path of [BROWSER_STATE_PATH, BROWSER_ACTION_LOCK_PATH]) {
+    try {
+      if (existsSync(path)) unlinkSync(path);
+    } catch {
+      /* ignore cleanup races during fixture reset */
+    }
+  }
 }
 
 /**
@@ -613,13 +633,10 @@ function runPageInitiatedNavigationSmoke(origin) {
 
 /** Recovering from tabs and navigations that used to strand the helper. */
 function runStrandedTabSmoke(origin) {
-  // The tab the helper is on is blank and the page with content is a second
-  // tab the page opened. Which of the two a browser hands over first is not
-  // part of any contract — one reports them in creation order, another puts the
-  // most recently opened or activated tab first — so this arrangement only
-  // discriminates under the first of those. The inverted arrangement further
-  // down covers the other; between them the choice is pinned whichever order
-  // this browser happens to use, and the correct answer is the same in both.
+  // The default browser session now pins the page target it was already driving
+  // instead of heuristically hopping to whichever tab looks most useful. A page
+  // that opens a new tab therefore leaves the helper on its current page until
+  // the caller explicitly navigates elsewhere.
   browser({ action: 'open', url: 'about:blank' });
   evaluateJson(`JSON.stringify(window.open(${JSON.stringify(`${origin}/stable`)}, "_blank") ? "opened" : "blocked")`);
   const drivenPage = () => browser({ action: 'evaluate', expression: 'location.href' });
@@ -629,18 +646,17 @@ function runStrandedTabSmoke(origin) {
   );
   assert.equal(
     drivenPage(),
-    `${origin}/stable`,
-    'the helper must drive the tab that has content, not the blank one it started on',
+    'about:blank',
+    'the helper must stay on the page this browser session already owned until the caller explicitly navigates elsewhere',
   );
 
-  // The same preference, the other way round: a blank tab the page opens next
-  // to the one being driven must not take over.
+  browser({ action: 'open', url: `${origin}/stable` });
+  assert.equal(drivenPage(), `${origin}/stable`);
+
+  // Once the session is on the content page, later tabs still must not take it over.
   evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
   sleepSync(300);
 
-  // The tab the page just opened took the foreground with it, and only the
-  // foregrounded tab is painted — so screenshots have to put the page they are
-  // capturing back in front, or they wait for a frame that never comes.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const shot = JSON.parse(browser({ action: 'screenshot' }));
     assert.equal(shot.__type, 'screenshot');
@@ -862,6 +878,20 @@ async function runIsolatedSessionSmoke(origin) {
     'an idle isolated session should be reaped after the configured TTL expires',
   );
 
+  isolatedText('lease-a', { action: 'open', url: `${origin}/stable` });
+  const state = JSON.parse(readFileSync(BROWSER_STATE_PATH, 'utf8'));
+  state.sessions['lease-a'].inFlight.push({
+    leaseId: 'stale-but-live-pid',
+    pid: process.pid,
+    startedAt: new Date(Date.now() - (11 * 60 * 1_000)).toISOString(),
+  });
+  writeFileSync(BROWSER_STATE_PATH, JSON.stringify(state), 'utf8');
+  assert.equal(
+    isolatedText('lease-a', { action: 'close' }),
+    'Browser session closed.',
+    'a lease older than the expiry window should not keep a session blocked just because its PID now belongs to some other live process',
+  );
+
   const evictionEnv = { TAURUS_BROWSER_MAX_SESSIONS: '2', TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '21600000' };
   isolatedText('evict-a', { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
   isolatedText('evict-a', { action: 'evaluate', expression: 'document.title = "evict a"' }, { env: evictionEnv });
@@ -902,8 +932,10 @@ function runViewportScreenshotSmoke() {
   browser({ action: 'resize', width: 1280, height: 720 });
 }
 
+resetBrowserFixtureState();
+
 try {
   await runSmoke();
 } finally {
-  browser({ action: 'close' });
+  resetBrowserFixtureState();
 }

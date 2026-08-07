@@ -20,7 +20,6 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  unlinkSync,
   writeFileSync,
 } from 'fs';
 import { execFileSync, spawn } from 'child_process';
@@ -61,8 +60,10 @@ const MAX_UNVERIFIED_DOCUMENT_AGE_MS = 24 * 60 * 60 * 1_000;
 // Deliberately match the Taurus app repo's shell output limit so helper-side
 // trimming and shell-side transport truncation stay aligned.
 const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
-// Foregrounding the page is a precondition for rendering, not the action
-// itself: give up quickly rather than letting an unresponsive tab stall a call.
+// Best-effort guard for the one shared default session used by manual CLI
+// callers. When that session opens extra tabs, foregrounding its own page keeps
+// screenshots and snapshots usable without reintroducing cross-run interference
+// for the protocol-controlled per-run sessions.
 const BRING_TO_FRONT_TIMEOUT_MS = 2_000;
 // Closing the browser is only done once per session, so waiting a few seconds
 // for it to exit is cheap next to attaching to a half-dead browser.
@@ -205,10 +206,6 @@ function saveState(state) {
   writeFileSync(STATE_FILE, JSON.stringify(normalizeState(state)), 'utf-8');
 }
 
-function clearState() {
-  try { unlinkSync(STATE_FILE); } catch { /* ignore */ }
-}
-
 function readPositiveIntegerEnv(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -265,15 +262,6 @@ function normalizeSession(value) {
 }
 
 function normalizeState(value) {
-  const legacyViewport = normalizeViewport(value?.legacy?.viewport)
-    || normalizeViewport(value?.viewport)
-    || DEFAULT_VIEWPORT;
-  const legacy = {
-    viewport: legacyViewport,
-    lastSeenAt: normalizeTimestamp(value?.legacy?.lastSeenAt, nowIso()),
-    active: value?.legacy?.active === true || (isNonEmptyString(value?.cdpUrl) && value?.schemaVersion !== STATE_SCHEMA_VERSION),
-  };
-
   const sessions = {};
   const sourceSessions = value?.sessions && typeof value.sessions === 'object' ? value.sessions : null;
   if (sourceSessions) {
@@ -289,7 +277,6 @@ function normalizeState(value) {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
     cdpUrl: isNonEmptyString(value?.cdpUrl) ? value.cdpUrl : null,
-    legacy,
     sessions,
   };
 }
@@ -303,9 +290,17 @@ function isProcessAlive(pid) {
   }
 }
 
-function pruneDeadSessionLeases(state) {
+function isLeaseExpired(lease, nowMs) {
+  const startedAtMs = Date.parse(lease.startedAt);
+  return !Number.isFinite(startedAtMs) || (nowMs - startedAtMs) > MAX_SESSION_LEASE_AGE_MS;
+}
+
+function pruneDeadSessionLeases(state, nowMs = Date.now()) {
+  // PID liveness alone is not enough: the kernel can eventually reuse a dead
+  // helper process ID, so an orphaned lease also needs an age limit or a later
+  // unrelated process could keep that session blocked forever.
   for (const session of Object.values(state.sessions)) {
-    session.inFlight = session.inFlight.filter(lease => isProcessAlive(lease.pid));
+    session.inFlight = session.inFlight.filter(lease => !isLeaseExpired(lease, nowMs) && isProcessAlive(lease.pid));
   }
 }
 
@@ -327,8 +322,10 @@ const BROWSER_RESULT_MARKER = 1;
 const BROWSER_PROTOCOL_VERSION = 2;
 const STATE_SCHEMA_VERSION = 2;
 const BROWSER_ACTION_LOCK = '/tmp/.browser-cli.action.lock';
+const DEFAULT_SHARED_SESSION_KEY = 'default';
 const DEFAULT_SESSION_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
 const DEFAULT_BROWSER_MAX_SESSIONS = 8;
+const MAX_SESSION_LEASE_AGE_MS = 10 * 60 * 1_000;
 const SESSION_IDLE_TTL_MS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_SESSION_IDLE_TTL_MS',
   DEFAULT_SESSION_IDLE_TTL_MS,
@@ -1155,15 +1152,6 @@ async function getRealViewport(page) {
     || DEFAULT_VIEWPORT;
 }
 
-function isBlankPage(page) {
-  const url = page.url();
-  return url === '' || url === 'about:blank';
-}
-
-function getLegacyViewport(state) {
-  return normalizeViewport(state?.legacy?.viewport) || DEFAULT_VIEWPORT;
-}
-
 function getSessionViewport(session) {
   return normalizeViewport(session?.viewport) || DEFAULT_VIEWPORT;
 }
@@ -1208,33 +1196,6 @@ async function acquireBrowserActionLock() {
       });
     });
   });
-}
-
-async function ensureLegacyPage(browser, viewport) {
-  const contexts = browser.contexts();
-  const ctx = contexts[0] || await browser.newContext({ viewport, userAgent: USER_AGENT });
-  const pages = ctx.pages();
-  // Prefer the first page that has navigated somewhere. A page can open extra
-  // tabs (window.open) and the order Playwright reports CDP targets in is not
-  // guaranteed, so taking pages[0] blindly can strand every later call on a
-  // fresh about:blank tab while the page the agent is working on sits next to
-  // it. Falling back to the first page keeps a genuinely blank session — the
-  // freshly launched browser — working.
-  const page = pages.find(candidate => !isBlankPage(candidate)) || pages[0] || await ctx.newPage();
-  // Headless Chromium only produces compositor frames for the foregrounded tab.
-  // Any tab the page opens takes the foreground with it, and from then on
-  // screenshots of the page we drive wait forever for a frame that is never
-  // painted, while animation frames stall. Foreground the page we drive, but
-  // never let this step hold up the action itself.
-  await withTimeout(page.bringToFront(), BRING_TO_FRONT_TIMEOUT_MS).catch(() => {});
-  // Installed twice on purpose: at document start for every future document of
-  // this page (the registration only lives as long as this CDP connection), and
-  // immediately for the document already loaded. Only the first form can claim
-  // to have seen the whole document, so only it passes `true`.
-  await page.addInitScript(installConsoleCaptureInPage, true);
-  await page.evaluate(installConsoleCaptureInPage, false).catch(() => {});
-  const appliedViewport = await ensurePageViewport(page, viewport);
-  return { page, viewport: appliedViewport };
 }
 
 // ── Launch or connect to Chromium ──
@@ -1288,7 +1249,6 @@ async function ensureBrowserConnection(state) {
       }
       state.cdpUrl = null;
       state.sessions = {};
-      state.legacy.active = false;
     }
   }
 
@@ -1340,27 +1300,18 @@ async function closeConnection(browser, rootCdp) {
   await browser?.close?.().catch(() => {});
 }
 
-/**
- * Leaves a freshly launched browser with the single page this helper drives.
- *
- * Chromium restores the tabs of the previous session from the profile, so
- * without this every tab a page ever opened comes back on the next launch and
- * they accumulate for the life of the container. That matters beyond tidiness:
- * only one tab is foregrounded and painted, and the helper can only ever drive
- * one page, so the rest are invisible clutter that changes which page gets
- * picked. Deliberately only done when a browser is launched — tabs opened
- * during a live session are left alone.
- */
-async function discardOtherPages(primaryPage) {
-  for (const other of primaryPage.context().pages()) {
-    if (other === primaryPage) continue;
-    await withTimeout(other.close(), PAGE_CLOSE_TIMEOUT_MS).catch(() => {});
-  }
-}
-
 async function discardAllPages(browser) {
   for (const context of browser.contexts()) {
     for (const page of context.pages()) {
+      await withTimeout(page.close(), PAGE_CLOSE_TIMEOUT_MS).catch(() => {});
+    }
+  }
+}
+
+async function discardOtherPages(primaryPage) {
+  for (const context of primaryPage.context().browser().contexts()) {
+    for (const page of context.pages()) {
+      if (page === primaryPage) continue;
       await withTimeout(page.close(), PAGE_CLOSE_TIMEOUT_MS).catch(() => {});
     }
   }
@@ -1429,7 +1380,7 @@ async function recreateIsolatedSession(rootCdp, session) {
   session.inFlight = replacement.inFlight;
 }
 
-async function prepareIsolatedPage(browser, rootCdp, session) {
+async function prepareIsolatedPage(browser, rootCdp, session, sessionKey) {
   let page = await findPageByTargetId(browser, session.targetId);
   if (!page) {
     const { browserContextIds } = await rootCdp.send('Target.getBrowserContexts');
@@ -1444,10 +1395,12 @@ async function prepareIsolatedPage(browser, rootCdp, session) {
     throw new Error('Could not attach to the isolated browser page for this run.');
   }
 
-  // Background tabs already render correctly in the current headless Chromium,
-  // so isolated sessions deliberately do not steal the foreground from each
-  // other. Forcing each run's page to the front would recreate the very cross-
-  // run interference this isolation work is meant to remove.
+  if (sessionKey === DEFAULT_SHARED_SESSION_KEY) {
+    await withTimeout(page.bringToFront(), BRING_TO_FRONT_TIMEOUT_MS).catch(() => {});
+  }
+  // Per-run sessions deliberately do not steal the foreground from each other.
+  // Forcing every run's page to the front would recreate the very cross-run
+  // interference this isolation work is meant to remove.
   await page.addInitScript(installConsoleCaptureInPage, true);
   await page.evaluate(installConsoleCaptureInPage, false).catch(() => {});
   const viewport = await ensurePageViewport(page, getSessionViewport(session));
@@ -1488,7 +1441,7 @@ async function evictOverflowSessions(rootCdp, state, protectedSessionKey, creati
 }
 
 async function closeBrowserIfUnused(state) {
-  if (Object.keys(state.sessions).length === 0 && !state.legacy.active) {
+  if (Object.keys(state.sessions).length === 0) {
     await closeBrowserProcess();
     state.cdpUrl = null;
   }
@@ -1699,69 +1652,7 @@ async function performActionOnPage(input, page, options = {}) {
   }
 }
 
-async function handleLegacyAction(input) {
-  if (input.action === 'close') {
-    const lock = await acquireBrowserActionLock();
-    try {
-      await closeBrowserProcess();
-      clearState();
-      return 'Browser closed.';
-    } finally {
-      await lock.release();
-    }
-  }
-
-  validateActionInput(input);
-
-  const lock = await acquireBrowserActionLock();
-  let browser = null;
-  let rootCdp = null;
-  let page = null;
-  let state = null;
-  let launchedFresh = false;
-  try {
-    state = loadState();
-    pruneDeadSessionLeases(state);
-    ({ browser, rootCdp, launchedFresh } = await ensureBrowserConnection(state));
-    await reapIdleSessions(rootCdp, state, null, Date.now());
-    const prepared = await ensureLegacyPage(browser, getLegacyViewport(state));
-    page = prepared.page;
-    if (launchedFresh) {
-      await discardOtherPages(page);
-    }
-    state.legacy.active = true;
-    state.legacy.lastSeenAt = nowIso();
-    state.legacy.viewport = prepared.viewport;
-    saveState(state);
-  } catch (err) {
-    await closeConnection(browser, rootCdp);
-    throw err;
-  } finally {
-    await lock.release();
-  }
-
-  try {
-    const outcome = await performActionOnPage(input, page, {
-      async onViewportChanged(viewport) {
-        const resizeLock = await acquireBrowserActionLock();
-        try {
-          const resizeState = loadState();
-          resizeState.legacy.active = true;
-          resizeState.legacy.lastSeenAt = nowIso();
-          resizeState.legacy.viewport = viewport;
-          saveState(resizeState);
-        } finally {
-          await resizeLock.release();
-        }
-      },
-    });
-    return typeof outcome === 'string' ? outcome : JSON.stringify(outcome);
-  } finally {
-    await closeConnection(browser, rootCdp);
-  }
-}
-
-function getIsolationControl(input) {
+function getProtocolControl(input) {
   const control = input?._taurus;
   if (!control || typeof control !== 'object') return null;
   if (control.browserProtocolVersion !== BROWSER_PROTOCOL_VERSION) return null;
@@ -1769,11 +1660,22 @@ function getIsolationControl(input) {
   return control;
 }
 
-function buildIsolatedEnvelope(control, outcome) {
+function getSessionRequest(input) {
+  const control = getProtocolControl(input);
+  return {
+    sessionKey: control?.sessionKey ?? DEFAULT_SHARED_SESSION_KEY,
+    nonce: control?.nonce ?? null,
+  };
+}
+
+function buildProtocolEnvelope(nonce, outcome) {
+  // The nonce comes from helper argv, which page JavaScript cannot read. Echoing
+  // it back means page-controlled output on a mismatched old helper cannot forge
+  // a plausible tool result for the daemon to trust.
   if (outcome && typeof outcome === 'object' && outcome.__type === 'screenshot') {
     return {
       __taurusBrowserResult: BROWSER_RESULT_MARKER,
-      nonce: control.nonce,
+      nonce,
       isError: false,
       output: outcome.text,
       screenshot: {
@@ -1786,35 +1688,42 @@ function buildIsolatedEnvelope(control, outcome) {
 
   return {
     __taurusBrowserResult: BROWSER_RESULT_MARKER,
-    nonce: control.nonce,
+    nonce,
     isError: false,
     output: String(outcome),
   };
 }
 
-function buildIsolatedErrorEnvelope(control, message) {
+function buildProtocolErrorEnvelope(nonce, message) {
   return {
     __taurusBrowserResult: BROWSER_RESULT_MARKER,
-    nonce: control.nonce,
+    nonce,
     isError: true,
     output: `Browser error: ${message}`,
   };
 }
 
-async function handleIsolatedClose(control) {
+function renderHelperSuccessOutput(sessionRequest, outcome) {
+  if (sessionRequest.nonce === null) {
+    return typeof outcome === 'string' ? outcome : JSON.stringify(outcome);
+  }
+  return JSON.stringify(buildProtocolEnvelope(sessionRequest.nonce, outcome));
+}
+
+async function handleSessionClose(sessionRequest) {
   const lock = await acquireBrowserActionLock();
   let browser = null;
   let rootCdp = null;
   try {
     const state = loadState();
     pruneDeadSessionLeases(state);
-    if (state.sessions[control.sessionKey]) {
+    if (state.sessions[sessionRequest.sessionKey]) {
       ({ browser, rootCdp } = await ensureBrowserConnection(state));
-      const session = state.sessions[control.sessionKey];
+      const session = state.sessions[sessionRequest.sessionKey];
       if (sessionHasActiveLease(session)) {
-        throw new Error('This run already has another Browser call in flight. Wait for it to finish before closing the browser session.');
+        throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before closing the browser session.');
       }
-      await disposeSession(rootCdp, state, control.sessionKey);
+      await disposeSession(rootCdp, state, sessionRequest.sessionKey);
     }
     await closeBrowserIfUnused(state);
     saveState(state);
@@ -1825,9 +1734,9 @@ async function handleIsolatedClose(control) {
   }
 }
 
-async function handleIsolatedAction(input, control) {
+async function handleSessionAction(input, sessionRequest) {
   if (input.action === 'close') {
-    return await handleIsolatedClose(control);
+    return await handleSessionClose(sessionRequest);
   }
 
   validateActionInput(input);
@@ -1843,22 +1752,25 @@ async function handleIsolatedAction(input, control) {
     const state = loadState();
     pruneDeadSessionLeases(state);
     ({ browser, rootCdp, launchedFresh } = await ensureBrowserConnection(state));
-    if (launchedFresh && !state.legacy.active) {
+    if (launchedFresh) {
       await discardAllPages(browser);
     }
-    await reapIdleSessions(rootCdp, state, control.sessionKey, Date.now());
+    await reapIdleSessions(rootCdp, state, sessionRequest.sessionKey, Date.now());
 
-    session = state.sessions[control.sessionKey];
-    await evictOverflowSessions(rootCdp, state, control.sessionKey, !session);
+    session = state.sessions[sessionRequest.sessionKey];
+    await evictOverflowSessions(rootCdp, state, sessionRequest.sessionKey, !session);
     if (!session) {
       session = await createIsolatedSession(rootCdp, DEFAULT_VIEWPORT);
-      state.sessions[control.sessionKey] = session;
+      state.sessions[sessionRequest.sessionKey] = session;
     }
     if (sessionHasActiveLease(session)) {
-      throw new Error('This run already has another Browser call in flight. Wait for it to finish before issuing another Browser action.');
+      throw new Error('This browser session already has another Browser call in flight. Wait for it to finish before issuing another Browser action.');
     }
 
-    page = await prepareIsolatedPage(browser, rootCdp, session);
+    page = await prepareIsolatedPage(browser, rootCdp, session, sessionRequest.sessionKey);
+    if (launchedFresh) {
+      await discardOtherPages(page);
+    }
     session.lastSeenAt = nowIso();
     session.inFlight.push(lease);
     saveState(state);
@@ -1881,7 +1793,7 @@ async function handleIsolatedAction(input, control) {
     try {
       const finalizeState = loadState();
       pruneDeadSessionLeases(finalizeState);
-      const currentSession = finalizeState.sessions[control.sessionKey];
+      const currentSession = finalizeState.sessions[sessionRequest.sessionKey];
       if (currentSession) {
         removeSessionLease(currentSession, lease.leaseId);
         currentSession.lastSeenAt = nowIso();
@@ -1956,18 +1868,18 @@ function formatAXNodes(nodes) {
 
 try {
   const input = JSON.parse(process.argv[2] || '{}');
-  const control = getIsolationControl(input);
-  if (control) {
+  const sessionRequest = getSessionRequest(input);
+  if (sessionRequest.nonce !== null) {
     try {
-      const result = await handleIsolatedAction(input, control);
-      process.stdout.write(JSON.stringify(buildIsolatedEnvelope(control, result)));
+      const result = await handleSessionAction(input, sessionRequest);
+      process.stdout.write(renderHelperSuccessOutput(sessionRequest, result));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      process.stdout.write(JSON.stringify(buildIsolatedErrorEnvelope(control, message)));
+      process.stdout.write(JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)));
     }
   } else {
-    const result = await handleLegacyAction(input);
-    process.stdout.write(result);
+    const result = await handleSessionAction(input, sessionRequest);
+    process.stdout.write(renderHelperSuccessOutput(sessionRequest, result));
   }
 } catch (err) {
   process.stderr.write(`Browser error: ${err instanceof Error ? err.message : String(err)}\n`);
