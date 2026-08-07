@@ -4,6 +4,26 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
+const BROWSER_STATE_PATH = '/tmp/.browser-cli.json';
+const BROWSER_ACTION_LOCK_PATH = '/tmp/.browser-cli.action.lock';
+const SMOKE_SESSION_PREFIX = '__browser-smoke__:';
+const SMOKE_SESSION_NAMES = [
+  'isolated-alpha',
+  'isolated-beta',
+  'ttl-a',
+  'ttl-b',
+  'lease-a',
+  'evict-a',
+  'evict-b',
+  'evict-c',
+  'oversized-output',
+  'hostile-wedge',
+  'hostile-survivor',
+  'hostile-escalation-closee',
+  'hostile-escalation-survivor',
+  'hostile-escalation-hidden',
+];
+const BROWSER_USER = process.env.TAURUS_BROWSER_USER || 'taurus-browser';
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
 const NEXT_LINE = String.fromCharCode(0x85);
@@ -13,10 +33,11 @@ const NEXT_LINE = String.fromCharCode(0x85);
 // helper mid-write and look like a helper failure.
 const MAX_HELPER_OUTPUT_BYTES = 32 * 1024 * 1024;
 
-function browser(input, { expectFailure = false } = {}) {
+function browser(input, { expectFailure = false, env } = {}) {
   const result = spawnSync('node', [BROWSER_CLI_PATH, JSON.stringify(input)], {
     encoding: 'utf8',
     maxBuffer: MAX_HELPER_OUTPUT_BYTES,
+    env: env ? { ...process.env, ...env } : process.env,
   });
 
   if (expectFailure) {
@@ -39,8 +60,161 @@ function browser(input, { expectFailure = false } = {}) {
   return result.stdout;
 }
 
+let isolatedNonceCounter = 0;
+
+function nextIsolatedNonce() {
+  isolatedNonceCounter += 1;
+  return `nonce-${isolatedNonceCounter}`;
+}
+
+function smokeSessionKey(name) {
+  return `${SMOKE_SESSION_PREFIX}${name}`;
+}
+
+function callIsolatedBrowser(sessionKey, input, { expectFailure = false, env } = {}) {
+  const nonce = nextIsolatedNonce();
+  const rawOutput = browser({
+    ...input,
+    _taurus: {
+      browserProtocolVersion: 2,
+      sessionKey,
+      nonce,
+    },
+  }, { env });
+
+  const envelope = JSON.parse(rawOutput);
+  assert.equal(envelope.__taurusBrowserResult, 1, `expected an isolated browser envelope for ${sessionKey}`);
+  assert.equal(envelope.nonce, nonce, `expected the helper to echo nonce ${nonce}`);
+  assert.equal(typeof envelope.output, 'string', 'isolated browser output should be textual');
+  assert.equal(typeof envelope.outputTruncated, 'boolean', 'isolated browser envelopes must declare whether helper-side truncation happened');
+  assert.equal(envelope.isError, expectFailure, `unexpected isolated browser error state for ${sessionKey}: ${envelope.output}`);
+  return { rawOutput, envelope };
+}
+
+function isolatedBrowser(sessionKey, input, options) {
+  return callIsolatedBrowser(sessionKey, input, options).envelope;
+}
+
+function isolatedText(sessionKey, input, options) {
+  return isolatedBrowser(sessionKey, input, options).output;
+}
+
+function isolatedScreenshot(sessionKey, options) {
+  const envelope = isolatedBrowser(sessionKey, { action: 'screenshot' }, options);
+  assert.equal(envelope.isError, false, `isolated screenshot for ${sessionKey} should succeed`);
+  assert.equal(envelope.screenshot?.mediaType, 'image/png');
+  assert.ok(envelope.screenshot?.base64.length > 0, 'isolated screenshot payload should not be empty');
+  return envelope;
+}
+
+function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
+  const nonce = nextIsolatedNonce();
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', [BROWSER_CLI_PATH, JSON.stringify({
+      ...input,
+      _taurus: {
+        browserProtocolVersion: 2,
+        sessionKey,
+        nonce,
+      },
+    })], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: env ? { ...process.env, ...env } : process.env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+    });
+    child.on('error', reject);
+    child.on('exit', code => {
+      if (code !== 0) {
+        reject(new Error(`isolated helper exited ${code}: ${stderr || stdout}`));
+        return;
+      }
+      try {
+        const envelope = JSON.parse(stdout);
+        assert.equal(envelope.__taurusBrowserResult, 1, 'expected an isolated browser envelope from the async helper');
+        assert.equal(envelope.nonce, nonce, `expected the async helper to echo nonce ${nonce}`);
+        assert.equal(typeof envelope.outputTruncated, 'boolean', 'async isolated-browser envelopes must declare whether helper-side truncation happened');
+        resolve(envelope);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function runLockedStateScript(script, args = [], { input } = {}) {
+  const result = spawnSync(
+    'flock',
+    ['-x', BROWSER_ACTION_LOCK_PATH, 'node', '-e', script, BROWSER_STATE_PATH, ...args],
+    { encoding: 'utf8', input },
+  );
+  if (result.status !== 0) {
+    throw new Error(`locked state helper failed: ${result.stderr || result.stdout || result.error?.message || 'unknown error'}`);
+  }
+  return result.stdout || '';
+}
+
+function getPersistedSessions() {
+  try {
+    // The helper rewrites its state file while holding a flock on this lock
+    // path. Read under the same lock so the smoke never mistakes a torn rewrite
+    // for "no default session" and tears down someone else's idle browser.
+    const state = JSON.parse(runLockedStateScript(`
+      const fs = require('fs');
+      try {
+        process.stdout.write(fs.readFileSync(process.argv[1], 'utf8'));
+      } catch {
+        process.stdout.write('{}');
+      }
+    `) || '{}');
+    return state && typeof state === 'object' && state.sessions && typeof state.sessions === 'object'
+      ? state.sessions
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function defaultSessionExists() {
+  return Object.prototype.hasOwnProperty.call(getPersistedSessions(), 'default');
+}
+
+/**
+ * The smoke suite gets rerun in long-lived containers, including after a failed
+ * attempt that may have left behind the sessions this suite uses. Reset by
+ * asking the helper to close only those known sessions under its own lock, so a
+ * rerun starts clean without deleting shared state or breaking another lock
+ * holder's inode out from under it.
+ */
+function resetBrowserFixtureState({ closeDefaultSession } = {}) {
+  closeBrowserTargetsMatching(/^http:\/\/127\.0\.0\.1:\d+\/wedge(?:-slow)?$/);
+  if (closeDefaultSession) {
+    try {
+      browser({ action: 'close' });
+    } catch {
+      /* ignore a missing or already-broken shared smoke session during cleanup */
+    }
+  }
+  for (const sessionName of SMOKE_SESSION_NAMES) {
+    try {
+      isolatedText(smokeSessionKey(sessionName), { action: 'close' });
+    } catch {
+      /* ignore a missing or already-broken isolated smoke session during cleanup */
+    }
+  }
 }
 
 /**
@@ -95,16 +269,11 @@ function countOccurrences(text, needle) {
   return text.split(needle).length - 1;
 }
 
-/**
- * The URLs of the pages the browser is holding, asked of the browser itself:
- * the helper only ever exposes the one page it drives, so the rest are
- * invisible from the actions alone.
- */
-function listBrowserPageTargets() {
+function listBrowserTargets() {
   const probe = spawnSync('node', ['-e', `
     fetch('http://127.0.0.1:9222/json/list', { signal: AbortSignal.timeout(2000) })
       .then(response => response.json())
-      .then(targets => console.log(JSON.stringify(targets.filter(target => target.type === 'page').map(target => target.url))))
+      .then(targets => console.log(JSON.stringify(Array.isArray(targets) ? targets : null)))
       .catch(() => console.log('null'));
   `], { encoding: 'utf8' });
   try {
@@ -113,6 +282,67 @@ function listBrowserPageTargets() {
   } catch {
     return null;
   }
+}
+
+function getBrowserProcessSignature() {
+  const probe = spawnSync('pgrep', ['-o', '-u', BROWSER_USER, '-f', 'chrome.*--remote-debugging-port=9222'], { encoding: 'utf8' });
+  return probe.status === 0 ? (probe.stdout || '').trim() || null : null;
+}
+
+function getBrowserContextCount() {
+  const probe = spawnSync('node', ['-e', `
+    (async () => {
+      const { createRequire } = require('module');
+      const requireFromGlobal = createRequire('/usr/lib/node_modules/');
+      const { chromium } = requireFromGlobal('playwright');
+      const browser = await chromium.connectOverCDP('http://127.0.0.1:9222', { timeout: 2000 });
+      const root = await browser.newBrowserCDPSession();
+      const { browserContextIds } = await root.send('Target.getBrowserContexts');
+      await root.detach().catch(() => {});
+      await browser.close().catch(() => {});
+      console.log(String(browserContextIds.length));
+    })().catch(error => console.log('failed:' + error.message));
+  `], { encoding: 'utf8' });
+  const output = (probe.stdout || '').trim();
+  assert.match(output, /^\d+$/, `could not read live browser context count: ${output || probe.stderr}`);
+  return Number(output);
+}
+
+/**
+ * The URLs of the pages the browser is holding, asked of the browser itself:
+ * the helper only ever exposes the one page it drives, so the rest are
+ * invisible from the actions alone.
+ */
+function listBrowserPageTargets() {
+  const targets = listBrowserTargets();
+  return targets ? targets.filter(target => target.type === 'page').map(target => target.url) : null;
+}
+
+function closeBrowserTargetsMatching(pattern) {
+  const targets = listBrowserTargets() ?? [];
+  for (const target of targets) {
+    if (target?.type !== 'page' || typeof target?.url !== 'string' || typeof target?.id !== 'string') continue;
+    if (!pattern.test(target.url)) continue;
+    const closeResult = spawnSync('node', ['-e', `
+      fetch(${JSON.stringify(`http://127.0.0.1:9222/json/close/${target.id}`)}, { method: 'PUT', signal: AbortSignal.timeout(2000) })
+        .then(() => console.log('closed'))
+        .catch(error => console.log('failed:' + error.message));
+    `], { encoding: 'utf8' });
+    assert.equal((closeResult.stdout || '').trim(), 'closed', `could not close browser target ${target.id} for ${target.url}`);
+  }
+}
+
+function deletePersistedSessionRecord(sessionKey) {
+  runLockedStateScript(`
+    const fs = require('fs');
+    const statePath = process.argv[1];
+    const sessionKey = process.argv[2];
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (state?.sessions && typeof state.sessions === 'object') {
+      delete state.sessions[sessionKey];
+    }
+    fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+  `, [sessionKey]);
 }
 
 /**
@@ -249,7 +479,13 @@ function assertAppearsBefore(text, earlier, later, label) {
   assert.equal(earlierIndex < laterIndex, true, `${label} should keep ${JSON.stringify(earlier)} before ${JSON.stringify(later)}`);
 }
 
-function runSmoke() {
+async function runSmoke() {
+  const defaultSessionOwnedBySmoke = !defaultSessionExists();
+  if (!defaultSessionOwnedBySmoke) {
+    console.log('Skipping shared default-session smoke because this container already has a default browser session. Running isolated-session checks only.');
+  }
+
+  if (defaultSessionOwnedBySmoke) {
   const openOutput = browser({ action: 'open', url: buildProbePage() });
   assert.match(openOutput, /Title: browser smoke/);
 
@@ -429,15 +665,22 @@ function runSmoke() {
   runConsoleMethodSmoke();
   runForgedConsoleSmoke();
   runViewportScreenshotSmoke();
+  }
 
   const pageServer = startPageServer(NAVIGATION_ROUTES);
   try {
-    runPageInitiatedNavigationSmoke(pageServer.origin);
-    runStrandedTabSmoke(pageServer.origin);
-    runExternalBlankTabSmoke(pageServer.origin);
-    runSessionResetSmoke(pageServer.origin);
+    if (defaultSessionOwnedBySmoke) {
+      runPageInitiatedNavigationSmoke(pageServer.origin);
+      runStrandedTabSmoke(pageServer.origin);
+      runExternalBlankTabSmoke(pageServer.origin);
+      runSessionResetSmoke(pageServer.origin);
+    }
+    runHostilePageIsolationSmoke(pageServer.origin);
+    runHostilePageEscalationSmoke(pageServer.origin);
+    await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
   } finally {
     pageServer.stop();
+    resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmoke });
   }
 
   console.log('Base image browser smoke passed.');
@@ -505,7 +748,98 @@ setTimeout(() => { throw new Error("game crash"); }, 10);
 new Image().src = "http://127.0.0.1:9/sprite.png";
 </script>`,
   '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
+  '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>',
+  '/wedge-slow': '<!doctype html><title>wedge slow page</title><h1>wedge slow</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 1200));</script>',
 };
+
+function runHostilePageIsolationSmoke(origin) {
+  const wedgedSession = smokeSessionKey('hostile-wedge');
+  const survivingSession = smokeSessionKey('hostile-survivor');
+
+  assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(isolatedText(wedgedSession, { action: 'open', url: `${origin}/wedge` }), /wedge page/);
+  sleepSync(500);
+
+  // This assertion pins current Chromium attach behaviour: today a single page
+  // spinning its renderer makes connectOverCDP fail for the whole browser. If a
+  // future Chromium or Playwright release makes attach robust to that page, this
+  // smoke should be updated to prove the improved behaviour instead of restoring
+  // the old container-wide denial.
+  const failure = isolatedBrowser(
+    survivingSession,
+    { action: 'evaluate', expression: 'location.pathname' },
+    { expectFailure: true },
+  );
+  assert.match(
+    failure.output,
+    /Could not attach to the existing Chromium instance in this container while it is still running/,
+  );
+  const persistedSessions = getPersistedSessions();
+  assert.equal(Boolean(persistedSessions[wedgedSession]), true, 'a wedged session must stay recorded instead of wiping all session state');
+  assert.equal(Boolean(persistedSessions[survivingSession]), true, 'another run\'s session record must survive a hostile page in a different run');
+  assert.equal(
+    (listBrowserPageTargets() ?? []).includes(`${origin}/stable`),
+    true,
+    'another run\'s page must remain open after a hostile page makes connectOverCDP fail',
+  );
+
+  const processBeforeRecovery = getBrowserProcessSignature();
+  assert.match(
+    isolatedText(wedgedSession, { action: 'close' }),
+    /forcing its browser page target to shut down/,
+    'Browser close should recover the single-wedge case by closing only the wedged target',
+  );
+  const sessionsAfterRecovery = getPersistedSessions();
+  assert.equal(Boolean(sessionsAfterRecovery[wedgedSession]), false, 'closing the wedged session should remove its persisted session record');
+  assert.equal(getBrowserProcessSignature(), processBeforeRecovery, 'closing one wedged session should not restart Chromium when that target alone unblocks attach');
+  assert.equal(
+    isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }),
+    '/stable',
+    'closing the wedged session should preserve the surviving run\'s live page in the single-wedge recovery case',
+  );
+  assert.equal(
+    getBrowserContextCount(),
+    Object.keys(getPersistedSessions()).length,
+    'sweep recovery should dispose the closed session\'s browser context instead of leaving an untracked orphan behind',
+  );
+}
+
+function runHostilePageEscalationSmoke(origin) {
+  const closeeSession = smokeSessionKey('hostile-escalation-closee');
+  const survivingSession = smokeSessionKey('hostile-escalation-survivor');
+  const hiddenSession = smokeSessionKey('hostile-escalation-hidden');
+
+  assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(isolatedText(closeeSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
+  assert.match(isolatedText(hiddenSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
+  deletePersistedSessionRecord(hiddenSession);
+  waitForPageTargets(
+    urls => urls.filter(url => url === `${origin}/wedge-slow`).length >= 2,
+    'the escalation case needs both a tracked wedged session and an extra wedged page that is no longer in persisted session state',
+  );
+  sleepSync(1600);
+
+  assert.match(
+    isolatedBrowser(survivingSession, { action: 'evaluate', expression: 'location.pathname' }, { expectFailure: true }).output,
+    /Could not attach to the existing Chromium instance in this container while it is still running/,
+  );
+
+  const processBeforeRecovery = getBrowserProcessSignature();
+  const closeOutput = isolatedText(closeeSession, { action: 'close' });
+  assert.match(closeOutput, /restarting Chromium/, 'the escalation case should reach the restart fallback once every recoverable target has been swept');
+  assert.notEqual(getBrowserProcessSignature(), processBeforeRecovery, 'the escalation case should actually restart Chromium');
+  const sessionsAfterRecovery = getPersistedSessions();
+  assert.equal(Boolean(sessionsAfterRecovery[closeeSession]), false, 'the explicitly closed session should still be removed after restart recovery');
+  assert.equal(Boolean(sessionsAfterRecovery[survivingSession]), true, 'other session records should survive the restart fallback so they can self-heal later');
+  assert.equal(Boolean(sessionsAfterRecovery[hiddenSession]), false, 'the hidden wedged session should stay absent from persisted state after the forced restart');
+  assert.equal(
+    isolatedText(survivingSession, { action: 'evaluate', expression: 'location.href' }),
+    'about:blank',
+    'after the restart fallback, surviving sessions should self-heal to a fresh page instead of staying unusable',
+  );
+  assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.equal(isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }), '/stable');
+}
 
 /**
  * A page that navigates itself while no helper process is connected lands on a
@@ -530,13 +864,10 @@ function runPageInitiatedNavigationSmoke(origin) {
 
 /** Recovering from tabs and navigations that used to strand the helper. */
 function runStrandedTabSmoke(origin) {
-  // The tab the helper is on is blank and the page with content is a second
-  // tab the page opened. Which of the two a browser hands over first is not
-  // part of any contract — one reports them in creation order, another puts the
-  // most recently opened or activated tab first — so this arrangement only
-  // discriminates under the first of those. The inverted arrangement further
-  // down covers the other; between them the choice is pinned whichever order
-  // this browser happens to use, and the correct answer is the same in both.
+  // The default browser session now pins the page target it was already driving
+  // instead of heuristically hopping to whichever tab looks most useful. A page
+  // that opens a new tab therefore leaves the helper on its current page until
+  // the caller explicitly navigates elsewhere.
   browser({ action: 'open', url: 'about:blank' });
   evaluateJson(`JSON.stringify(window.open(${JSON.stringify(`${origin}/stable`)}, "_blank") ? "opened" : "blocked")`);
   const drivenPage = () => browser({ action: 'evaluate', expression: 'location.href' });
@@ -546,18 +877,17 @@ function runStrandedTabSmoke(origin) {
   );
   assert.equal(
     drivenPage(),
-    `${origin}/stable`,
-    'the helper must drive the tab that has content, not the blank one it started on',
+    'about:blank',
+    'the helper must stay on the page this browser session already owned until the caller explicitly navigates elsewhere',
   );
 
-  // The same preference, the other way round: a blank tab the page opens next
-  // to the one being driven must not take over.
+  browser({ action: 'open', url: `${origin}/stable` });
+  assert.equal(drivenPage(), `${origin}/stable`);
+
+  // Once the session is on the content page, later tabs still must not take it over.
   evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
   sleepSync(300);
 
-  // The tab the page just opened took the foreground with it, and only the
-  // foregrounded tab is painted — so screenshots have to put the page they are
-  // capturing back in front, or they wait for a frame that never comes.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const shot = JSON.parse(browser({ action: 'screenshot' }));
     assert.equal(shot.__type, 'screenshot');
@@ -698,6 +1028,159 @@ function runSessionResetSmoke(origin) {
   assert.ok(shot.base64.length > 0, 'the recovered session must still be able to produce a screenshot');
 }
 
+async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
+  const alphaSession = smokeSessionKey('isolated-alpha');
+  const betaSession = smokeSessionKey('isolated-beta');
+
+  assert.match(isolatedText(alphaSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(isolatedText(betaSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(
+    isolatedBrowser(alphaSession, { action: 'resize', width: 9999, height: 1 }, { expectFailure: true }).output,
+    /between 1 and 3840/,
+  );
+
+  assert.equal(
+    isolatedText(alphaSession, {
+      action: 'evaluate',
+      expression: '(() => { document.title = "alpha page"; localStorage.setItem("runner", "alpha"); return location.pathname + "|" + document.title + "|" + localStorage.getItem("runner"); })()',
+    }),
+    '/stable|alpha page|alpha',
+  );
+  assert.equal(
+    isolatedText(betaSession, {
+      action: 'evaluate',
+      expression: '(() => { document.title = "beta page"; return String(localStorage.getItem("runner")); })()',
+    }),
+    'null',
+    'a second run should not see the first run\'s localStorage',
+  );
+  assert.equal(
+    isolatedText(betaSession, {
+      action: 'evaluate',
+      expression: '(() => { localStorage.setItem("runner", "beta"); return document.title = "beta page"; })()',
+    }),
+    'beta page',
+  );
+  assert.equal(
+    isolatedText(alphaSession, { action: 'evaluate', expression: 'localStorage.getItem("runner")' }),
+    'alpha',
+    'the first run should keep its own localStorage value after another run writes a different one',
+  );
+
+  assert.match(isolatedText(alphaSession, { action: 'resize', width: 800, height: 600 }), /800x600/);
+  assert.match(isolatedText(betaSession, { action: 'resize', width: 1024, height: 768 }), /1024x768/);
+  assert.equal(
+    isolatedText(alphaSession, { action: 'evaluate', expression: 'JSON.stringify({ width: window.innerWidth, title: document.title })' }),
+    '{"width":800,"title":"alpha page"}',
+  );
+  assert.equal(
+    isolatedText(betaSession, { action: 'evaluate', expression: 'JSON.stringify({ width: window.innerWidth, title: document.title })' }),
+    '{"width":1024,"title":"beta page"}',
+  );
+
+  const [alphaShot, betaShot] = await Promise.all([
+    isolatedBrowserAsync(alphaSession, { action: 'screenshot' }),
+    isolatedBrowserAsync(betaSession, { action: 'screenshot' }),
+  ]);
+  assert.match(alphaShot.output, /alpha page/);
+  assert.match(alphaShot.output, /Viewport: 800x600/);
+  assert.match(betaShot.output, /beta page/);
+  assert.match(betaShot.output, /Viewport: 1024x768/);
+
+  assert.equal(isolatedText(alphaSession, { action: 'close' }), 'Browser session closed.');
+  assert.equal(isolatedText(betaSession, { action: 'evaluate', expression: 'document.title' }), 'beta page');
+  assert.equal(
+    isolatedText(alphaSession, { action: 'evaluate', expression: 'location.href' }),
+    'about:blank',
+    'closing one isolated session should not affect another, and the closed run should restart from a blank page',
+  );
+
+  assert.equal(isolatedText(betaSession, { action: 'close' }), 'Browser session closed.');
+  if (closeDefaultSession) {
+    browser({ action: 'close' });
+  }
+
+  const ttlEnv = { TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '100' };
+  const ttlSessionA = smokeSessionKey('ttl-a');
+  const ttlSessionB = smokeSessionKey('ttl-b');
+  isolatedText(ttlSessionA, { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
+  isolatedText(ttlSessionA, { action: 'evaluate', expression: 'document.title = "ttl a"' }, { env: ttlEnv });
+  sleepSync(250);
+  isolatedText(ttlSessionB, { action: 'open', url: `${origin}/stable` }, { env: ttlEnv });
+  assert.equal(
+    isolatedText(ttlSessionA, { action: 'evaluate', expression: 'location.href' }, { env: ttlEnv }),
+    'about:blank',
+    'an idle isolated session should be reaped after the configured TTL expires',
+  );
+
+  const leaseSession = smokeSessionKey('lease-a');
+  isolatedText(leaseSession, { action: 'open', url: `${origin}/stable` });
+  runLockedStateScript(`
+    const fs = require('fs');
+    const statePath = process.argv[1];
+    const sessionKey = process.argv[2];
+    const pid = Number(process.argv[3]);
+    const startedAt = process.argv[4];
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (!state?.sessions?.[sessionKey]) {
+      throw new Error('lease smoke fixture: missing session ' + sessionKey);
+    }
+    state.sessions[sessionKey].inFlight.push({ leaseId: 'stale-but-live-pid', pid, startedAt });
+    fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+  `, [leaseSession, String(process.pid), new Date(Date.now() - (11 * 60 * 1_000)).toISOString()]);
+  assert.equal(
+    isolatedText(leaseSession, { action: 'close' }),
+    'Browser session closed.',
+    'a lease older than the expiry window should not keep a session blocked just because its PID now belongs to some other live process',
+  );
+
+  const oversizedOutputSession = smokeSessionKey('oversized-output');
+  isolatedText(oversizedOutputSession, { action: 'open', url: `${origin}/stable` });
+  const oversizedOutput = callIsolatedBrowser(oversizedOutputSession, {
+    action: 'evaluate',
+    expression: '"0123456789".repeat(1_000_000)',
+  });
+  assert.equal(oversizedOutput.envelope.isError, false);
+  assert.equal(oversizedOutput.envelope.outputTruncated, true, 'oversized isolated text output should be truncated by the helper before the shell can truncate the envelope');
+  assert.match(oversizedOutput.envelope.output, /Browser helper truncated the rest of this output/);
+  assert.ok(
+    Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') <= 4_000_000,
+    'the serialized isolated-browser envelope should stay inside the helper\'s bounded text-envelope budget',
+  );
+
+  isolatedText(oversizedOutputSession, {
+    action: 'evaluate',
+    expression: '(() => { document.title = "x".repeat(13_500_000); return document.title.length; })()',
+  });
+  const giantTitleShot = callIsolatedBrowser(oversizedOutputSession, { action: 'screenshot' });
+  assert.ok(
+    Buffer.byteLength(giantTitleShot.rawOutput, 'utf8') < 20_000_000,
+    'the giant-title screenshot envelope should stay inside the Browser screenshot transport budget after truncating the hostile page-controlled title',
+  );
+  assert.equal(giantTitleShot.envelope.isError, false);
+  assert.equal(giantTitleShot.envelope.outputTruncated, true, 'a page-controlled giant title should be truncated inside the screenshot envelope before shell capture can corrupt it');
+  assert.match(giantTitleShot.envelope.output, /Screenshot of "x{100,}.*\[truncated\]"/);
+  assert.ok(giantTitleShot.envelope.screenshot?.base64.length > 0, 'the giant-title screenshot should still deliver image bytes');
+
+  const evictionEnv = { TAURUS_BROWSER_MAX_SESSIONS: '2', TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '21600000' };
+  const evictSessionA = smokeSessionKey('evict-a');
+  const evictSessionB = smokeSessionKey('evict-b');
+  const evictSessionC = smokeSessionKey('evict-c');
+  isolatedText(evictSessionA, { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText(evictSessionA, { action: 'evaluate', expression: 'document.title = "evict a"' }, { env: evictionEnv });
+  isolatedText(evictSessionB, { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText(evictSessionB, { action: 'evaluate', expression: 'document.title = "evict b"' }, { env: evictionEnv });
+  isolatedText(evictSessionC, { action: 'open', url: `${origin}/stable` }, { env: evictionEnv });
+  isolatedText(evictSessionC, { action: 'evaluate', expression: 'document.title = "evict c"' }, { env: evictionEnv });
+  assert.equal(isolatedText(evictSessionB, { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict b');
+  assert.equal(isolatedText(evictSessionC, { action: 'evaluate', expression: 'document.title' }, { env: evictionEnv }), 'evict c');
+  assert.equal(
+    isolatedText(evictSessionA, { action: 'evaluate', expression: 'location.href' }, { env: evictionEnv }),
+    'about:blank',
+    'when the session cap is reached, the least recently used idle session should be evicted first',
+  );
+}
+
 /** Viewport ceiling and the screenshot payloads it has to keep affordable. */
 function runViewportScreenshotSmoke() {
   browser({ action: 'open', url: buildContentHeavyPage() });
@@ -722,8 +1205,11 @@ function runViewportScreenshotSmoke() {
   browser({ action: 'resize', width: 1280, height: 720 });
 }
 
+const defaultSessionOwnedBySmokeAtStart = !defaultSessionExists();
+resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmokeAtStart });
+
 try {
-  runSmoke();
+  await runSmoke();
 } finally {
-  browser({ action: 'close' });
+  resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmokeAtStart });
 }
