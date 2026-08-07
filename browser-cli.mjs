@@ -73,6 +73,7 @@ const MAX_SCREENSHOT_URL_SUMMARY_CHARS = 4_096;
 const DEVTOOLS_HTTP_TIMEOUT_MS = 2_000;
 const ATTACH_RETRY_TIMEOUT_MS = 3_000;
 const ATTACH_RECOVERY_TIMEOUT_MS = 5_000;
+const ATTACH_RECOVERY_BACKOFF_MS = 750;
 // Best-effort guard for the one shared default session used by manual CLI
 // callers. When that session opens extra tabs, foregrounding its own page keeps
 // screenshots and snapshots usable without reintroducing cross-run interference
@@ -1440,7 +1441,7 @@ async function listDevtoolsTargets(cdpUrl) {
 
 async function closeDevtoolsTarget(cdpUrl, targetId) {
   try {
-    const response = await fetch(`${cdpUrl}/json/close/${targetId}`, {
+    const response = await fetch(`${cdpUrl}/json/close/${encodeURIComponent(targetId)}`, {
       method: 'PUT',
       signal: AbortSignal.timeout(DEVTOOLS_HTTP_TIMEOUT_MS),
     });
@@ -1461,6 +1462,14 @@ async function canAttachToBrowser(cdpUrl, timeoutMs) {
   } finally {
     await closeConnection(browser, rootCdp);
   }
+}
+
+async function canAttachToBrowserWithBackoff(cdpUrl) {
+  if (await canAttachToBrowser(cdpUrl, ATTACH_RETRY_TIMEOUT_MS)) {
+    return true;
+  }
+  await sleep(ATTACH_RECOVERY_BACKOFF_MS);
+  return await canAttachToBrowser(cdpUrl, ATTACH_RETRY_TIMEOUT_MS);
 }
 
 /**
@@ -1587,8 +1596,7 @@ async function findPageByTargetId(browser, targetId) {
 }
 
 async function waitForPageByTargetId(browser, targetId, deadlineMs) {
-  const deadline = deadlineMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadlineMs) {
     const page = await findPageByTargetId(browser, targetId);
     if (page) return page;
     await sleep(100);
@@ -1974,19 +1982,48 @@ async function recoverUnavailableBrowserForClose(state, sessionKey) {
   }
 
   const cdpUrl = state.cdpUrl;
-  if (cdpUrl && await closeDevtoolsTarget(cdpUrl, session.targetId)) {
-    delete state.sessions[sessionKey];
-    if (Object.keys(state.sessions).length === 0) {
-      await closeBrowserProcess();
-      state.cdpUrl = null;
-    } else if (!await canAttachToBrowser(cdpUrl, ATTACH_RETRY_TIMEOUT_MS)) {
-      await closeBrowserProcess();
-      state.cdpUrl = null;
+  if (cdpUrl) {
+    const recoveryCandidates = [
+      sessionKey,
+      ...Object.keys(state.sessions).filter(candidateKey => candidateKey !== sessionKey),
+    ];
+    let collateralTargetsClosed = 0;
+
+    for (const candidateKey of recoveryCandidates) {
+      const candidateSession = state.sessions[candidateKey];
+      if (!candidateSession) continue;
+      await closeDevtoolsTarget(cdpUrl, candidateSession.targetId);
+      if (candidateKey !== sessionKey) {
+        collateralTargetsClosed += 1;
+      }
+      if (!await canAttachToBrowserWithBackoff(cdpUrl)) {
+        continue;
+      }
+
+      let browser = null;
+      let rootCdp = null;
+      try {
+        ({ browser, rootCdp } = await connectToBrowser(cdpUrl, ATTACH_RECOVERY_TIMEOUT_MS));
+        await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+      } finally {
+        await closeConnection(browser, rootCdp);
+      }
+
+      delete state.sessions[sessionKey];
+      if (Object.keys(state.sessions).length === 0) {
+        await closeBrowserProcess();
+        state.cdpUrl = null;
+        saveState(state);
+        return collateralTargetsClosed === 0
+          ? 'Browser session closed after forcing its browser page target to shut down. Chromium was then shut down because no browser sessions remained.'
+          : 'Browser session closed after forcing additional browser page targets to shut down until the browser became reachable again. Chromium was then shut down because no browser sessions remained.';
+      }
+
       saveState(state);
-      return 'Browser session closed by restarting Chromium after another page made normal browser attachment stop working. Remaining sessions will reopen on their next Browser call.';
+      return collateralTargetsClosed === 0
+        ? 'Browser session closed after forcing its browser page target to shut down because the browser could not be attached normally.'
+        : 'Browser session closed after forcing additional browser page targets to shut down until the browser became reachable again. Any other affected sessions will reopen fresh pages in their existing browser contexts on their next Browser call.';
     }
-    saveState(state);
-    return 'Browser session closed after forcing its browser page target to shut down because Chromium could not be attached normally.';
   }
 
   delete state.sessions[sessionKey];
@@ -2013,6 +2050,10 @@ async function handleSessionClose(sessionRequest) {
       ));
     } catch (err) {
       if (isBrowserAttachBlockedError(err)) {
+        // Recovery deliberately ignores in-flight leases here. Once Chromium has
+        // become unattachable, any Browser call still holding a lease is stuck
+        // on that same broken browser, so waiting on the lease would only trap
+        // the container in the already-failed state.
         return await recoverUnavailableBrowserForClose(state, sessionRequest.sessionKey);
       }
       throw err;

@@ -19,7 +19,11 @@ const SMOKE_SESSION_NAMES = [
   'oversized-output',
   'hostile-wedge',
   'hostile-survivor',
+  'hostile-escalation-closee',
+  'hostile-escalation-survivor',
+  'hostile-escalation-hidden',
 ];
+const BROWSER_USER = process.env.TAURUS_BROWSER_USER || 'taurus-browser';
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
 const NEXT_LINE = String.fromCharCode(0x85);
@@ -196,7 +200,7 @@ function defaultSessionExists() {
  * holder's inode out from under it.
  */
 function resetBrowserFixtureState({ closeDefaultSession } = {}) {
-  closeBrowserTargetsMatching(/^http:\/\/127\.0\.0\.1:\d+\/wedge$/);
+  closeBrowserTargetsMatching(/^http:\/\/127\.0\.0\.1:\d+\/wedge(?:-slow)?$/);
   if (closeDefaultSession) {
     try {
       browser({ action: 'close' });
@@ -280,6 +284,30 @@ function listBrowserTargets() {
   }
 }
 
+function getBrowserProcessSignature() {
+  const probe = spawnSync('pgrep', ['-o', '-u', BROWSER_USER, '-f', 'chrome.*--remote-debugging-port=9222'], { encoding: 'utf8' });
+  return probe.status === 0 ? (probe.stdout || '').trim() || null : null;
+}
+
+function getBrowserContextCount() {
+  const probe = spawnSync('node', ['-e', `
+    (async () => {
+      const { createRequire } = require('module');
+      const requireFromGlobal = createRequire('/usr/lib/node_modules/');
+      const { chromium } = requireFromGlobal('playwright');
+      const browser = await chromium.connectOverCDP('http://127.0.0.1:9222', { timeout: 2000 });
+      const root = await browser.newBrowserCDPSession();
+      const { browserContextIds } = await root.send('Target.getBrowserContexts');
+      await root.detach().catch(() => {});
+      await browser.close().catch(() => {});
+      console.log(String(browserContextIds.length));
+    })().catch(error => console.log('failed:' + error.message));
+  `], { encoding: 'utf8' });
+  const output = (probe.stdout || '').trim();
+  assert.match(output, /^\d+$/, `could not read live browser context count: ${output || probe.stderr}`);
+  return Number(output);
+}
+
 /**
  * The URLs of the pages the browser is holding, asked of the browser itself:
  * the helper only ever exposes the one page it drives, so the rest are
@@ -302,6 +330,19 @@ function closeBrowserTargetsMatching(pattern) {
     `], { encoding: 'utf8' });
     assert.equal((closeResult.stdout || '').trim(), 'closed', `could not close browser target ${target.id} for ${target.url}`);
   }
+}
+
+function deletePersistedSessionRecord(sessionKey) {
+  runLockedStateScript(`
+    const fs = require('fs');
+    const statePath = process.argv[1];
+    const sessionKey = process.argv[2];
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (state?.sessions && typeof state.sessions === 'object') {
+      delete state.sessions[sessionKey];
+    }
+    fs.writeFileSync(statePath, JSON.stringify(state), 'utf8');
+  `, [sessionKey]);
 }
 
 /**
@@ -635,6 +676,7 @@ async function runSmoke() {
       runSessionResetSmoke(pageServer.origin);
     }
     runHostilePageIsolationSmoke(pageServer.origin);
+    runHostilePageEscalationSmoke(pageServer.origin);
     await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
   } finally {
     pageServer.stop();
@@ -707,6 +749,7 @@ new Image().src = "http://127.0.0.1:9/sprite.png";
 </script>`,
   '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
   '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>',
+  '/wedge-slow': '<!doctype html><title>wedge slow page</title><h1>wedge slow</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 1200));</script>',
 };
 
 function runHostilePageIsolationSmoke(origin) {
@@ -740,24 +783,59 @@ function runHostilePageIsolationSmoke(origin) {
     'another run\'s page must remain open after a hostile page makes connectOverCDP fail',
   );
 
+  const processBeforeRecovery = getBrowserProcessSignature();
   assert.match(
     isolatedText(wedgedSession, { action: 'close' }),
-    /Browser session closed/,
-    'Browser close should remain a working recovery path even when attach is blocked',
+    /forcing its browser page target to shut down/,
+    'Browser close should recover the single-wedge case by closing only the wedged target',
   );
   const sessionsAfterRecovery = getPersistedSessions();
   assert.equal(Boolean(sessionsAfterRecovery[wedgedSession]), false, 'closing the wedged session should remove its persisted session record');
-
-  const recoveredLocation = isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' });
-  if (recoveredLocation === '/stable') {
-    assert.equal(recoveredLocation, '/stable', 'closing the wedged session should preserve other runs when Chromium can stay alive');
-    return;
-  }
-
+  assert.equal(getBrowserProcessSignature(), processBeforeRecovery, 'closing one wedged session should not restart Chromium when that target alone unblocks attach');
   assert.equal(
-    recoveredLocation,
+    isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }),
+    '/stable',
+    'closing the wedged session should preserve the surviving run\'s live page in the single-wedge recovery case',
+  );
+  assert.equal(
+    getBrowserContextCount(),
+    Object.keys(getPersistedSessions()).length,
+    'sweep recovery should dispose the closed session\'s browser context instead of leaving an untracked orphan behind',
+  );
+}
+
+function runHostilePageEscalationSmoke(origin) {
+  const closeeSession = smokeSessionKey('hostile-escalation-closee');
+  const survivingSession = smokeSessionKey('hostile-escalation-survivor');
+  const hiddenSession = smokeSessionKey('hostile-escalation-hidden');
+
+  assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  assert.match(isolatedText(closeeSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
+  assert.match(isolatedText(hiddenSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
+  deletePersistedSessionRecord(hiddenSession);
+  waitForPageTargets(
+    urls => urls.filter(url => url === `${origin}/wedge-slow`).length >= 2,
+    'the escalation case needs both a tracked wedged session and an extra wedged page that is no longer in persisted session state',
+  );
+  sleepSync(1600);
+
+  assert.match(
+    isolatedBrowser(survivingSession, { action: 'evaluate', expression: 'location.pathname' }, { expectFailure: true }).output,
+    /Could not attach to the existing Chromium instance in this container while it is still running/,
+  );
+
+  const processBeforeRecovery = getBrowserProcessSignature();
+  const closeOutput = isolatedText(closeeSession, { action: 'close' });
+  assert.match(closeOutput, /restarting Chromium/, 'the escalation case should reach the restart fallback once every recoverable target has been swept');
+  assert.notEqual(getBrowserProcessSignature(), processBeforeRecovery, 'the escalation case should actually restart Chromium');
+  const sessionsAfterRecovery = getPersistedSessions();
+  assert.equal(Boolean(sessionsAfterRecovery[closeeSession]), false, 'the explicitly closed session should still be removed after restart recovery');
+  assert.equal(Boolean(sessionsAfterRecovery[survivingSession]), true, 'other session records should survive the restart fallback so they can self-heal later');
+  assert.equal(Boolean(sessionsAfterRecovery[hiddenSession]), false, 'the hidden wedged session should stay absent from persisted state after the forced restart');
+  assert.equal(
+    isolatedText(survivingSession, { action: 'evaluate', expression: 'location.href' }),
     'about:blank',
-    'if recovery had to restart Chromium, the surviving run should self-heal into a fresh blank page instead of staying unusable',
+    'after the restart fallback, surviving sessions should self-heal to a fresh page instead of staying unusable',
   );
   assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
   assert.equal(isolatedText(survivingSession, { action: 'evaluate', expression: 'location.pathname' }), '/stable');
