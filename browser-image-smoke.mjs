@@ -148,6 +148,21 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function getPersistedSessions() {
+  try {
+    const state = JSON.parse(readFileSync(BROWSER_STATE_PATH, 'utf8'));
+    return state && typeof state === 'object' && state.sessions && typeof state.sessions === 'object'
+      ? state.sessions
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function defaultSessionExists() {
+  return Object.prototype.hasOwnProperty.call(getPersistedSessions(), 'default');
+}
+
 /**
  * The smoke suite gets rerun in long-lived containers, including after a failed
  * attempt that may have left behind the sessions this suite uses. Reset by
@@ -155,11 +170,13 @@ function sleepSync(ms) {
  * rerun starts clean without deleting shared state or breaking another lock
  * holder's inode out from under it.
  */
-function resetBrowserFixtureState() {
-  try {
-    browser({ action: 'close' });
-  } catch {
-    /* ignore a missing or already-broken shared smoke session during cleanup */
+function resetBrowserFixtureState({ closeDefaultSession } = {}) {
+  if (closeDefaultSession) {
+    try {
+      browser({ action: 'close' });
+    } catch {
+      /* ignore a missing or already-broken shared smoke session during cleanup */
+    }
   }
   for (const sessionName of SMOKE_SESSION_NAMES) {
     try {
@@ -377,6 +394,12 @@ function assertAppearsBefore(text, earlier, later, label) {
 }
 
 async function runSmoke() {
+  const defaultSessionOwnedBySmoke = !defaultSessionExists();
+  if (!defaultSessionOwnedBySmoke) {
+    console.log('Skipping shared default-session smoke because this container already has a default browser session. Running isolated-session checks only.');
+  }
+
+  if (defaultSessionOwnedBySmoke) {
   const openOutput = browser({ action: 'open', url: buildProbePage() });
   assert.match(openOutput, /Title: browser smoke/);
 
@@ -556,16 +579,20 @@ async function runSmoke() {
   runConsoleMethodSmoke();
   runForgedConsoleSmoke();
   runViewportScreenshotSmoke();
+  }
 
   const pageServer = startPageServer(NAVIGATION_ROUTES);
   try {
-    runPageInitiatedNavigationSmoke(pageServer.origin);
-    runStrandedTabSmoke(pageServer.origin);
-    runExternalBlankTabSmoke(pageServer.origin);
-    runSessionResetSmoke(pageServer.origin);
-    await runIsolatedSessionSmoke(pageServer.origin);
+    if (defaultSessionOwnedBySmoke) {
+      runPageInitiatedNavigationSmoke(pageServer.origin);
+      runStrandedTabSmoke(pageServer.origin);
+      runExternalBlankTabSmoke(pageServer.origin);
+      runSessionResetSmoke(pageServer.origin);
+    }
+    await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
   } finally {
     pageServer.stop();
+    resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmoke });
   }
 
   console.log('Base image browser smoke passed.');
@@ -822,7 +849,7 @@ function runSessionResetSmoke(origin) {
   assert.ok(shot.base64.length > 0, 'the recovered session must still be able to produce a screenshot');
 }
 
-async function runIsolatedSessionSmoke(origin) {
+async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
   const alphaSession = smokeSessionKey('isolated-alpha');
   const betaSession = smokeSessionKey('isolated-beta');
 
@@ -890,7 +917,9 @@ async function runIsolatedSessionSmoke(origin) {
   );
 
   assert.equal(isolatedText(betaSession, { action: 'close' }), 'Browser session closed.');
-  browser({ action: 'close' });
+  if (closeDefaultSession) {
+    browser({ action: 'close' });
+  }
 
   const ttlEnv = { TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '100' };
   const ttlSessionA = smokeSessionKey('ttl-a');
@@ -933,6 +962,20 @@ async function runIsolatedSessionSmoke(origin) {
     Buffer.byteLength(oversizedOutput.rawOutput, 'utf8') < 100_000,
     'the serialized isolated-browser envelope should stay below the daemon shell\'s default capture ceiling',
   );
+
+  isolatedText(oversizedOutputSession, {
+    action: 'evaluate',
+    expression: '(() => { document.title = "x".repeat(13_500_000); return document.title.length; })()',
+  });
+  const giantTitleShot = callIsolatedBrowser(oversizedOutputSession, { action: 'screenshot' });
+  assert.ok(
+    Buffer.byteLength(giantTitleShot.rawOutput, 'utf8') < 20_000_000,
+    'the giant-title screenshot envelope should stay inside the Browser screenshot transport budget after truncating the hostile page-controlled title',
+  );
+  assert.equal(giantTitleShot.envelope.isError, false);
+  assert.equal(giantTitleShot.envelope.outputTruncated, true, 'a page-controlled giant title should be truncated inside the screenshot envelope before shell capture can corrupt it');
+  assert.match(giantTitleShot.envelope.output, /Screenshot of "x{100,}.*\[truncated\]"/);
+  assert.ok(giantTitleShot.envelope.screenshot?.base64.length > 0, 'the giant-title screenshot should still deliver image bytes');
 
   const evictionEnv = { TAURUS_BROWSER_MAX_SESSIONS: '2', TAURUS_BROWSER_SESSION_IDLE_TTL_MS: '21600000' };
   const evictSessionA = smokeSessionKey('evict-a');
@@ -977,10 +1020,11 @@ function runViewportScreenshotSmoke() {
   browser({ action: 'resize', width: 1280, height: 720 });
 }
 
-resetBrowserFixtureState();
+const defaultSessionOwnedBySmokeAtStart = !defaultSessionExists();
+resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmokeAtStart });
 
 try {
   await runSmoke();
 } finally {
-  resetBrowserFixtureState();
+  resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmokeAtStart });
 }

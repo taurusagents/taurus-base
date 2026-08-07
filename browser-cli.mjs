@@ -67,6 +67,9 @@ const MAX_CONSOLE_OUTPUT_LENGTH = 100_000;
 // helper instead of a shell-truncated JSON fragment.
 const MAX_TEXT_PROTOCOL_STDOUT_BYTES = 80_000;
 const TRUNCATED_PROTOCOL_OUTPUT_SUFFIX = '\n\n[Browser helper truncated the rest of this output to keep the protocol envelope within Taurus transport limits.]';
+const TRUNCATED_SCREENSHOT_FIELD_SUFFIX = '…[truncated]';
+const MAX_SCREENSHOT_TITLE_SUMMARY_CHARS = 2_048;
+const MAX_SCREENSHOT_URL_SUMMARY_CHARS = 4_096;
 // Best-effort guard for the one shared default session used by manual CLI
 // callers. When that session opens extra tabs, foregrounding its own page keeps
 // screenshots and snapshots usable without reintroducing cross-run interference
@@ -624,6 +627,39 @@ function sanitizeConsoleText(text) {
 function truncateConsoleText(text, maxLength) {
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function truncateSummaryField(text, maxLength) {
+  if (text.length <= maxLength) {
+    return { text, truncated: false };
+  }
+
+  const keptLength = Math.max(0, maxLength - TRUNCATED_SCREENSHOT_FIELD_SUFFIX.length);
+  return {
+    text: `${text.slice(0, keptLength)}${TRUNCATED_SCREENSHOT_FIELD_SUFFIX}`,
+    truncated: true,
+  };
+}
+
+/**
+ * A page controls both document.title and, via navigations and fragments, the
+ * URL we report alongside a screenshot. Bound those summary fields before they
+ * enter the envelope so a hostile page cannot turn a valid screenshot into an
+ * oversized JSON blob that the shell cuts mid-envelope.
+ */
+function buildScreenshotSummary(title, url, viewport, byteLength) {
+  const boundedTitle = truncateSummaryField(
+    escapeLineIntegrityCharacters(title),
+    MAX_SCREENSHOT_TITLE_SUMMARY_CHARS,
+  );
+  const boundedUrl = truncateSummaryField(
+    escapeLineIntegrityCharacters(url),
+    MAX_SCREENSHOT_URL_SUMMARY_CHARS,
+  );
+  return {
+    text: `Screenshot of "${boundedTitle.text}" (${boundedUrl.text})\nViewport: ${viewport.width}x${viewport.height}, ${byteLength} bytes`,
+    outputTruncated: boundedTitle.truncated || boundedUrl.truncated,
+  };
 }
 
 /**
@@ -1633,12 +1669,14 @@ async function performActionOnPage(input, page, options = {}) {
 
     case 'screenshot': {
       const buffer = await page.screenshot({ fullPage: false });
-      const title = escapeLineIntegrityCharacters(await page.title());
+      const title = await page.title();
       const url = page.url();
       const viewport = await getRealViewport(page);
+      const summary = buildScreenshotSummary(title, url, viewport, buffer.length);
       return {
         __type: 'screenshot',
-        text: `Screenshot of "${title}" (${url})\nViewport: ${viewport.width}x${viewport.height}, ${buffer.length} bytes`,
+        text: summary.text,
+        outputTruncated: summary.outputTruncated,
         base64: buffer.toString('base64'),
         mediaType: 'image/png',
       };
@@ -1745,7 +1783,7 @@ function buildProtocolEnvelope(nonce, outcome) {
       nonce,
       isError: false,
       output: outcome.text,
-      outputTruncated: false,
+      outputTruncated: outcome.outputTruncated === true,
       screenshot: {
         base64: outcome.base64,
         mediaType: outcome.mediaType,
