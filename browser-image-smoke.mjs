@@ -5,6 +5,7 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 
 const BROWSER_CLI_PATH = process.env.BROWSER_CLI_PATH || '/usr/local/lib/browser-cli.mjs';
 const BROWSER_STATE_PATH = '/tmp/.browser-cli.json';
+const BROWSER_ACTION_LOCK_PATH = '/tmp/.browser-cli.action.lock';
 const SMOKE_SESSION_PREFIX = '__browser-smoke__:';
 const SMOKE_SESSION_NAMES = [
   'isolated-alpha',
@@ -150,7 +151,15 @@ function sleepSync(ms) {
 
 function getPersistedSessions() {
   try {
-    const state = JSON.parse(readFileSync(BROWSER_STATE_PATH, 'utf8'));
+    // The helper rewrites its state file while holding a flock on this lock
+    // path. Read under the same lock so the smoke never mistakes a torn rewrite
+    // for "no default session" and tears down someone else's idle browser.
+    const stateRead = spawnSync(
+      'bash',
+      ['-lc', 'exec 9>>"$1"; flock -x 9; cat "$2" 2>/dev/null || true', 'bash', BROWSER_ACTION_LOCK_PATH, BROWSER_STATE_PATH],
+      { encoding: 'utf8' },
+    );
+    const state = JSON.parse(stateRead.stdout || '{}');
     return state && typeof state === 'object' && state.sessions && typeof state.sessions === 'object'
       ? state.sessions
       : {};
