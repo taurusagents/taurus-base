@@ -81,7 +81,11 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get update \
     && apt-get install -y --no-install-recommends nodejs=24.15.0-1nodesource1 \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g typescript@6.0.3 prettier@3.8.3 eslint@10.4.0
+    && npm install -g typescript@6.0.3 prettier@3.8.3 eslint@10.4.0 \
+# Ship a pinned pnpm in-image via Corepack so containers do not depend on a
+# network fetch the first time pnpm is used.
+    && corepack enable pnpm --install-directory /usr/bin \
+    && corepack prepare pnpm@10.33.0 --activate
 
 # ── Go ──
 RUN curl -fsSL https://go.dev/dl/go1.24.3.linux-$(dpkg --print-architecture).tar.gz \
