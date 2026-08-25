@@ -126,7 +126,7 @@ index a534912a8..a9f040e42 100644
      };
  
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index d2a9fd522..fdf68c7cd 100644
+index d2a9fd522..f1ccd4c16 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
 @@ -84,8 +84,10 @@ pub(crate) async fn build_compaction_initial_context(
@@ -158,7 +158,50 @@ index d2a9fd522..fdf68c7cd 100644
      let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
  
      let mut history = sess.clone_history().await;
-@@ -367,7 +372,17 @@ async fn run_compact_task_inner_impl(
+@@ -248,7 +253,11 @@ async fn run_compact_task_inner_impl(
+         CodexResponsesRequestKind::Compaction(compaction_metadata),
+     );
+ 
+-    loop {
++    // Output of THIS compaction request, kept apart from the session history so
++    // the summary can only be text this request produced. A failed attempt's
++    // partial items are discarded with it: only the attempt that reaches
++    // `response.completed` leaves the loop with them.
++    let compaction_output: Vec<ResponseItem> = loop {
+         // Clone is required because of the loop
+         let turn_input = history
+             .clone()
+@@ -269,8 +278,8 @@ async fn run_compact_task_inner_impl(
+         .await;
+ 
+         match attempt_result {
+-            Ok(()) => {
+-                break;
++            Ok(items) => {
++                break items;
+             }
+             Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
+                 return Err(err);
+@@ -317,11 +326,16 @@ async fn run_compact_task_inner_impl(
+                 }
+             }
+         }
+-    }
++    };
+ 
+     let history_snapshot = sess.clone_history().await;
+     let history_items = history_snapshot.raw_items();
+-    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
++    // This request's own output, not the whole history: when the compaction turn
++    // answers with nothing (refusal, empty completion) it must report no summary,
++    // where a backwards scan of the history would pick up an assistant message
++    // from the task itself and store that as the summary instead.
++    let summary_suffix =
++        get_last_assistant_message_from_turn(&compaction_output).unwrap_or_default();
+     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+     let user_messages = collect_user_messages(history_items);
+ 
+@@ -367,7 +381,17 @@ async fn run_compact_task_inner_impl(
      .await;
      sess.recompute_token_usage(&turn_context).await;
  
@@ -177,6 +220,96 @@ index d2a9fd522..fdf68c7cd 100644
          .await;
      let warning = EventMsg::Warning(WarningEvent {
          message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+@@ -501,11 +525,12 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
+         .iter()
+         .filter_map(|item| match crate::event_mapping::parse_turn_item(item) {
+             Some(TurnItem::UserMessage(user)) => {
+-                if is_summary_message(&user.message()) {
++                let message = user.message();
++                if is_summary_message(&message) || is_post_compaction_note(&message) {
+                     None
+                 } else {
+                     Some(CompactedUserMessage {
+-                        message: user.message(),
++                        message,
+                         internal_chat_message_metadata_passthrough: match item {
+                             ResponseItem::Message {
+                                 internal_chat_message_metadata_passthrough,
+@@ -521,8 +546,30 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
+         .collect()
+ }
+ 
++/// Opening tag of the note the Taurus runtime steers in as a user message right
++/// after a compaction. It describes the boundary it was written at, so keeping
++/// it in a rebuilt history moves it to a point it does not describe. The literal
++/// is a contract with that runtime, which writes the envelope in
++/// `wrapPostCompactionMaterial` (src/agents/post-compaction-material.ts in the
++/// taurus-agents repository); neither side may change it alone.
++const POST_COMPACTION_NOTE_OPENING: &str = "<post-compaction-note";
++
++fn is_post_compaction_note(message: &str) -> bool {
++    message.trim_start().starts_with(POST_COMPACTION_NOTE_OPENING)
++}
++
++/// How the summary preamble opened before it was reworded to address the model
++/// as the author of its own earlier summary. Threads from a build that shipped
++/// the old wording still carry summaries beginning this way; matching it keeps
++/// them recognisable, so they are dropped at the next compaction instead of
++/// being retained verbatim into every later history. This build never writes it,
++/// and it can go once no such thread is live.
++const LEGACY_SUMMARY_PREFIX_OPENING: &str =
++    "Another language model started to solve this problem and produced a summary of its thinking process.";
++
+ pub(crate) fn is_summary_message(message: &str) -> bool {
+     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
++        || message.starts_with(LEGACY_SUMMARY_PREFIX_OPENING)
+ }
+ 
+ /// Inserts canonical initial context into compacted replacement history at the
+@@ -658,13 +705,16 @@ fn build_compacted_history_with_limit(
+     history
+ }
+ 
++/// Runs one request to completion and returns the items it produced, so a caller
++/// can read the summary from this request's output rather than from the history.
+ async fn drain_to_completed(
+     sess: &Session,
+     turn_context: &TurnContext,
+     client_session: &mut ModelClientSession,
+     responses_metadata: &CodexResponsesMetadata,
+     prompt: &Prompt,
+-) -> CodexResult<()> {
++) -> CodexResult<Vec<ResponseItem>> {
++    let mut output_items: Vec<ResponseItem> = Vec::new();
+     let mut stream = client_session
+         .stream(
+             prompt,
+@@ -691,6 +741,7 @@ async fn drain_to_completed(
+             Ok(ResponseEvent::OutputItemDone(item)) => {
+                 sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+                     .await;
++                output_items.push(item);
+             }
+             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
+                 sess.set_server_reasoning_included(included).await;
+@@ -701,7 +752,7 @@ async fn drain_to_completed(
+             Ok(ResponseEvent::Completed { token_usage, .. }) => {
+                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
+                     .await?;
+-                return Ok(());
++                return Ok(output_items);
+             }
+             Ok(_) => continue,
+             Err(e) => return Err(e),
+diff --git a/codex-rs/prompts/templates/compact/summary_prefix.md b/codex-rs/prompts/templates/compact/summary_prefix.md
+index 62a7161b8..5ce82b57c 100644
+--- a/codex-rs/prompts/templates/compact/summary_prefix.md
++++ b/codex-rs/prompts/templates/compact/summary_prefix.md
+@@ -1 +1 @@
+-Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:
+\ No newline at end of file
++Earlier, you started to solve this problem and produced a summary of your thinking process. You also have access to the state of the tools that you used. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary you produced, use the information in this summary to assist with your own analysis:
+\ No newline at end of file
 diff --git a/codex-rs/protocol/src/items.rs b/codex-rs/protocol/src/items.rs
 index a65bd970d..c6b026a13 100644
 --- a/codex-rs/protocol/src/items.rs
