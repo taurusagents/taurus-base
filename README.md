@@ -159,9 +159,14 @@ changes. What it does:
   `wrapPostCompactionMaterial` (`src/agents/post-compaction-material.ts` in the
   `taurus-agents` repository); neither side may change it alone.
 
-Upstream's `codex-rs/core/tests/common/context_snapshot.rs` hard-codes the old
-summary preamble. It is left untouched on purpose: it belongs to test code that
-is not compiled for the `-p codex-cli --bin codex` build this image performs.
+Upstream tests that asserted the pre-fork behaviour are adapted rather than left
+to fail: the provider-capability tests now expect forced-local compaction, and
+the app-server test that asserted remote dispatch now asserts that a provider
+upstream would route remotely still compacts locally and never calls the compact
+endpoint. One exception is deliberate — `codex-rs/core/tests/common/context_snapshot.rs`
+hard-codes the old summary preamble and is left as upstream wrote it, being test
+code that the `-p codex-cli --bin codex` build this image performs does not
+compile.
 
 ## Automatic publishing
 

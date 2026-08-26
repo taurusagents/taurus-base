@@ -74,7 +74,7 @@ index a4d867cf9..52a5772ee 100644
          thread_id: "thr_123".to_string(),
          turn_id: None,
 diff --git a/codex-rs/app-server/tests/suite/v2/compaction.rs b/codex-rs/app-server/tests/suite/v2/compaction.rs
-index f1637d13b..c808b6b11 100644
+index f1637d13b..c5c884f1e 100644
 --- a/codex-rs/app-server/tests/suite/v2/compaction.rs
 +++ b/codex-rs/app-server/tests/suite/v2/compaction.rs
 @@ -84,10 +84,13 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
@@ -93,7 +93,43 @@ index f1637d13b..c808b6b11 100644
          unreachable!("completed item should be context compaction");
      };
  
-@@ -166,10 +169,13 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+@@ -99,7 +102,12 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()> {
++async fn auto_compaction_stays_local_when_the_provider_would_support_remote() -> Result<()> {
++    // Upstream asserts remote dispatch here. This build reports remote
++    // compaction as an unsupported provider capability, so the same setup — an
++    // OpenAI provider with ChatGPT auth, which upstream would route to the
++    // compact endpoint — has to compact locally instead. The mounted compact
++    // endpoint is kept precisely so the test can prove it is never called.
+     skip_if_no_network!(Ok(()));
+     const REMOTE_AUTO_COMPACT_LIMIT: i64 = 200_000;
+ 
+@@ -112,11 +120,18 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+         responses::ev_assistant_message("m2", "SECOND_REPLY"),
+         responses::ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
+     ]);
++    // Local compaction spends a model turn of its own, so the third user turn
++    // needs a fourth response — the same four-response shape as the local test
++    // above, rather than the three a remote compaction would have used.
+     let sse3 = responses::sse(vec![
+-        responses::ev_assistant_message("m3", "FINAL_REPLY"),
+-        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 120),
++        responses::ev_assistant_message("m3", "LOCAL_SUMMARY"),
++        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 200),
++    ]);
++    let sse4 = responses::sse(vec![
++        responses::ev_assistant_message("m4", "FINAL_REPLY"),
++        responses::ev_completed_with_tokens("r4", /*total_tokens*/ 120),
+     ]);
+-    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
++    responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+ 
+     let compacted_history = vec![
+         ResponseItem::Message {
+@@ -166,10 +181,13 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
      let started = wait_for_context_compaction_started(&mut mcp).await?;
      let completed = wait_for_context_compaction_completed(&mut mcp).await?;
  
@@ -109,7 +145,74 @@ index f1637d13b..c808b6b11 100644
          unreachable!("completed item should be context compaction");
      };
  
-@@ -284,10 +290,13 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
+@@ -177,63 +195,9 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+     assert_eq!(completed.thread_id, thread_id);
+     assert_eq!(started_id, completed_id);
+ 
+-    let compact_requests = compact_mock.requests();
+-    assert_eq!(compact_requests.len(), 1);
+-    assert_eq!(compact_requests[0].path(), "/v1/responses/compact");
+-
+-    let response_requests = responses_log.requests();
+-    assert_eq!(response_requests.len(), 3);
+-    let turn_metadata = response_requests
+-        .iter()
+-        .map(|request| {
+-            request
+-                .header("x-codex-turn-metadata")
+-                .as_deref()
+-                .map(parse_json_header)
+-                .expect("turn request should include turn metadata")
+-        })
+-        .collect::<Vec<_>>();
+-    for (request, metadata) in response_requests.iter().zip(&turn_metadata) {
+-        assert_eq!(metadata["request_kind"].as_str(), Some("turn"));
+-        assert!(
+-            metadata["turn_id"]
+-                .as_str()
+-                .is_some_and(|turn_id| !turn_id.is_empty()),
+-            "turn request should carry a non-empty turn id"
+-        );
+-        assert_eq!(
+-            metadata["window_id"].as_str(),
+-            request.header("x-codex-window-id").as_deref()
+-        );
+-        assert!(metadata.get("compaction").is_none());
+-    }
+-
+-    let compact_metadata = compact_requests[0]
+-        .header("x-codex-turn-metadata")
+-        .as_deref()
+-        .map(parse_json_header)
+-        .expect("compact request should include turn metadata");
+-    assert_eq!(
+-        compact_metadata["request_kind"].as_str(),
+-        Some("compaction")
+-    );
+-    assert_eq!(
+-        compact_metadata["compaction"],
+-        serde_json::json!({
+-            "trigger": "auto",
+-            "reason": "context_limit",
+-            "implementation": "responses_compact",
+-            "phase": "pre_turn",
+-            "strategy": "memento",
+-        })
+-    );
+-    assert_eq!(
+-        compact_metadata["turn_id"], turn_metadata[2]["turn_id"],
+-        "pre-turn compaction should carry the current turn id"
+-    );
+-    assert_eq!(
+-        compact_metadata["window_id"].as_str(),
+-        compact_requests[0].header("x-codex-window-id").as_deref()
++    assert!(
++        compact_mock.requests().is_empty(),
++        "compaction must not reach the remote compact endpoint"
+     );
+ 
+     Ok(())
+@@ -284,10 +248,13 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
      .await??;
      let completed = wait_for_context_compaction_completed(&mut mcp).await?;
  
@@ -125,8 +228,19 @@ index f1637d13b..c808b6b11 100644
          unreachable!("completed item should be context compaction");
      };
  
+@@ -448,10 +415,6 @@ async fn wait_for_context_compaction_completed(
+     }
+ }
+ 
+-fn parse_json_header(value: &str) -> serde_json::Value {
+-    serde_json::from_str(value).expect("turn metadata should be JSON")
+-}
+-
+ fn compaction_config(server_uri: &str, auto_compact_limit: i64) -> MockResponsesConfig {
+     MockResponsesConfig::new(server_uri)
+         .with_root_config(&format!(
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index b58e99d9d..36a3541b9 100644
+index b58e99d9d..ddee6103a 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
 @@ -244,9 +244,12 @@ async fn run_compact_task_inner_impl(
@@ -185,7 +299,7 @@ index b58e99d9d..36a3541b9 100644
      let summary_suffix =
 -        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
 -    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-+        get_last_assistant_message_from_turn(&compaction_output).unwrap_or_default();
++        get_last_assistant_message_from_turn(compaction_output.iter()).unwrap_or_default();
 +    // Say so when there is no summary, rather than leaving the preamble followed
 +    // by nothing. The preamble is kept so the replacement message still matches
 +    // `is_summary_message` and is dropped by the next compaction instead of
@@ -446,3 +560,17 @@ index feaf06387..c643daf88 100644
      }
  }
  
+diff --git a/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs b/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
+index 6f6babc05..07c396fa1 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
+@@ -172,6 +172,9 @@ pub(super) fn completed_item(
+         EventMsg::ContextCompacted(_) => Some((
+             TurnItem::ContextCompaction(ContextCompactionItem {
+                 id: next_item_id()?,
++                // Legacy rollout lines predate the summary field and carry no
++                // summary text of their own.
++                summary: None,
+             }),
+             None,
+         )),
