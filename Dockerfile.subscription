@@ -3,8 +3,8 @@
 # Usage: hidden Taurus subscription sidecars use this image instead of the
 # user-visible default agent container image.
 
-ARG CODEX_GIT_REF=rust-v0.144.1
-ARG CODEX_GIT_COMMIT=44918ea10c0f99151c6710411b4322c2f5c96bea
+ARG CODEX_GIT_REF=rust-v0.149.1
+ARG CODEX_GIT_COMMIT=ff29a44391deccde0aba0f8390337d7f3c319ea4
 ARG CODEX_RUST_VERSION=1.95.0
 ARG CODEX_BUILD_JOBS=1
 
@@ -34,10 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
-# Upstream rust-v0.144.1 still refreshes internal workspace package versions in
-# Cargo.lock during build, so `cargo build --locked` fails on the pinned tag.
-# Build from the pinned commit anyway. `CODEX_BUILD_JOBS` defaults to 1 for
-# memory-constrained builders but can be overridden by CI/staging.
+# Upstream refreshes internal workspace package versions in Cargo.lock during
+# the build, so `cargo build --locked` fails on a pinned tag (observed on
+# rust-v0.144.1 and not re-tested since — this build simply does not pass
+# --locked). The pinned commit is still enforced by the rev-parse check below.
+# `CODEX_BUILD_JOBS` defaults to 1 for memory-constrained builders but can be
+# overridden by CI/staging.
 RUN curl -fsSL https://sh.rustup.rs | bash -s -- -y --profile minimal --default-toolchain ${CODEX_RUST_VERSION} \
     && git clone --depth 1 --branch ${CODEX_GIT_REF} https://github.com/openai/codex.git /tmp/codex-src \
     && cd /tmp/codex-src \
@@ -97,7 +99,7 @@ RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-vers
 # same stdio app-server Taurus uses in subscription sidecars.
 RUN chmod 0755 /usr/bin/codex \
     && /usr/bin/codex --version | tee /tmp/codex-version \
-    && grep -F '0.144.1' /tmp/codex-version \
+    && grep -F '0.149.1' /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
     && rm -f /tmp/codex-app-server-smoke.mjs
 

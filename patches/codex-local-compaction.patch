@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
-index ca8487b79..00d8ee780 100644
+index 34afee0e1..32fe1fa3e 100644
 --- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
-@@ -1119,7 +1119,7 @@ impl ThreadHistoryBuilder {
+@@ -1127,7 +1127,7 @@ impl ThreadHistoryBuilder {
  
      fn handle_context_compacted(&mut self, _payload: &ContextCompactedEvent) {
          let id = self.next_item_id();
@@ -12,10 +12,10 @@ index ca8487b79..00d8ee780 100644
  
      fn handle_entered_review_mode(
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/item.rs b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
-index 7a5e4dc1f..ef6859ae1 100644
+index c2b59e459..d82ef1194 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/item.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
-@@ -392,6 +392,9 @@ pub enum ThreadItem {
+@@ -400,6 +400,9 @@ pub enum ThreadItem {
      #[ts(rename_all = "camelCase")]
      ContextCompaction {
          id: String,
@@ -25,7 +25,7 @@ index 7a5e4dc1f..ef6859ae1 100644
      },
  }
  
-@@ -967,9 +970,10 @@ impl From<CoreTurnItem> for ThreadItem {
+@@ -984,9 +987,10 @@ impl From<CoreTurnItem> for ThreadItem {
                      duration_ms,
                  }
              }
@@ -40,18 +40,18 @@ index 7a5e4dc1f..ef6859ae1 100644
      }
  }
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
-index d35d39fe4..4cfedc228 100644
+index a4d867cf9..52a5772ee 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
-@@ -258,6 +258,7 @@ fn thread_items_list_round_trips() {
-     let response = ThreadItemsListResponse {
-         data: vec![ThreadItem::ContextCompaction {
-             id: "item_1".to_string(),
-+            summary: None,
+@@ -368,6 +368,7 @@ fn thread_items_list_round_trips() {
+             turn_id: "turn_456".to_string(),
+             item: ThreadItem::ContextCompaction {
+                 id: "item_1".to_string(),
++                summary: None,
+             },
          }],
          next_cursor: None,
-         backwards_cursor: Some("cursor_0".to_string()),
-@@ -272,6 +273,21 @@ fn thread_items_list_round_trips() {
+@@ -386,6 +387,21 @@ fn thread_items_list_round_trips() {
          })
      );
  
@@ -74,10 +74,10 @@ index d35d39fe4..4cfedc228 100644
          thread_id: "thr_123".to_string(),
          turn_id: None,
 diff --git a/codex-rs/app-server/tests/suite/v2/compaction.rs b/codex-rs/app-server/tests/suite/v2/compaction.rs
-index a534912a8..a9f040e42 100644
+index f1637d13b..c5c884f1e 100644
 --- a/codex-rs/app-server/tests/suite/v2/compaction.rs
 +++ b/codex-rs/app-server/tests/suite/v2/compaction.rs
-@@ -95,10 +95,13 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
+@@ -84,10 +84,13 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
      let started = wait_for_context_compaction_started(&mut mcp).await?;
      let completed = wait_for_context_compaction_completed(&mut mcp).await?;
  
@@ -93,7 +93,43 @@ index a534912a8..a9f040e42 100644
          unreachable!("completed item should be context compaction");
      };
  
-@@ -182,10 +185,13 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+@@ -99,7 +102,12 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()> {
++async fn auto_compaction_stays_local_when_the_provider_would_support_remote() -> Result<()> {
++    // Upstream asserts remote dispatch here. This build reports remote
++    // compaction as an unsupported provider capability, so the same setup — an
++    // OpenAI provider with ChatGPT auth, which upstream would route to the
++    // compact endpoint — has to compact locally instead. The mounted compact
++    // endpoint is kept precisely so the test can prove it is never called.
+     skip_if_no_network!(Ok(()));
+     const REMOTE_AUTO_COMPACT_LIMIT: i64 = 200_000;
+ 
+@@ -112,11 +120,18 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+         responses::ev_assistant_message("m2", "SECOND_REPLY"),
+         responses::ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
+     ]);
++    // Local compaction spends a model turn of its own, so the third user turn
++    // needs a fourth response — the same four-response shape as the local test
++    // above, rather than the three a remote compaction would have used.
+     let sse3 = responses::sse(vec![
+-        responses::ev_assistant_message("m3", "FINAL_REPLY"),
+-        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 120),
++        responses::ev_assistant_message("m3", "LOCAL_SUMMARY"),
++        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 200),
++    ]);
++    let sse4 = responses::sse(vec![
++        responses::ev_assistant_message("m4", "FINAL_REPLY"),
++        responses::ev_completed_with_tokens("r4", /*total_tokens*/ 120),
+     ]);
+-    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
++    responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+ 
+     let compacted_history = vec![
+         ResponseItem::Message {
+@@ -166,10 +181,13 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
      let started = wait_for_context_compaction_started(&mut mcp).await?;
      let completed = wait_for_context_compaction_completed(&mut mcp).await?;
  
@@ -109,8 +145,75 @@ index a534912a8..a9f040e42 100644
          unreachable!("completed item should be context compaction");
      };
  
-@@ -300,10 +306,13 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
-     let started = wait_for_context_compaction_started(&mut mcp).await?;
+@@ -177,63 +195,9 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
+     assert_eq!(completed.thread_id, thread_id);
+     assert_eq!(started_id, completed_id);
+ 
+-    let compact_requests = compact_mock.requests();
+-    assert_eq!(compact_requests.len(), 1);
+-    assert_eq!(compact_requests[0].path(), "/v1/responses/compact");
+-
+-    let response_requests = responses_log.requests();
+-    assert_eq!(response_requests.len(), 3);
+-    let turn_metadata = response_requests
+-        .iter()
+-        .map(|request| {
+-            request
+-                .header("x-codex-turn-metadata")
+-                .as_deref()
+-                .map(parse_json_header)
+-                .expect("turn request should include turn metadata")
+-        })
+-        .collect::<Vec<_>>();
+-    for (request, metadata) in response_requests.iter().zip(&turn_metadata) {
+-        assert_eq!(metadata["request_kind"].as_str(), Some("turn"));
+-        assert!(
+-            metadata["turn_id"]
+-                .as_str()
+-                .is_some_and(|turn_id| !turn_id.is_empty()),
+-            "turn request should carry a non-empty turn id"
+-        );
+-        assert_eq!(
+-            metadata["window_id"].as_str(),
+-            request.header("x-codex-window-id").as_deref()
+-        );
+-        assert!(metadata.get("compaction").is_none());
+-    }
+-
+-    let compact_metadata = compact_requests[0]
+-        .header("x-codex-turn-metadata")
+-        .as_deref()
+-        .map(parse_json_header)
+-        .expect("compact request should include turn metadata");
+-    assert_eq!(
+-        compact_metadata["request_kind"].as_str(),
+-        Some("compaction")
+-    );
+-    assert_eq!(
+-        compact_metadata["compaction"],
+-        serde_json::json!({
+-            "trigger": "auto",
+-            "reason": "context_limit",
+-            "implementation": "responses_compact",
+-            "phase": "pre_turn",
+-            "strategy": "memento",
+-        })
+-    );
+-    assert_eq!(
+-        compact_metadata["turn_id"], turn_metadata[2]["turn_id"],
+-        "pre-turn compaction should carry the current turn id"
+-    );
+-    assert_eq!(
+-        compact_metadata["window_id"].as_str(),
+-        compact_requests[0].header("x-codex-window-id").as_deref()
++    assert!(
++        compact_mock.requests().is_empty(),
++        "compaction must not reach the remote compact endpoint"
+     );
+ 
+     Ok(())
+@@ -284,10 +248,13 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
+     .await??;
      let completed = wait_for_context_compaction_completed(&mut mcp).await?;
  
 -    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
@@ -125,24 +228,22 @@ index a534912a8..a9f040e42 100644
          unreachable!("completed item should be context compaction");
      };
  
-diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index d2a9fd522..fdf68c7cd 100644
---- a/codex-rs/core/src/compact.rs
-+++ b/codex-rs/core/src/compact.rs
-@@ -84,8 +84,10 @@ pub(crate) async fn build_compaction_initial_context(
+@@ -448,10 +415,6 @@ async fn wait_for_context_compaction_completed(
      }
  }
  
--pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
--    provider.supports_remote_compaction()
-+pub(crate) fn should_use_remote_compact_task(_provider: &ModelProviderInfo) -> bool {
-+    // Taurus staging experiment: force local compaction so the summary is emitted client-side
-+    // instead of being hidden behind the remote compaction task.
-+    false
- }
- 
- pub(crate) async fn run_inline_auto_compact_task(
-@@ -224,9 +226,12 @@ async fn run_compact_task_inner_impl(
+-fn parse_json_header(value: &str) -> serde_json::Value {
+-    serde_json::from_str(value).expect("turn metadata should be JSON")
+-}
+-
+ fn compaction_config(server_uri: &str, auto_compact_limit: i64) -> MockResponsesConfig {
+     MockResponsesConfig::new(server_uri)
+         .with_root_config(&format!(
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index b58e99d9d..ddee6103a 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -244,9 +244,12 @@ async fn run_compact_task_inner_impl(
      initial_context_injection: InitialContextInjection,
      compaction_metadata: CompactionTurnMetadata,
  ) -> CodexResult<String> {
@@ -158,7 +259,61 @@ index d2a9fd522..fdf68c7cd 100644
      let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
  
      let mut history = sess.clone_history().await;
-@@ -367,7 +372,17 @@ async fn run_compact_task_inner_impl(
+@@ -268,7 +271,11 @@ async fn run_compact_task_inner_impl(
+         CodexResponsesRequestKind::Compaction(compaction_metadata),
+     );
+ 
+-    loop {
++    // Output of THIS compaction request, kept apart from the session history so
++    // the summary can only be text this request produced. A failed attempt's
++    // partial items are discarded with it: only the attempt that reaches
++    // `response.completed` leaves the loop with them.
++    let compaction_output: Vec<ResponseItem> = loop {
+         // Clone is required because of the loop
+         let turn_input = history
+             .clone()
+@@ -289,8 +296,8 @@ async fn run_compact_task_inner_impl(
+         .await;
+ 
+         match attempt_result {
+-            Ok(()) => {
+-                break;
++            Ok(items) => {
++                break items;
+             }
+             Err(err)
+                 if matches!(
+@@ -342,13 +349,26 @@ async fn run_compact_task_inner_impl(
+                 }
+             }
+         }
+-    }
++    };
+ 
+     let history_snapshot = sess.clone_history().await;
+     let history_items = history_snapshot.annotated_items();
++    // This request's own output, not the whole history: when the compaction turn
++    // answers with nothing (refusal, empty completion) it must report no summary,
++    // where a backwards scan of the history would pick up an assistant message
++    // from the task itself and store that as the summary instead.
+     let summary_suffix =
+-        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
+-    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
++        get_last_assistant_message_from_turn(compaction_output.iter()).unwrap_or_default();
++    // Say so when there is no summary, rather than leaving the preamble followed
++    // by nothing. The preamble is kept so the replacement message still matches
++    // `is_summary_message` and is dropped by the next compaction instead of
++    // being retained as an ordinary user message forever.
++    let summary_body = if summary_suffix.is_empty() {
++        "(no summary available)"
++    } else {
++        summary_suffix.as_str()
++    };
++    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_body}");
+     let user_messages = collect_annotated_user_messages(history_items);
+ 
+     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+@@ -384,7 +404,17 @@ async fn run_compact_task_inner_impl(
      .await;
      sess.recompute_token_usage(&turn_context).await;
  
@@ -177,11 +332,208 @@ index d2a9fd522..fdf68c7cd 100644
          .await;
      let warning = EventMsg::Warning(WarningEvent {
          message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+@@ -548,11 +578,12 @@ fn compacted_user_message(
+     let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
+         return None;
+     };
+-    if is_summary_message(&user.message()) {
++    let message = user.message();
++    if is_summary_message(&message) || is_post_compaction_note(&message) {
+         return None;
+     }
+     Some(CompactedUserMessage {
+-        message: user.message(),
++        message,
+         internal_chat_message_metadata_passthrough: match item {
+             ResponseItem::Message {
+                 internal_chat_message_metadata_passthrough,
+@@ -564,6 +595,18 @@ fn compacted_user_message(
+     })
+ }
+ 
++/// Opening tag of the note the Taurus runtime steers in as a user message right
++/// after a compaction. It describes the boundary it was written at, so keeping
++/// it in a rebuilt history moves it to a point it does not describe. The literal
++/// is a contract with that runtime, which writes the envelope in
++/// `wrapPostCompactionMaterial` (src/agents/post-compaction-material.ts in the
++/// taurus-agents repository); neither side may change it alone.
++const POST_COMPACTION_NOTE_OPENING: &str = "<post-compaction-note";
++
++fn is_post_compaction_note(message: &str) -> bool {
++    message.trim_start().starts_with(POST_COMPACTION_NOTE_OPENING)
++}
++
+ pub(crate) fn is_summary_message(message: &str) -> bool {
+     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+ }
+@@ -716,13 +759,16 @@ fn build_compacted_history_with_limit(
+     history
+ }
+ 
++/// Runs one request to completion and returns the items it produced, so a caller
++/// can read the summary from this request's output rather than from the history.
+ async fn drain_to_completed(
+     sess: &Session,
+     turn_context: &TurnContext,
+     client_session: &mut ModelClientSession,
+     responses_metadata: &CodexResponsesMetadata,
+     prompt: &Prompt,
+-) -> CodexResult<()> {
++) -> CodexResult<Vec<ResponseItem>> {
++    let mut output_items: Vec<ResponseItem> = Vec::new();
+     let mut stream = client_session
+         .stream(
+             prompt,
+@@ -748,6 +794,7 @@ async fn drain_to_completed(
+             Ok(ResponseEvent::OutputItemDone(item)) => {
+                 sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+                     .await;
++                output_items.push(item);
+             }
+             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
+                 sess.set_server_reasoning_included(included).await;
+@@ -770,7 +817,7 @@ async fn drain_to_completed(
+                 .await;
+                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
+                     .await?;
+-                return Ok(());
++                return Ok(output_items);
+             }
+             Ok(_) => continue,
+             Err(e) => return Err(e),
+diff --git a/codex-rs/model-provider/src/provider.rs b/codex-rs/model-provider/src/provider.rs
+index 192c0eb0c..7113c321b 100644
+--- a/codex-rs/model-provider/src/provider.rs
++++ b/codex-rs/model-provider/src/provider.rs
+@@ -8,7 +8,6 @@ use codex_api::ApiError;
+ use codex_api::Provider;
+ use codex_api::SharedAuthProvider;
+ use codex_api::TransportError;
+-use codex_api::is_azure_responses_provider;
+ use codex_login::AuthManager;
+ use codex_login::CodexAuth;
+ use codex_login::default_client::RESIDENCY_HEADER_NAME;
+@@ -341,16 +340,19 @@ impl ModelProvider for ConfiguredModelProvider {
+     }
+ 
+     fn capabilities(&self) -> ProviderCapabilities {
+-        let remote_compaction = if self.info.is_openai()
+-            || is_azure_responses_provider(&self.info.name, self.info.base_url.as_deref())
+-        {
+-            RemoteCompactionSupport::V2
+-        } else {
+-            RemoteCompactionSupport::Unsupported
+-        };
+-
++        // Taurus force-local override. Upstream reports V2 here for OpenAI and
++        // Azure providers, which routes compaction to the provider-side task and
++        // leaves the summary text on the server. Reporting the capability as
++        // unsupported sends every compaction down Codex's own local
++        // summarization path instead — the path that produces a summary this
++        // process can see and hand to the app-server client.
++        //
++        // Overriding the capability rather than the callers is deliberate: both
++        // dispatch sites (`tasks/compact.rs` for a requested compaction and
++        // `session/turn.rs` for an automatic one) read this single accessor, so
++        // one answer covers both, and any dispatch site added later inherits it.
+         ProviderCapabilities {
+-            remote_compaction,
++            remote_compaction: RemoteCompactionSupport::Unsupported,
+             ..ProviderCapabilities::default()
+         }
+     }
+@@ -629,47 +631,47 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn configured_provider_uses_default_capabilities() {
++    fn configured_provider_uses_default_capabilities_except_forced_local_compaction() {
+         let provider = create_model_provider(
+             ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+             /*auth_manager*/ None,
+         );
+ 
+-        assert_eq!(provider.capabilities(), ProviderCapabilities::default());
++        assert_eq!(
++            provider.capabilities(),
++            ProviderCapabilities {
++                remote_compaction: RemoteCompactionSupport::Unsupported,
++                ..ProviderCapabilities::default()
++            }
++        );
+     }
+ 
+     #[test]
+-    fn configured_provider_remote_compaction_matches_provider_support() {
+-        let cases = [
+-            (
+-                ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+-                RemoteCompactionSupport::V2,
+-            ),
+-            (
+-                ModelProviderInfo {
+-                    name: "Azure".to_string(),
+-                    base_url: Some("https://example.com/openai".to_string()),
+-                    ..ModelProviderInfo::default()
+-                },
+-                RemoteCompactionSupport::V2,
+-            ),
+-            (
+-                ModelProviderInfo {
+-                    name: "Custom".to_string(),
+-                    base_url: Some("https://example.openai.azure.com/openai/v1".to_string()),
+-                    ..ModelProviderInfo::default()
+-                },
+-                RemoteCompactionSupport::V2,
+-            ),
+-            (
+-                provider_for("https://example.test/v1".to_string()),
+-                RemoteCompactionSupport::Unsupported,
+-            ),
++    fn configured_provider_reports_remote_compaction_unsupported_for_every_provider() {
++        // Providers that upstream answers V2 for are included on purpose: the
++        // forced-local override has to hold for them too, or compaction goes
++        // back to the provider-side task and the summary stops being visible.
++        let provider_infos = [
++            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
++            ModelProviderInfo {
++                name: "Azure".to_string(),
++                base_url: Some("https://example.com/openai".to_string()),
++                ..ModelProviderInfo::default()
++            },
++            ModelProviderInfo {
++                name: "Custom".to_string(),
++                base_url: Some("https://example.openai.azure.com/openai/v1".to_string()),
++                ..ModelProviderInfo::default()
++            },
++            provider_for("https://example.test/v1".to_string()),
+         ];
+ 
+-        for (provider_info, expected) in cases {
++        for provider_info in provider_infos {
+             let provider = create_model_provider(provider_info, /*auth_manager*/ None);
+-            assert_eq!(provider.capabilities().remote_compaction, expected);
++            assert_eq!(
++                provider.capabilities().remote_compaction,
++                RemoteCompactionSupport::Unsupported
++            );
+         }
+     }
+ 
+diff --git a/codex-rs/prompts/templates/compact/summary_prefix.md b/codex-rs/prompts/templates/compact/summary_prefix.md
+index 62a7161b8..5ce82b57c 100644
+--- a/codex-rs/prompts/templates/compact/summary_prefix.md
++++ b/codex-rs/prompts/templates/compact/summary_prefix.md
+@@ -1 +1 @@
+-Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:
+\ No newline at end of file
++Earlier, you started to solve this problem and produced a summary of your thinking process. You also have access to the state of the tools that you used. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary you produced, use the information in this summary to assist with your own analysis:
+\ No newline at end of file
 diff --git a/codex-rs/protocol/src/items.rs b/codex-rs/protocol/src/items.rs
-index a65bd970d..c6b026a13 100644
+index feaf06387..c643daf88 100644
 --- a/codex-rs/protocol/src/items.rs
 +++ b/codex-rs/protocol/src/items.rs
-@@ -407,6 +407,9 @@ pub struct McpToolCallError {
+@@ -445,6 +445,9 @@ pub struct McpToolCallError {
  #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
  pub struct ContextCompactionItem {
      pub id: String,
@@ -191,7 +543,7 @@ index a65bd970d..c6b026a13 100644
  }
  
  fn new_item_id() -> String {
-@@ -415,7 +418,15 @@ fn new_item_id() -> String {
+@@ -453,7 +456,15 @@ fn new_item_id() -> String {
  
  impl ContextCompactionItem {
      pub fn new() -> Self {
@@ -208,3 +560,17 @@ index a65bd970d..c6b026a13 100644
      }
  }
  
+diff --git a/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs b/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
+index 6f6babc05..07c396fa1 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
+@@ -172,6 +172,9 @@ pub(super) fn completed_item(
+         EventMsg::ContextCompacted(_) => Some((
+             TurnItem::ContextCompaction(ContextCompactionItem {
+                 id: next_item_id()?,
++                // Legacy rollout lines predate the summary field and carry no
++                // summary text of their own.
++                summary: None,
+             }),
+             None,
+         )),

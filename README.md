@@ -13,7 +13,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `Dockerfile.subscription` — the dedicated subscription sidecar image definition
 - `subscription-runtime-versions.json` — pinned Claude/Codex/MCP SDK contract baked into the subscription image
 - `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --listen stdio://`
-- `patches/codex-local-compaction.patch` — Taurus staging patch that forces local compaction and exposes the plain summary body (without Codex's internal `SUMMARY_PREFIX` boilerplate; omitted entirely when empty) as `summary` on the app-server v2 `contextCompaction` wire item
+- `patches/codex-local-compaction.patch` — the Taurus fork patch applied to the pinned Codex source; see [Codex fork patch](#codex-fork-patch) for everything it changes
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
 
 ## `taurus-base`
@@ -63,7 +63,7 @@ Taurus expects inside the sidecar:
 - Node.js 24
 - Python 3
 - `@anthropic-ai/claude-code@2.1.207`
-- patched source build of `openai/codex` `rust-v0.144.1` (remote compaction forced local for Taurus staging)
+- patched source build of `openai/codex` `rust-v0.149.1` (the Taurus fork — see [Codex fork patch](#codex-fork-patch))
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
 
@@ -117,6 +117,56 @@ Important: this image does **not** bake Taurus's `resources/subscription-mcp/*`
 wrapper/helper programs. Taurus keeps shipping those app-owned helpers via the
 mounted `/provider/taurus-mcp` runtime directory so wrapper changes can roll out
 without rebuilding the image.
+
+### Codex fork patch
+
+`patches/codex-local-compaction.patch` is applied to the pinned upstream source
+before the build. The resulting binary is identified by `codexVariant` in
+`subscription-runtime-versions.json`; bump that string whenever the patch
+changes. What it does:
+
+- **Forces local compaction.** The configured model provider reports remote
+  compaction as unsupported. That capability is the single thing both compaction
+  dispatch sites consult, so a requested compaction and an automatic one alike
+  run Codex's own client-side summarization instead of the provider-side task.
+  Everything below depends on it: on the remote path Codex never sees the summary
+  text at all.
+- **Exposes the summary on the wire.** The app-server v2 `contextCompaction`
+  item carries a `summary` field holding the plain summary body, without the
+  `SUMMARY_PREFIX` boilerplate Codex prepends for the model's own benefit.
+- **Scopes the summary to the compaction turn.** The summary is read from the
+  items that compaction request produced, not from a backwards scan of the whole
+  session history — a compaction that answered with nothing would otherwise
+  publish the last assistant message of the actual task as its "summary". When
+  the compaction turn produced no assistant reply, `summary` is absent from the
+  item and the replacement history says `(no summary available)`.
+- **Reframes `SUMMARY_PREFIX` for self-continuity.** The preamble that
+  introduces a carried-over summary used to describe it as the work of "another
+  language model"; it now addresses the model as the author of its own earlier
+  summary. Recognition of a summary (`is_summary_message`) is left exactly as
+  upstream wrote it, matching the current preamble only — deployment replaces
+  every sidecar at once, so no compatibility path is kept for the old wording.
+  A thread that compacted before the swap carries an old-prefix summary in its
+  rollout; when it compacts again on the new binary that summary is retained as
+  an ordinary user message instead of being dropped. That is bounded and
+  self-limiting: at most one such message per pre-swap thread, and every summary
+  written afterwards matches again.
+- **Drops Taurus post-compaction notes from rebuilt histories.** Messages
+  starting with `<post-compaction-note` are filtered out alongside old
+  summaries. Those notes describe the boundary they were written at, so
+  retaining them into a later rebuild puts them somewhere they do not describe.
+  The tag is a contract with the Taurus runtime, which writes the envelope in
+  `wrapPostCompactionMaterial` (`src/agents/post-compaction-material.ts` in the
+  `taurus-agents` repository); neither side may change it alone.
+
+Upstream tests that asserted the pre-fork behaviour are adapted rather than left
+to fail: the provider-capability tests now expect forced-local compaction, and
+the app-server test that asserted remote dispatch now asserts that a provider
+upstream would route remotely still compacts locally and never calls the compact
+endpoint. One exception is deliberate — `codex-rs/core/tests/common/context_snapshot.rs`
+hard-codes the old summary preamble and is left as upstream wrote it, being test
+code that the `-p codex-cli --bin codex` build this image performs does not
+compile.
 
 ## Automatic publishing
 
