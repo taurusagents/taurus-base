@@ -34,19 +34,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
-# Upstream refreshes internal workspace package versions in Cargo.lock during
-# the build, so `cargo build --locked` fails on a pinned tag (observed on
-# rust-v0.144.1 and not re-tested since — this build simply does not pass
-# --locked). The pinned commit is still enforced by the rev-parse check below.
+# Dependencies are downloaded and compiled in two separate steps so that no
+# third-party code ever runs while the network is reachable. `cargo fetch` only
+# downloads. Every crate build script — arbitrary code, run at compile time —
+# then executes under `--offline`, which also stops the compile from pulling in
+# any crate that was not downloaded first, so the dependency set is fixed
+# before any of it is allowed to run. `--locked` on the build fails loudly if
+# the patch applied below ever changes the dependency graph.
+#
+# The fetch deliberately does not pass `--locked`. Upstream's release tags bump
+# the workspace version in Cargo.toml without regenerating Cargo.lock, so the
+# committed lock is stale for upstream's own crates at every pinned tag and
+# `--locked` rejects it before downloading anything. Cargo rewrites just those
+# entries on first use; third-party versions and their checksums stay exactly
+# as upstream committed them.
+#
 # `CODEX_BUILD_JOBS` defaults to 1 for memory-constrained builders but can be
 # overridden by CI/staging.
 RUN curl -fsSL https://sh.rustup.rs | bash -s -- -y --profile minimal --default-toolchain ${CODEX_RUST_VERSION} \
     && git clone --depth 1 --branch ${CODEX_GIT_REF} https://github.com/openai/codex.git /tmp/codex-src \
     && cd /tmp/codex-src \
     && test "$(git rev-parse HEAD)" = "${CODEX_GIT_COMMIT}" \
+    && (cd codex-rs && cargo fetch) \
     && git apply /tmp/codex-local-compaction.patch \
     && cd codex-rs \
-    && cargo build --release -j ${CODEX_BUILD_JOBS} -p codex-cli --bin codex \
+    && cargo build --release --locked --offline -j ${CODEX_BUILD_JOBS} -p codex-cli --bin codex \
     && install -D target/release/codex /out/codex
 
 FROM ubuntu:22.04
@@ -87,8 +99,22 @@ COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
 COPY codex-app-server-smoke.mjs /tmp/codex-app-server-smoke.mjs
 COPY --from=codex-builder /out/codex /usr/bin/codex
+# A global npm install pins only the top-level version and re-resolves the whole
+# tree below it on every rebuild. `--min-release-age=3` holds that resolution
+# three days behind the registry, the same cooldown Taurus's pnpm projects use,
+# so a package published moments ago cannot reach this image before anyone has
+# had a chance to notice it. Raising a pinned version to a release younger than
+# the cooldown fails the build until that release ages in.
+#
+# `--ignore-scripts` blocks install hooks, which is how a hostile npm package
+# normally gets to run code. Exactly one hook here is load-bearing: the Claude
+# Code wrapper ships a stub and its postinstall copies the real platform binary
+# over it, so that single reviewed script is run explicitly below. It exits 0
+# even when it finds no binary to place, hence the version check that follows.
 RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-versions.json'); ['@anthropic-ai/claude-code@' + versions.claudeCode, '@modelcontextprotocol/sdk@' + versions.mcpSdk].join(' ')") \
-    && npm install -g ${packages} \
+    && npm install -g --ignore-scripts --min-release-age=3 ${packages} \
+    && node /usr/lib/node_modules/@anthropic-ai/claude-code/install.cjs \
+    && claude --version \
     && ln -sf /usr/bin/codex /usr/local/bin/codex \
     && mkdir -p /usr/local/lib/taurus-subscription \
     && cp /tmp/subscription-runtime-versions.json /usr/local/lib/taurus-subscription/runtime-versions.json \

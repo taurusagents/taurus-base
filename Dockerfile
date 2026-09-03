@@ -81,7 +81,15 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get update \
     && apt-get install -y --no-install-recommends nodejs=24.15.0-1nodesource1 \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g typescript@6.0.3 prettier@3.8.3 eslint@10.4.0 \
+# A global npm install pins only the top-level version and re-resolves the whole
+# tree below it on every rebuild. `--min-release-age=3` holds that resolution
+# three days behind the registry, the same cooldown Taurus's pnpm projects use,
+# so a package published moments ago cannot reach this image before anyone has
+# had a chance to notice it. Raising a pinned version to a release younger than
+# the cooldown fails the build until that release ages in. `--ignore-scripts`
+# blocks install hooks, which is how a hostile npm package normally gets to run
+# code; nothing installed here declares one.
+    && npm install -g --ignore-scripts --min-release-age=3 typescript@6.0.3 prettier@3.8.3 eslint@10.4.0 \
 # Ship a pinned pnpm in-image via Corepack so containers do not depend on a
 # network fetch the first time pnpm is used.
     && corepack enable pnpm --install-directory /usr/bin \
@@ -122,7 +130,9 @@ RUN useradd -r -m -d /home/taurus-browser -s /usr/sbin/nologin taurus-browser \
 
 # ── Playwright + Chromium ──
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN npm install -g playwright@1.60.0 \
+# Chromium is downloaded by the pinned Playwright CLI on the next line rather
+# than by an install hook, so blocking hooks does not affect it.
+RUN npm install -g --ignore-scripts --min-release-age=3 playwright@1.60.0 \
     && playwright install --with-deps chromium \
     && chmod -R a+rX /ms-playwright
 
