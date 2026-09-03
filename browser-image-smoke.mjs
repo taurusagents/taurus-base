@@ -230,10 +230,30 @@ const fs = require('fs');
 const [portFile, routesJson] = process.argv.slice(1);
 const routes = JSON.parse(routesJson);
 const server = http.createServer((req, res) => {
-  const body = routes[req.url.split('?')[0]];
-  if (body === undefined) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
-  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-  res.end(body);
+  const route = routes[req.url.split('?')[0]];
+  if (route === undefined) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
+  const spec = typeof route === 'string'
+    ? { status: 200, type: 'text/html; charset=utf-8', body: route, delayMs: 0, neverEnd: false }
+    : {
+      status: Number.isInteger(route.status) ? route.status : 200,
+      type: typeof route.type === 'string' ? route.type : 'text/html; charset=utf-8',
+      body: typeof route.body === 'string' ? route.body : '',
+      delayMs: Number.isInteger(route.delayMs) ? route.delayMs : 0,
+      neverEnd: route.neverEnd === true,
+    };
+  const respond = () => {
+    res.writeHead(spec.status, { 'content-type': spec.type });
+    if (spec.neverEnd) {
+      res.write(spec.body);
+      return;
+    }
+    res.end(spec.body);
+  };
+  if (spec.delayMs > 0) {
+    setTimeout(respond, spec.delayMs);
+    return;
+  }
+  respond();
 });
 server.listen(0, '127.0.0.1', () => fs.writeFileSync(portFile, JSON.stringify({ port: server.address().port })));
 setTimeout(() => process.exit(0), 300000).unref();
@@ -671,6 +691,7 @@ async function runSmoke() {
   try {
     if (defaultSessionOwnedBySmoke) {
       runPageInitiatedNavigationSmoke(pageServer.origin);
+      runReadinessSmoke(pageServer.origin);
       runStrandedTabSmoke(pageServer.origin);
       runExternalBlankTabSmoke(pageServer.origin);
       runSessionResetSmoke(pageServer.origin);
@@ -748,6 +769,16 @@ setTimeout(() => { throw new Error("game crash"); }, 10);
 new Image().src = "http://127.0.0.1:9/sprite.png";
 </script>`,
   '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
+  '/readiness-delayed-parent': '<!doctype html><title>readiness delayed parent</title><body><h1>delayed parent</h1><iframe id="stage" src="/readiness-delayed-child" style="width:320px;height:180px;border:0"></iframe></body>',
+  '/readiness-delayed-child': {
+    delayMs: 1800,
+    body: '<!doctype html><title>readiness delayed child</title><body style="margin:0;background:rgb(248,196,40);color:#111;font:32px/1.4 sans-serif;display:grid;place-items:center;height:100vh">child ready</body>',
+  },
+  '/readiness-stuck-parent': '<!doctype html><title>readiness stuck parent</title><body><h1>stuck parent</h1><iframe id="stage" src="/readiness-stuck-child" style="width:320px;height:180px;border:0"></iframe></body>',
+  '/readiness-stuck-child': {
+    neverEnd: true,
+    body: '<!doctype html><title>readiness stuck child</title><body style="margin:0;background:rgb(48,52,60);color:#fff;font:32px/1.4 sans-serif;display:grid;place-items:center;height:100vh">still loading</body>',
+  },
   '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>',
   '/wedge-slow': '<!doctype html><title>wedge slow page</title><h1>wedge slow</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 1200));</script>',
 };
@@ -860,6 +891,37 @@ function runPageInitiatedNavigationSmoke(origin) {
   assert.equal(countOccurrences(output, '[log] game boot'), 1, 'the fallback must not double-report');
   assert.equal(countOccurrences(output, '[exception] Error: game crash'), 1, 'the fallback must not double-report');
   assert.equal(output.includes('loader start'), false, 'the previous document is gone after navigation');
+}
+
+function runReadinessSmoke(origin) {
+  const stableOpen = browser({ action: 'open', url: `${origin}/stable` });
+  assert.match(stableOpen, /Load: complete/);
+
+  const delayedOpen = browser({ action: 'open', url: `${origin}/readiness-delayed-parent` });
+  assert.match(delayedOpen, /Load: still in progress after 1000ms; subresources may still be loading/);
+  const delayedSnapshot = browser({ action: 'snapshot' });
+  assert.match(delayedSnapshot, /Note: the page was still loading when this accessibility tree was read/);
+  const delayedShotStartedAt = Date.now();
+  const delayedShot = JSON.parse(browser({ action: 'screenshot' }));
+  const delayedShotElapsedMs = Date.now() - delayedShotStartedAt;
+  assert.equal(delayedShot.__type, 'screenshot');
+  assert.ok(delayedShot.base64.length > 0, 'the delayed-load page should still produce a screenshot');
+  assert.doesNotMatch(delayedShot.text, /Note:/, 'the screenshot settle should usually wait out a delayed child frame that finishes inside the cap');
+
+  const stuckOpen = browser({ action: 'open', url: `${origin}/readiness-stuck-parent` });
+  assert.match(stuckOpen, /Load: still in progress after 1000ms; subresources may still be loading/);
+  const stuckSnapshot = browser({ action: 'snapshot' });
+  assert.match(stuckSnapshot, /Note: the page was still loading when this accessibility tree was read/);
+  const stuckShotStartedAt = Date.now();
+  const stuckShot = JSON.parse(browser({ action: 'screenshot' }));
+  const stuckShotElapsedMs = Date.now() - stuckShotStartedAt;
+  assert.equal(stuckShot.__type, 'screenshot');
+  assert.ok(stuckShot.base64.length > 0, 'a page with a child frame that never finishes should still return a screenshot');
+  assert.match(stuckShot.text, /Note: the page was still loading when this frame was captured/);
+  assert.ok(
+    stuckShotElapsedMs < 7000,
+    `the screenshot settle should stay bounded for a never-ending child frame (took ${stuckShotElapsedMs}ms)`,
+  );
 }
 
 /** Recovering from tabs and navigations that used to strand the helper. */
@@ -1012,17 +1074,27 @@ function runExternalBlankTabSmoke(origin) {
  * container.
  */
 function runSessionResetSmoke(origin) {
+  browser({ action: 'close' });
   browser({ action: 'open', url: `${origin}/stable` });
+  const pageCountBeforeExtraTabs = (listBrowserPageTargets() ?? []).length;
   for (let index = 0; index < 3; index += 1) {
     evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
   }
   sleepSync(300);
-  assert.ok((listBrowserPageTargets() ?? []).length > 1, 'the scenario needs the page to have opened extra tabs');
+  assert.equal(
+    (listBrowserPageTargets() ?? []).length,
+    pageCountBeforeExtraTabs + 3,
+    'the scenario needs the page to have opened exactly three extra tabs on top of whatever other sessions the browser already held',
+  );
 
   browser({ action: 'close' });
   browser({ action: 'open', url: `${origin}/stable` });
 
-  assert.equal((listBrowserPageTargets() ?? []).length, 1, 'a new browser session must not inherit the closed session\'s tabs');
+  assert.equal(
+    (listBrowserPageTargets() ?? []).length,
+    pageCountBeforeExtraTabs,
+    'a new browser session must not inherit the closed session\'s extra tabs even when other runs already have pages open',
+  );
   assert.equal(browser({ action: 'evaluate', expression: 'location.pathname' }), '/stable');
   const shot = JSON.parse(browser({ action: 'screenshot' }));
   assert.ok(shot.base64.length > 0, 'the recovered session must still be able to produce a screenshot');

@@ -74,11 +74,16 @@ const DEVTOOLS_HTTP_TIMEOUT_MS = 2_000;
 const ATTACH_RETRY_TIMEOUT_MS = 3_000;
 const ATTACH_RECOVERY_TIMEOUT_MS = 5_000;
 const ATTACH_RECOVERY_BACKOFF_MS = 750;
+const OPEN_LOAD_STATUS_TIMEOUT_MS = 1_000;
 // Best-effort guard for the one shared default session used by manual CLI
 // callers. When that session opens extra tabs, foregrounding its own page keeps
 // screenshots and snapshots usable without reintroducing cross-run interference
 // for the protocol-controlled per-run sessions.
 const BRING_TO_FRONT_TIMEOUT_MS = 2_000;
+const READINESS_PROBE_FRAME_TIMEOUT_MS = 250;
+const SCREENSHOT_READINESS_WAIT_TIMEOUT_MS = 1_500;
+const SCREENSHOT_READINESS_POLL_INTERVAL_MS = 50;
+const SCREENSHOT_PAINT_SETTLE_TIMEOUT_MS = 250;
 // Closing the browser is only done once per session, so waiting a few seconds
 // for it to exit is cheap next to attaching to a half-dead browser.
 const BROWSER_EXIT_POLL_ATTEMPTS = 50;
@@ -498,6 +503,125 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+function isDocumentReadyState(value) {
+  return value === 'loading' || value === 'interactive' || value === 'complete';
+}
+
+async function readFrameReadyState(frame) {
+  try {
+    const readyState = await withTimeout(frame.evaluate(() => document.readyState), READINESS_PROBE_FRAME_TIMEOUT_MS);
+    return isDocumentReadyState(readyState) ? readyState : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Checks how far the page has progressed without letting one bad frame poison
+ * the whole read. Frames are evaluated in their own execution contexts so
+ * cross-origin children still report their document readiness.
+ */
+async function probePageReadiness(page) {
+  const frames = page.frames();
+  const mainFrame = page.mainFrame();
+  const readiness = {
+    mainDocumentReadyState: 'unknown',
+    loadingFrameCount: 0,
+    loadingChildFrameCount: 0,
+    unavailableFrameCount: 0,
+    totalFrameCount: frames.length,
+  };
+
+  const frameStates = await Promise.all(frames.map(async frame => ({
+    frame,
+    readyState: await readFrameReadyState(frame),
+  })));
+
+  for (const { frame, readyState } of frameStates) {
+    if (readyState === null) {
+      readiness.unavailableFrameCount += 1;
+      continue;
+    }
+    if (frame === mainFrame) {
+      readiness.mainDocumentReadyState = readyState;
+    }
+    if (readyState !== 'complete') {
+      readiness.loadingFrameCount += 1;
+      if (frame !== mainFrame) {
+        readiness.loadingChildFrameCount += 1;
+      }
+    }
+  }
+
+  return readiness;
+}
+
+function pageReadinessNeedsNote(readiness) {
+  return readiness.mainDocumentReadyState !== 'complete'
+    || readiness.loadingFrameCount > 0
+    || readiness.unavailableFrameCount > 0;
+}
+
+function buildPageReadinessNote(readiness, action) {
+  if (!pageReadinessNeedsNote(readiness)) return null;
+
+  const status = readiness.mainDocumentReadyState !== 'complete' || readiness.loadingFrameCount > 0
+    ? 'the page was still loading'
+    : 'the page could not be fully checked';
+  const subject = action === 'snapshot' ? 'accessibility tree' : 'frame';
+  const verb = action === 'snapshot' ? 'read' : 'captured';
+  const followUp = action === 'snapshot'
+    ? 'If the tree looks incomplete, wait and take another snapshot.'
+    : 'If the image looks incomplete, wait and take another screenshot.';
+  const details = [
+    `main document: ${readiness.mainDocumentReadyState}`,
+    `${readiness.loadingFrameCount} of ${readiness.totalFrameCount} ${pluralize(readiness.totalFrameCount, 'frame')} still loading`,
+  ];
+  if (readiness.unavailableFrameCount > 0) {
+    details.push(
+      `${readiness.unavailableFrameCount} ${pluralize(readiness.unavailableFrameCount, 'frame')} could not be checked`,
+    );
+  }
+  return `Note: ${status} when this ${subject} was ${verb} (${details.join('; ')}). ${followUp}`;
+}
+
+async function waitForPageReadinessBeforeScreenshot(page) {
+  const deadline = Date.now() + SCREENSHOT_READINESS_WAIT_TIMEOUT_MS;
+  let readiness = await probePageReadiness(page);
+  while (
+    readiness.mainDocumentReadyState !== 'complete'
+    || readiness.loadingChildFrameCount > 0
+  ) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0 || page.isClosed()) {
+      return readiness;
+    }
+    await sleep(Math.min(SCREENSHOT_READINESS_POLL_INTERVAL_MS, remainingMs));
+    readiness = await probePageReadiness(page);
+  }
+  return readiness;
+}
+
+async function givePagePaintOpportunity(page) {
+  await withTimeout(
+    page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      });
+    })),
+    SCREENSHOT_PAINT_SETTLE_TIMEOUT_MS,
+  ).catch(() => {});
+}
+
+async function observeOpenLoadStatus(page) {
+  try {
+    await page.waitForLoadState('load', { timeout: OPEN_LOAD_STATUS_TIMEOUT_MS });
+    return 'Load: complete';
+  } catch {
+    return `Load: still in progress after ${OPEN_LOAD_STATUS_TIMEOUT_MS}ms; subresources may still be loading`;
+  }
+}
+
 function parseInteger(value) {
   return typeof value === 'number' && Number.isInteger(value) ? value : null;
 }
@@ -689,7 +813,7 @@ function truncateSummaryField(text, maxLength) {
  * enter the envelope so a hostile page cannot turn a valid screenshot into an
  * oversized JSON blob that the shell cuts mid-envelope.
  */
-function buildScreenshotSummary(title, url, viewport, byteLength) {
+function buildScreenshotSummary(title, url, viewport, byteLength, note = null) {
   const boundedTitle = truncateSummaryField(
     escapeLineIntegrityCharacters(title),
     MAX_SCREENSHOT_TITLE_SUMMARY_CHARS,
@@ -699,7 +823,11 @@ function buildScreenshotSummary(title, url, viewport, byteLength) {
     MAX_SCREENSHOT_URL_SUMMARY_CHARS,
   );
   return {
-    text: `Screenshot of "${boundedTitle.text}" (${boundedUrl.text})\nViewport: ${viewport.width}x${viewport.height}, ${byteLength} bytes`,
+    text: [
+      `Screenshot of "${boundedTitle.text}" (${boundedUrl.text})`,
+      `Viewport: ${viewport.width}x${viewport.height}, ${byteLength} bytes`,
+      note,
+    ].filter(Boolean).join('\n'),
     outputTruncated: boundedTitle.truncated || boundedUrl.truncated,
   };
 }
@@ -1720,12 +1848,15 @@ async function performActionOnPage(input, page, options = {}) {
       const status = response?.status() ?? 'unknown';
       const title = escapeLineIntegrityCharacters(await page.title());
       const url = escapeLineIntegrityCharacters(input.url);
-      return `Navigated to ${url}\nTitle: ${title}\nStatus: ${status}`;
+      const loadStatus = await observeOpenLoadStatus(page);
+      return `Navigated to ${url}\nTitle: ${title}\nStatus: ${status}\n${loadStatus}`;
     }
 
     case 'snapshot': {
-      const url = page.url();
+      const url = escapeLineIntegrityCharacters(page.url());
       const title = escapeLineIntegrityCharacters(await page.title());
+      const readiness = await probePageReadiness(page);
+      const readinessNote = buildPageReadinessNote(readiness, 'snapshot');
       const cdp = await page.context().newCDPSession(page);
       let nodes;
       try {
@@ -1734,7 +1865,7 @@ async function performActionOnPage(input, page, options = {}) {
         await cdp.detach().catch(() => {});
       }
       const tree = escapeLineIntegrityCharacters(formatAXNodes(nodes));
-      return `URL: ${url}\nTitle: ${title}\n\n${tree}`;
+      return `URL: ${url}\nTitle: ${title}${readinessNote ? `\n${readinessNote}` : ''}\n\n${tree}`;
     }
 
     case 'console':
@@ -1827,11 +1958,15 @@ async function performActionOnPage(input, page, options = {}) {
     }
 
     case 'screenshot': {
+      await waitForPageReadinessBeforeScreenshot(page);
+      await givePagePaintOpportunity(page);
+      const readiness = await probePageReadiness(page);
+      const readinessNote = buildPageReadinessNote(readiness, 'screenshot');
       const buffer = await page.screenshot({ fullPage: false });
       const title = await page.title();
       const url = page.url();
       const viewport = await getRealViewport(page);
-      const summary = buildScreenshotSummary(title, url, viewport, buffer.length);
+      const summary = buildScreenshotSummary(title, url, viewport, buffer.length, readinessNote);
       return {
         __type: 'screenshot',
         text: summary.text,
