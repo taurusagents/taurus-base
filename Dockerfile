@@ -9,10 +9,13 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Every archive this file downloads is pinned to a version and checked against a
-# SHA-256 recorded below, and those checksums are for the amd64 artifacts. amd64
-# is the only architecture this image is built for, so stop here rather than
-# reach the first checksum comparison with the wrong file and a confusing error.
+# The uv, Go and asdf archives below are pinned to a version and compared
+# against a SHA-256 written down beside them, and those checksums are of the
+# amd64 builds. amd64 is the only architecture this image is built for, so stop
+# here rather than reach the first comparison with a file it was never computed
+# from. This says nothing about the rest of what the build fetches: the npm
+# installs carry their own hashes in their lockfiles, while the pip packages and
+# the Chromium download carry no committed digest at all.
 RUN [ "$(dpkg --print-architecture)" = amd64 ] \
     || { echo "taurus-base is built for amd64 only; the pinned checksums do not cover $(dpkg --print-architecture)." >&2; exit 1; }
 
