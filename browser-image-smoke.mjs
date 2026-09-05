@@ -848,6 +848,8 @@ const ABANDONED_ACTION_TIMEOUT_MS = 2_000;
 // page has certainly already made the change the next call must not see.
 const ABANDONED_ACTION_MUTATION_DELAY_MS = 200;
 const ABANDONED_ACTION_MARKER = 'abandoned action kept running';
+const ABANDONED_ACTION_STORAGE_KEY = 'smokeSignIn';
+const ABANDONED_ACTION_STORAGE_VALUE = 'kept';
 
 /**
  * An action that never settles. The deadline makes the helper give up on the
@@ -861,6 +863,15 @@ function runAbandonedActionRecoverySmoke(origin) {
   phase('abandoned action recovery');
   const session = smokeSessionKey('abandoned-action');
   assert.match(isolatedText(session, { action: 'open', url: `${origin}/stable` }), /stable page/);
+
+  // Whatever the agent had signed into, in the two forms a site keeps it in.
+  assert.equal(
+    isolatedText(session, {
+      action: 'evaluate',
+      expression: `(() => { document.cookie = ${JSON.stringify(`${ABANDONED_ACTION_STORAGE_KEY}=${ABANDONED_ACTION_STORAGE_VALUE}; path=/`)}; localStorage.setItem(${JSON.stringify(ABANDONED_ACTION_STORAGE_KEY)}, ${JSON.stringify(ABANDONED_ACTION_STORAGE_VALUE)}); return "stored"; })()`,
+    }),
+    'stored',
+  );
 
   const abandoned = isolatedBrowser(session, {
     action: 'evaluate',
@@ -890,8 +901,25 @@ function runAbandonedActionRecoverySmoke(origin) {
     'the session should come back on a fresh page instead of the one the abandoned action still has',
   );
 
-  // Still a working session, not just a blank one.
+  // Still a working session, not just a blank one — and still signed in. The
+  // page has to go, but the session's storage is what the agent spent its last
+  // ten calls building up, and losing it silently is worse than the timeout it
+  // is being told about.
   assert.match(isolatedText(session, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  const storage = JSON.parse(isolatedText(session, {
+    action: 'evaluate',
+    expression: `JSON.stringify({ cookie: document.cookie, stored: localStorage.getItem(${JSON.stringify(ABANDONED_ACTION_STORAGE_KEY)}) })`,
+  }));
+  assert.equal(
+    storage.stored,
+    ABANDONED_ACTION_STORAGE_VALUE,
+    'retiring the page of an abandoned action must not take the session\'s localStorage with it',
+  );
+  assert.match(
+    storage.cookie,
+    new RegExp(`${ABANDONED_ACTION_STORAGE_KEY}=${ABANDONED_ACTION_STORAGE_VALUE}`),
+    'retiring the page of an abandoned action must not take the session\'s cookies with it',
+  );
 
   // The same thing where the page will never respond again. Chromium refuses to
   // attach to the whole browser while any page is spinning its renderer, so an

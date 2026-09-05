@@ -100,6 +100,9 @@ const CONNECTION_CLOSE_TIMEOUT_MS = 5_000;
 // the browser process itself is the problem, which is exactly the situation the
 // callers below are trying to recover from.
 const DISPOSE_CONTEXT_TIMEOUT_MS = 5_000;
+// Closing a single page is asked of the browser process too, for the same
+// reason, and is bounded for the same reason.
+const CLOSE_TARGET_TIMEOUT_MS = 5_000;
 // The action lock is only ever held across session setup or session finalising,
 // both of which are bounded well inside this. Waiting longer means the holder is
 // stuck, or that something outside this helper holds the lock file; saying so
@@ -1739,6 +1742,19 @@ async function disposeBrowserContext(rootCdp, browserContextId) {
   ).catch(() => {});
 }
 
+/**
+ * Closes one page and leaves the browser context it lived in alone, so the
+ * session keeps its cookies and its local storage. The browser process closes
+ * the page on its own authority, so this works on a page that has stopped
+ * answering, and on one whose unload handler asks to stay.
+ */
+async function closePageTarget(rootCdp, targetId) {
+  await withTimeout(
+    rootCdp.send('Target.closeTarget', { targetId }),
+    CLOSE_TARGET_TIMEOUT_MS,
+  ).catch(() => {});
+}
+
 async function disposeSession(rootCdp, state, sessionKey) {
   const session = state.sessions[sessionKey];
   if (!session) return false;
@@ -2229,7 +2245,6 @@ async function handleSessionAction(input, sessionRequest) {
   }
 
   let viewportAfter = null;
-  let actionAbandoned = false;
   try {
     return await withTimeout(
       performActionOnPage(input, page, {
@@ -2241,7 +2256,20 @@ async function handleSessionAction(input, sessionRequest) {
       `Browser action "${input.action}"`,
     );
   } catch (err) {
-    actionAbandoned = err?.timedOut === true;
+    if (err?.timedOut === true) {
+      // The deadline gave up on the call; it did not cancel it. Whatever the
+      // page was doing is still running, and handing that page to the next call
+      // would let it inherit an unfinished action's side effects, or wait behind
+      // a page that never became responsive again. Closing the page ends both,
+      // and leaves the session's browser context — its cookies, its storage,
+      // whatever it is signed into — untouched. The next call finds no page for
+      // this session and opens a new one in the same context.
+      //
+      // Done here rather than under the lock below: closing a page changes no
+      // shared state, and if the lock could not be taken the page would never
+      // be closed at all.
+      await closePageTarget(rootCdp, session.targetId);
+    }
     throw err;
   } finally {
     const finalizeLock = await acquireBrowserActionLock();
@@ -2254,15 +2282,6 @@ async function handleSessionAction(input, sessionRequest) {
         currentSession.lastSeenAt = nowIso();
         if (viewportAfter) {
           currentSession.viewport = viewportAfter;
-        }
-        if (actionAbandoned) {
-          // The deadline gave up on the call; it did not cancel it. Whatever the
-          // page was doing is still running, and handing that page to the next
-          // call would let it inherit an unfinished action's side effects, or
-          // wait behind a page that never became responsive again. Destroying
-          // the context ends both. The session itself survives: the next call
-          // rebuilds a page for it, with the viewport it had.
-          await disposeBrowserContext(rootCdp, currentSession.browserContextId);
         }
       }
       saveState(finalizeState);
