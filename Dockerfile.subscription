@@ -118,11 +118,12 @@ COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/tauru
 # and tarball hash in it — not just the two named in package.json — is fixed at
 # the moment the lockfile was committed and reviewed.
 #
-# The two CLI versions are written down twice: once in package.json, which
-# decides what is installed, and once in the runtime manifest below, which is
-# what Taurus and the workflow smoke read back. They are separate files a human
-# edits by hand, so the build compares them first and stops if they have drifted
-# rather than shipping an image whose manifest describes something else.
+# The two CLI versions are written down twice: in package.json, which decides
+# what is installed, and in subscription-runtime-versions.json, the manifest
+# baked into this image for Taurus and the workflow smoke to read back. They are
+# separate files a human edits by hand, so the build compares them first and
+# stops if they have drifted rather than shipping an image whose manifest
+# describes something other than what is in it.
 #
 # `--ignore-scripts` blocks install hooks, which is how a hostile npm package
 # normally gets to run code. Exactly one hook here is load-bearing: the Claude
