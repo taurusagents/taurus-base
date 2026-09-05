@@ -837,8 +837,11 @@ setTimeout(() => { throw new Error("game crash"); }, 10);
 new Image().src = "http://127.0.0.1:9/sprite.png";
 </script>`,
   '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
-  '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>',
-  '/wedge-slow': '<!doctype html><title>wedge slow page</title><h1>wedge slow</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 1200));</script>',
+  // These two are ordinary pages. What makes them stop responding is asked for
+  // afterwards, by armSpinningRenderer, and the two names only say which
+  // scenario a page belongs to.
+  '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1>',
+  '/wedge-slow': '<!doctype html><title>wedge slow page</title><h1>wedge slow</h1>',
 };
 
 // The deadline the helper puts on one action, lowered for the case below so it
@@ -979,6 +982,35 @@ function runAbandonedActionRecoverySmoke(origin) {
   assert.match(isolatedText(wedgedSession, { action: 'close' }), /Browser session closed/);
 }
 
+// Long enough for another helper call to be made and answered before the first
+// armed page stops responding, which the escalation case below needs.
+const SPIN_ARMING_DELAY_MS = 3_000;
+
+/**
+ * Makes a page stop responding to anything, from a call of its own rather than
+ * from its load handler.
+ *
+ * This used to be part of the fixture, scheduled 50ms after load — which put it
+ * in a race with the `open` action that had just loaded it, because `open`
+ * returns as soon as the document is parsed and then asks the page for its
+ * title. Asking a page that has stopped responding for its title never returns
+ * and cannot be given a timeout, so losing that race hung the helper outright,
+ * and a loaded machine lost it often. Arming the spin from an expression that
+ * schedules it and returns means the reply is already on its way before the
+ * renderer stops answering, so no call can be caught mid-flight by the page it
+ * just opened.
+ */
+function armSpinningRenderer(sessionKey, delayMs) {
+  assert.equal(
+    isolatedText(sessionKey, {
+      action: 'evaluate',
+      expression: `(() => { setTimeout(() => { while (true) {} }, ${delayMs}); return "armed"; })()`,
+    }),
+    'armed',
+    `could not arm the spinning renderer for ${sessionKey}`,
+  );
+}
+
 function runHostilePageIsolationSmoke(origin) {
   phase('hostile page isolation');
   const wedgedSession = smokeSessionKey('hostile-wedge');
@@ -986,6 +1018,7 @@ function runHostilePageIsolationSmoke(origin) {
 
   assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
   assert.match(isolatedText(wedgedSession, { action: 'open', url: `${origin}/wedge` }), /wedge page/);
+  armSpinningRenderer(wedgedSession, 0);
   sleepSync(500);
 
   // This assertion pins current Chromium attach behaviour: today a single page
@@ -1041,12 +1074,16 @@ function runHostilePageEscalationSmoke(origin) {
   assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
   assert.match(isolatedText(closeeSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
   assert.match(isolatedText(hiddenSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
+  // Both pages are armed before either stops responding, because once one has,
+  // the browser refuses to attach and the second call could not be made at all.
+  armSpinningRenderer(closeeSession, SPIN_ARMING_DELAY_MS);
+  armSpinningRenderer(hiddenSession, SPIN_ARMING_DELAY_MS);
   deletePersistedSessionRecord(hiddenSession);
   waitForPageTargets(
     urls => urls.filter(url => url === `${origin}/wedge-slow`).length >= 2,
     'the escalation case needs both a tracked wedged session and an extra wedged page that is no longer in persisted session state',
   );
-  sleepSync(1600);
+  sleepSync(SPIN_ARMING_DELAY_MS + 500);
 
   assert.match(
     isolatedBrowser(survivingSession, { action: 'evaluate', expression: 'location.pathname' }, { expectFailure: true }).output,
