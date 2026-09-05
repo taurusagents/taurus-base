@@ -33,12 +33,66 @@ const NEXT_LINE = String.fromCharCode(0x85);
 // helper mid-write and look like a helper failure.
 const MAX_HELPER_OUTPUT_BYTES = 32 * 1024 * 1024;
 
+// Nothing this smoke spawns is allowed to run forever. Without a bound the
+// whole suite hangs on one stuck child, and CI only notices when the job hits
+// the runner's own limit hours later.
+//
+// The helper gets the generous bound: a `wait` action alone can ask it to sleep
+// for a minute, and it has its own deadlines well inside this one, so reaching
+// this bound means the helper is stuck rather than merely slow.
+const HELPER_TIMEOUT_MS = 240_000;
+// The probes are a single CDP request or a `pgrep`: seconds, not minutes.
+const PROBE_TIMEOUT_MS = 60_000;
+
+const SMOKE_STARTED_AT_MS = Date.now();
+
+/**
+ * Announces what the smoke is about to do, with elapsed time. Individual checks
+ * are silent unless they fail, so without these a hang leaves nothing in the CI
+ * log but whatever command ran before this file started.
+ */
+function phase(description) {
+  const elapsedSeconds = ((Date.now() - SMOKE_STARTED_AT_MS) / 1_000).toFixed(1);
+  console.log(`[browser smoke +${elapsedSeconds}s] ${description}`);
+}
+
+// Keep failure reports readable: a failing screenshot carries megabytes.
+function excerptStream(stream) {
+  const text = stream || '';
+  return `${text.slice(0, 2_000)}${text.length > 2_000 ? ' …(truncated)' : ''}`;
+}
+
+/**
+ * Turns a child that never produced an exit status into a loud, specific
+ * failure. `spawnSync` reports a timeout, a failure to spawn and an output
+ * overflow the same way: `error` is set and `status` is null. A caller that
+ * only looks at the status cannot tell any of those from an ordinary non-zero
+ * exit — and `null !== 0`, so a hang would otherwise read as exactly the
+ * failure some of the callers below are expecting.
+ */
+function assertChildCompleted(label, result, timeoutMs) {
+  if (!result.error) return;
+  const reason = result.error.code === 'ETIMEDOUT'
+    ? `did not finish within ${timeoutMs}ms and was killed`
+    : `could not be run: ${result.error.message}`;
+  throw new Error([
+    `${label} ${reason}`,
+    'stdout:',
+    excerptStream(result.stdout),
+    'stderr:',
+    excerptStream(result.stderr),
+  ].join('\n'));
+}
+
 function browser(input, { expectFailure = false, env } = {}) {
   const result = spawnSync('node', [BROWSER_CLI_PATH, JSON.stringify(input)], {
     encoding: 'utf8',
     maxBuffer: MAX_HELPER_OUTPUT_BYTES,
+    timeout: HELPER_TIMEOUT_MS,
     env: env ? { ...process.env, ...env } : process.env,
   });
+
+  assertChildCompleted(`browser-cli for ${JSON.stringify(input)}`, result, HELPER_TIMEOUT_MS);
 
   if (expectFailure) {
     assert.notStrictEqual(result.status, 0, `Expected browser helper failure for ${JSON.stringify(input)}`);
@@ -46,14 +100,12 @@ function browser(input, { expectFailure = false, env } = {}) {
   }
 
   if (result.status !== 0) {
-    // Keep failure reports readable: a failing screenshot carries megabytes.
-    const excerpt = stream => `${(stream || '').slice(0, 2_000)}${(stream || '').length > 2_000 ? ' …(truncated)' : ''}`;
     throw new Error([
       `browser-cli failed for ${JSON.stringify(input)} (status ${result.status}, signal ${result.signal}, error ${result.error?.message ?? 'none'})`,
       'stdout:',
-      excerpt(result.stdout),
+      excerptStream(result.stdout),
       'stderr:',
-      excerpt(result.stderr),
+      excerptStream(result.stderr),
     ].join('\n'));
   }
 
@@ -124,6 +176,14 @@ function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
 
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    // Same bound as the synchronous calls, enforced by hand because this one is
+    // a plain spawn. SIGKILL rather than SIGTERM: the point of reaching here is
+    // that the helper stopped responding.
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, HELPER_TIMEOUT_MS);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => {
@@ -132,8 +192,16 @@ function isolatedBrowserAsync(sessionKey, input, { env } = {}) {
     child.stderr.on('data', chunk => {
       stderr += chunk;
     });
-    child.on('error', reject);
+    child.on('error', error => {
+      clearTimeout(deadline);
+      reject(error);
+    });
     child.on('exit', code => {
+      clearTimeout(deadline);
+      if (timedOut) {
+        reject(new Error(`isolated helper for ${sessionKey} did not finish within ${HELPER_TIMEOUT_MS}ms and was killed: ${stderr || stdout}`));
+        return;
+      }
       if (code !== 0) {
         reject(new Error(`isolated helper exited ${code}: ${stderr || stdout}`));
         return;
@@ -159,8 +227,11 @@ function runLockedStateScript(script, args = [], { input } = {}) {
   const result = spawnSync(
     'flock',
     ['-x', BROWSER_ACTION_LOCK_PATH, 'node', '-e', script, BROWSER_STATE_PATH, ...args],
-    { encoding: 'utf8', input },
+    // The lock is held for the length of a helper action, so this waits as long
+    // as a helper call may take rather than as long as a probe may take.
+    { encoding: 'utf8', input, timeout: HELPER_TIMEOUT_MS },
   );
+  assertChildCompleted('locked state helper', result, HELPER_TIMEOUT_MS);
   if (result.status !== 0) {
     throw new Error(`locked state helper failed: ${result.stderr || result.stdout || result.error?.message || 'unknown error'}`);
   }
@@ -275,7 +346,11 @@ function listBrowserTargets() {
       .then(response => response.json())
       .then(targets => console.log(JSON.stringify(Array.isArray(targets) ? targets : null)))
       .catch(() => console.log('null'));
-  `], { encoding: 'utf8' });
+  `], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  // A stuck probe must not be read as "the browser has no targets": callers
+  // poll this one until it agrees with them, and a silent null would turn a
+  // hang into a wait that only ends at the poll deadline.
+  assertChildCompleted('devtools target listing', probe, PROBE_TIMEOUT_MS);
   try {
     const parsed = JSON.parse((probe.stdout || '').trim());
     return Array.isArray(parsed) ? parsed : null;
@@ -285,7 +360,8 @@ function listBrowserTargets() {
 }
 
 function getBrowserProcessSignature() {
-  const probe = spawnSync('pgrep', ['-o', '-u', BROWSER_USER, '-f', 'chrome.*--remote-debugging-port=9222'], { encoding: 'utf8' });
+  const probe = spawnSync('pgrep', ['-o', '-u', BROWSER_USER, '-f', 'chrome.*--remote-debugging-port=9222'], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  assertChildCompleted('browser process lookup', probe, PROBE_TIMEOUT_MS);
   return probe.status === 0 ? (probe.stdout || '').trim() || null : null;
 }
 
@@ -302,7 +378,8 @@ function getBrowserContextCount() {
       await browser.close().catch(() => {});
       console.log(String(browserContextIds.length));
     })().catch(error => console.log('failed:' + error.message));
-  `], { encoding: 'utf8' });
+  `], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  assertChildCompleted('browser context count probe', probe, PROBE_TIMEOUT_MS);
   const output = (probe.stdout || '').trim();
   assert.match(output, /^\d+$/, `could not read live browser context count: ${output || probe.stderr}`);
   return Number(output);
@@ -327,7 +404,8 @@ function closeBrowserTargetsMatching(pattern) {
       fetch(${JSON.stringify(`http://127.0.0.1:9222/json/close/${target.id}`)}, { method: 'PUT', signal: AbortSignal.timeout(2000) })
         .then(() => console.log('closed'))
         .catch(error => console.log('failed:' + error.message));
-    `], { encoding: 'utf8' });
+    `], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+    assertChildCompleted(`close of browser target ${target.id}`, closeResult, PROBE_TIMEOUT_MS);
     assert.equal((closeResult.stdout || '').trim(), 'closed', `could not close browser target ${target.id} for ${target.url}`);
   }
 }
@@ -486,6 +564,7 @@ async function runSmoke() {
   }
 
   if (defaultSessionOwnedBySmoke) {
+  phase('shared session: page load and console capture');
   const openOutput = browser({ action: 'open', url: buildProbePage() });
   assert.match(openOutput, /Title: browser smoke/);
 
@@ -509,6 +588,7 @@ async function runSmoke() {
   assert.equal(countOccurrences(consoleOutput, '[exception] Error: boot crash'), 1, 'exceptions must not be reported twice');
   assert.match(browser({ action: 'console' }), /\[log\] boot log 42/);
 
+  phase('shared session: keyboard and mouse input');
   browser({ action: 'keydown', key: 'w' });
   let state = evaluateJson('JSON.stringify(window.__probe)');
   assert.equal(state.keys.w, true);
@@ -566,6 +646,7 @@ async function runSmoke() {
     /"steps" is required and must be an integer\./,
   );
 
+  phase('shared session: snapshot, screenshot and viewport');
   const snapshot = browser({ action: 'snapshot' });
   assert.match(snapshot, /Title: browser smoke/);
 
@@ -604,6 +685,7 @@ async function runSmoke() {
   assert.deepEqual(webglProbe.pixels, [64, 128, 191, 255]);
   assert.equal(webglProbe.webgpuAdapter, 'null');
 
+  phase('shared session: output escaping');
   const escapedOpenOutput = browser({ action: 'open', url: buildEscapedOutputPage() });
   assert.equal(escapedOpenOutput.includes('Title: title\\u2028split\\u2029again\\x85done'), true, 'open output should escape unsafe title separators');
   assertNoUnsafeLineSeparators(escapedOpenOutput, 'open output');
@@ -634,6 +716,7 @@ async function runSmoke() {
   assertEscapedUnsafeLineSeparators(escapedScreenshot.text, 'screenshot text');
   assertNoUnsafeLineSeparators(escapedScreenshot.text, 'screenshot text');
 
+  phase('shared session: console ordering and caps');
   browser({ action: 'open', url: buildOrderingPage() });
   browser({ action: 'wait', ms: 500 });
   const orderedConsoleOutput = browser({ action: 'console' });
@@ -679,6 +762,7 @@ async function runSmoke() {
     runHostilePageEscalationSmoke(pageServer.origin);
     await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
   } finally {
+    phase('cleanup');
     pageServer.stop();
     resetBrowserFixtureState({ closeDefaultSession: defaultSessionOwnedBySmoke });
   }
@@ -688,6 +772,7 @@ async function runSmoke() {
 
 /** Console methods beyond log/warn/error still reach the agent. */
 function runConsoleMethodSmoke() {
+  phase('console methods');
   browser({ action: 'open', url: buildConsoleMethodsPage() });
   const output = browser({ action: 'console' });
 
@@ -709,6 +794,7 @@ function runConsoleMethodSmoke() {
  * positions have to be decided by the helper, not by the page.
  */
 function runForgedConsoleSmoke() {
+  phase('forged console output');
   browser({ action: 'open', url: buildForgedConsolePage() });
 
   // Push entries claiming a browser-attested type, and timestamps far outside
@@ -753,6 +839,7 @@ new Image().src = "http://127.0.0.1:9/sprite.png";
 };
 
 function runHostilePageIsolationSmoke(origin) {
+  phase('hostile page isolation');
   const wedgedSession = smokeSessionKey('hostile-wedge');
   const survivingSession = smokeSessionKey('hostile-survivor');
 
@@ -805,6 +892,7 @@ function runHostilePageIsolationSmoke(origin) {
 }
 
 function runHostilePageEscalationSmoke(origin) {
+  phase('hostile page escalation');
   const closeeSession = smokeSessionKey('hostile-escalation-closee');
   const survivingSession = smokeSessionKey('hostile-escalation-survivor');
   const hiddenSession = smokeSessionKey('hostile-escalation-hidden');
@@ -847,6 +935,7 @@ function runHostilePageEscalationSmoke(origin) {
  * still be complete, which means falling back to CDP replay.
  */
 function runPageInitiatedNavigationSmoke(origin) {
+  phase('page-initiated navigation');
   browser({ action: 'open', url: `${origin}/loader` });
   // Deliberately slept in this process: any browser action would hold a CDP
   // connection open, which is exactly the case that already worked.
@@ -864,6 +953,7 @@ function runPageInitiatedNavigationSmoke(origin) {
 
 /** Recovering from tabs and navigations that used to strand the helper. */
 function runStrandedTabSmoke(origin) {
+  phase('stranded tabs');
   // The default browser session now pins the page target it was already driving
   // instead of heuristically hopping to whichever tab looks most useful. A page
   // that opens a new tab therefore leaves the helper on its current page until
@@ -958,7 +1048,8 @@ function openBlankTabsThroughBrowser(count) {
       }
       console.log('opened');
     })().catch(error => console.log('failed: ' + error.message));
-  `], { encoding: 'utf8' });
+  `], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  assertChildCompleted('blank tab opener', probe, PROBE_TIMEOUT_MS);
 
   const outcome = (probe.stdout || '').trim();
   assert.equal(outcome, 'opened', `could not open blank tabs through the browser: ${outcome || probe.stderr}`);
@@ -982,6 +1073,7 @@ const EXTERNAL_BLANK_TAB_ATTEMPTS = 3;
  * this one covers a browser that starts from the most recent.
  */
 function runExternalBlankTabSmoke(origin) {
+  phase('externally opened blank tabs');
   for (let attempt = 0; attempt < EXTERNAL_BLANK_TAB_ATTEMPTS; attempt += 1) {
     // From a fresh session each time, so the only tabs are the one being driven
     // and the blank ones opened below, and so the previous attempt's choice
@@ -1012,6 +1104,7 @@ function runExternalBlankTabSmoke(origin) {
  * container.
  */
 function runSessionResetSmoke(origin) {
+  phase('session reset');
   browser({ action: 'open', url: `${origin}/stable` });
   for (let index = 0; index < 3; index += 1) {
     evaluateJson('JSON.stringify(window.open("about:blank", "_blank") ? "opened" : "blocked")');
@@ -1029,6 +1122,7 @@ function runSessionResetSmoke(origin) {
 }
 
 async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
+  phase('isolated sessions');
   const alphaSession = smokeSessionKey('isolated-alpha');
   const betaSession = smokeSessionKey('isolated-beta');
 
@@ -1183,6 +1277,7 @@ async function runIsolatedSessionSmoke(origin, { closeDefaultSession } = {}) {
 
 /** Viewport ceiling and the screenshot payloads it has to keep affordable. */
 function runViewportScreenshotSmoke() {
+  phase('viewport screenshots');
   browser({ action: 'open', url: buildContentHeavyPage() });
 
   for (const [width, height] of [[1280, 720], [1920, 1080], [2560, 1440]]) {
