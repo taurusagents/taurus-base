@@ -106,37 +106,6 @@ RUN mkdir -p /etc/apt/keyrings \
     && corepack enable pnpm --install-directory /usr/bin \
     && corepack prepare pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e --activate
 
-# ── TypeScript / Prettier / ESLint ──
-# `npm ci` installs exactly the tree recorded in the lockfile, so every version
-# and tarball hash in it — not just the ones named in package.json — is fixed at
-# the moment the lockfile was committed and reviewed. Each set keeps its own
-# directory: a shared one would hoist the trees together, and one set's
-# dependency could then quietly change another's.
-#
-# `--ignore-scripts` blocks install hooks, which is how a hostile npm package
-# normally gets to run code. Nothing in this set declares one.
-#
-# The symlinks put the results back where the rest of the system looks for them:
-# NODE_PATH points at /usr/lib/node_modules and other tools call the binaries by
-# absolute path. Node resolves a symlink to its real location before looking for
-# a package's own dependencies, so each package still finds those inside its own
-# set rather than across sets.
-COPY npm/base-toolchain/package.json npm/base-toolchain/package-lock.json /opt/taurus-npm/base-toolchain/
-RUN npm ci --prefix /opt/taurus-npm/base-toolchain --ignore-scripts \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript /usr/lib/node_modules/typescript \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/prettier /usr/lib/node_modules/prettier \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/eslint /usr/lib/node_modules/eslint \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript/bin/tsc /usr/bin/tsc \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript/bin/tsserver /usr/bin/tsserver \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/prettier/bin/prettier.cjs /usr/bin/prettier \
-    && ln -s /opt/taurus-npm/base-toolchain/node_modules/eslint/bin/eslint.js /usr/bin/eslint \
-    && tsc --version \
-    && prettier --version \
-    && eslint --version \
-# tsserver reads a request stream rather than answering --version, so the most
-# it can be asked at build time is whether the link leads to a runnable file.
-    && test -x /usr/bin/tsserver
-
 # ── Go ──
 # Checksum as published by go.dev/dl for this archive.
 RUN curl -fsSL -o /tmp/go.tar.gz https://go.dev/dl/go1.24.3.linux-amd64.tar.gz \
@@ -180,15 +149,51 @@ RUN useradd -r -m -d /home/taurus-browser -s /usr/sbin/nologin taurus-browser \
 
 # ── Playwright + Chromium ──
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-# Installed from its own lockfile into its own tree, exactly like the toolchain
-# set above. Chromium itself is downloaded afterwards by the installed Playwright
-# CLI rather than by an install hook, so blocking hooks does not affect it.
+# `npm ci` installs exactly the tree recorded in the lockfile, so every version
+# and tarball hash in it — not just the one named in package.json — is fixed at
+# the moment the lockfile was committed and reviewed. Each set installs into its
+# own directory: a shared one would hoist the trees together, and a dependency
+# of one set could then quietly decide the version another set gets.
+#
+# `--ignore-scripts` blocks install hooks, which is how a hostile npm package
+# normally gets to run code. The only hook anywhere in this set belongs to a
+# macOS-only optional dependency that never installs here. Chromium is
+# downloaded afterwards by the installed Playwright CLI rather than by a hook,
+# so blocking hooks does not affect it.
+#
+# The symlinks put the results back where the rest of the system looks for them:
+# NODE_PATH points at /usr/lib/node_modules, browser-cli.mjs resolves Playwright
+# from that directory by name, and the CLI is called by absolute path. Node
+# resolves a symlink to its real location before looking for a package's own
+# dependencies, so each package still finds those inside its own set rather than
+# across sets.
 COPY npm/playwright/package.json npm/playwright/package-lock.json /opt/taurus-npm/playwright/
 RUN npm ci --prefix /opt/taurus-npm/playwright --ignore-scripts \
     && ln -s /opt/taurus-npm/playwright/node_modules/playwright /usr/lib/node_modules/playwright \
     && ln -s /opt/taurus-npm/playwright/node_modules/playwright/cli.js /usr/bin/playwright \
     && playwright install --with-deps chromium \
     && chmod -R a+rX /ms-playwright
+
+# ── TypeScript / Prettier / ESLint ──
+# Installed from its own lockfile into its own tree and symlinked into the same
+# two places as the Playwright set above, for the same reasons. Nothing in this
+# set declares an install hook at all. It comes after the Chromium download so
+# that changing a version here does not repeat it.
+COPY npm/base-toolchain/package.json npm/base-toolchain/package-lock.json /opt/taurus-npm/base-toolchain/
+RUN npm ci --prefix /opt/taurus-npm/base-toolchain --ignore-scripts \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript /usr/lib/node_modules/typescript \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/prettier /usr/lib/node_modules/prettier \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/eslint /usr/lib/node_modules/eslint \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript/bin/tsc /usr/bin/tsc \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript/bin/tsserver /usr/bin/tsserver \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/prettier/bin/prettier.cjs /usr/bin/prettier \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/eslint/bin/eslint.js /usr/bin/eslint \
+    && tsc --version \
+    && prettier --version \
+    && eslint --version \
+# tsserver reads a request stream rather than answering --version, so the most
+# it can be asked at build time is whether the link leads to a runnable file.
+    && test -x /usr/bin/tsserver
 
 # ── Browser CLI helper ──
 COPY browser-cli.mjs /usr/local/lib/browser-cli.mjs
