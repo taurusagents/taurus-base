@@ -103,10 +103,13 @@ const DISPOSE_CONTEXT_TIMEOUT_MS = 5_000;
 // Closing pages is asked of the browser process too, for the same reason, and is
 // bounded for the same reason. One bound covers a whole context's worth.
 const CLOSE_TARGET_TIMEOUT_MS = 5_000;
-// The action lock is only ever held across session setup or session finalising,
-// both of which are bounded well inside this. Waiting longer means the holder is
-// stuck, or that something outside this helper holds the lock file; saying so
-// beats waiting for a caller to give up on a silent process.
+// The action lock is only ever held across setting a session up or finalising
+// one, and neither is anywhere near this long in ordinary use. Waiting longer
+// than this means the holder is stuck, or that something outside this helper
+// holds the lock file; saying so beats waiting on a silent process. It is not a
+// claim about the worst case — sweeping several idle sessions out of the way can
+// take longer than this on its own, and a caller that waits behind that is told
+// about the lock rather than left guessing.
 const LOCK_ACQUIRE_TIMEOUT_MS = 30_000;
 // Releasing is a formality — closing the child's input ends it — but it sits in
 // the same cleanup paths as the waits above and must not outlive them either.
@@ -581,6 +584,8 @@ function budgetedWaitMs(cap) {
   return Math.min(cap, remainingBudgetMs() - WATCHDOG_MARGIN_MS);
 }
 
+let answering = false;
+
 /**
  * Writes this call's answer and stops.
  *
@@ -594,8 +599,6 @@ function budgetedWaitMs(cap) {
  * for a result, so wait for the write to be taken before leaving. If it never
  * is, nobody is reading, and staying would make this the hang it exists to end.
  */
-let answering = false;
-
 function writeAndExit(stream, text, exitCode) {
   answering = true;
   const leave = () => process.exit(exitCode);
