@@ -91,6 +91,19 @@ const FRESH_BROWSER_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
 const MAX_WAIT_MS = 60_000;
+// Ceiling for one page action. Most of what an action does already carries its
+// own timeout — navigation, clicks, fills, screenshots — but several steps have
+// none to give: `evaluate` accepts no timeout option at all, and mouse and
+// keyboard input is dispatched to the page without one. A page that spins its
+// renderer, or an expression that simply never returns, would otherwise keep
+// this helper and whoever is waiting on it alive indefinitely. A `wait` action
+// may legitimately sleep for MAX_WAIT_MS, so the ceiling clears that with room
+// for the page work around it.
+const ACTION_TIMEOUT_MS = MAX_WAIT_MS + 60_000;
+// Dropping a CDP connection is a local operation, but it also happens after an
+// action was abandoned at its deadline, and the abandoned call still holds that
+// connection. Bounded so teardown cannot inherit the hang it is cleaning up.
+const CONNECTION_CLOSE_TIMEOUT_MS = 5_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
 const SESSION_KEY_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
 const INVALID_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -488,12 +501,17 @@ function sleep(ms) {
 /**
  * Rejects if `promise` has not settled within `ms`. Used for best-effort steps
  * that must never turn into a hang; the underlying call is simply abandoned.
+ * `description` names the abandoned step, for the callers whose timeout is
+ * reported to the agent rather than swallowed.
  */
-function withTimeout(promise, ms) {
+function withTimeout(promise, ms, description = null) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms).unref();
+      setTimeout(
+        () => reject(new Error(`${description ? `${description} ` : ''}timed out after ${ms}ms`)),
+        ms,
+      ).unref();
     }),
   ]);
 }
@@ -1555,8 +1573,8 @@ async function ensureBrowserConnection(state) {
 }
 
 async function closeConnection(browser, rootCdp) {
-  await rootCdp?.detach?.().catch(() => {});
-  await browser?.close?.().catch(() => {});
+  await withTimeout(rootCdp?.detach?.(), CONNECTION_CLOSE_TIMEOUT_MS).catch(() => {});
+  await withTimeout(browser?.close?.(), CONNECTION_CLOSE_TIMEOUT_MS).catch(() => {});
 }
 
 async function discardAllPages(browser) {
@@ -2161,11 +2179,15 @@ async function handleSessionAction(input, sessionRequest) {
 
   let viewportAfter = null;
   try {
-    return await performActionOnPage(input, page, {
-      async onViewportChanged(viewport) {
-        viewportAfter = viewport;
-      },
-    });
+    return await withTimeout(
+      performActionOnPage(input, page, {
+        async onViewportChanged(viewport) {
+          viewportAfter = viewport;
+        },
+      }),
+      ACTION_TIMEOUT_MS,
+      `Browser action "${input.action}"`,
+    );
   } finally {
     const finalizeLock = await acquireBrowserActionLock();
     try {
