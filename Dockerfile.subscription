@@ -18,6 +18,12 @@ ARG CODEX_BUILD_JOBS
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/root/.cargo/bin:${PATH}
 
+# The rustup installer below is pinned to the amd64 build and checked against
+# the SHA-256 recorded with it, which is the only architecture this image is
+# built for. Stop here rather than reach that comparison with the wrong file.
+RUN [ "$(dpkg --print-architecture)" = amd64 ] \
+    || { echo "taurus-base-subscription is built for amd64 only; the pinned checksums do not cover $(dpkg --print-architecture)." >&2; exit 1; }
+
 # Keep Codex build dependencies in a throwaway stage so the runtime image stays
 # small while still compiling the pinned upstream source reproducibly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,7 +57,18 @@ COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
 #
 # `CODEX_BUILD_JOBS` defaults to 1 for memory-constrained builders but can be
 # overridden by CI/staging.
-RUN curl -fsSL https://sh.rustup.rs | bash -s -- -y --profile minimal --default-toolchain ${CODEX_RUST_VERSION} \
+#
+# https://sh.rustup.rs is a script that fetches whatever rustup is current and
+# runs it, so this takes the versioned installer directly and checks it against
+# the SHA-256 the Rust project publishes next to it. That covers the installer
+# only: rustup then downloads the pinned toolchain itself, checking each piece
+# against hashes in a manifest it fetches from the same server, so the toolchain
+# is whatever static.rust-lang.org serves rather than bytes reviewed here.
+RUN curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init \
+    && echo "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --profile minimal --default-toolchain ${CODEX_RUST_VERSION} \
+    && rm -f /tmp/rustup-init \
     && git clone --depth 1 --branch ${CODEX_GIT_REF} https://github.com/openai/codex.git /tmp/codex-src \
     && cd /tmp/codex-src \
     && test "$(git rev-parse HEAD)" = "${CODEX_GIT_COMMIT}" \

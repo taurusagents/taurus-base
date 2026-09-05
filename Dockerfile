@@ -9,6 +9,13 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Every archive this file downloads is pinned to a version and checked against a
+# SHA-256 recorded below, and those checksums are for the amd64 artifacts. amd64
+# is the only architecture this image is built for, so stop here rather than
+# reach the first checksum comparison with the wrong file and a confusing error.
+RUN [ "$(dpkg --print-architecture)" = amd64 ] \
+    || { echo "taurus-base is built for amd64 only; the pinned checksums do not cover $(dpkg --print-architecture)." >&2; exit 1; }
+
 # ── Core utilities ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -70,7 +77,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pytest==9.0.3 \
     ruff==0.15.14 \
     black==26.5.1 \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh
+# uv's convenience installer fetches whatever release is current and drops the
+# binaries in root's home, where only login shells find them. Take the release
+# archive instead: it is a fixed version whose checksum Astral publishes beside
+# it, and /usr/local/bin is on every shell's PATH.
+    && curl -fsSL -o /tmp/uv.tar.gz https://github.com/astral-sh/uv/releases/download/0.12.9/uv-x86_64-unknown-linux-gnu.tar.gz \
+    && echo "ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460  /tmp/uv.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 \
+        uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx \
+    && rm -f /tmp/uv.tar.gz \
+    && uv --version
 
 # ── Node.js 24 (NodeSource) ──
 RUN mkdir -p /etc/apt/keyrings \
@@ -122,13 +138,21 @@ RUN npm ci --prefix /opt/taurus-npm/base-toolchain --ignore-scripts \
     && test -x /usr/bin/tsserver
 
 # ── Go ──
-RUN curl -fsSL https://go.dev/dl/go1.24.3.linux-$(dpkg --print-architecture).tar.gz \
-    | tar xz -C /usr/local
+# Checksum as published by go.dev/dl for this archive.
+RUN curl -fsSL -o /tmp/go.tar.gz https://go.dev/dl/go1.24.3.linux-amd64.tar.gz \
+    && echo "3333f6ea53afa971e9078895eaa4ac7204a8c6b5c68c10e6bc9a33e8e391bdd8  /tmp/go.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/go.tar.gz -C /usr/local \
+    && rm -f /tmp/go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # ── asdf version manager ──
-RUN curl -fsSL https://github.com/asdf-vm/asdf/releases/download/v0.18.1/asdf-v0.18.1-linux-$(dpkg --print-architecture).tar.gz \
-    | tar xz -C /usr/local/bin \
+# asdf publishes only an MD5 next to its release archives, which is too weak to
+# rely on, so this is GitHub's own SHA-256 of the stored release asset. It was
+# checked against upstream's MD5 of the same bytes when it was written down.
+RUN curl -fsSL -o /tmp/asdf.tar.gz https://github.com/asdf-vm/asdf/releases/download/v0.18.1/asdf-v0.18.1-linux-amd64.tar.gz \
+    && echo "56141dc99eab75c140dcdd85cf73f3b82fed2485a8dccd4f11a4dc5cbcb6ea5c  /tmp/asdf.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/asdf.tar.gz -C /usr/local/bin \
+    && rm -f /tmp/asdf.tar.gz \
     && chmod +x /usr/local/bin/asdf
 
 # ── GitHub CLI ──
