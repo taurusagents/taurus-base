@@ -160,6 +160,12 @@ changes. What it does:
   `wrapPostCompactionMaterial` (`src/agents/post-compaction-material.ts` in the
   `taurus-agents` repository); neither side may change it alone.
 
+Adding `summary` to the compaction item makes any exhaustive match on that item
+a compile error, so the patch also relaxes the one such match, in the TUI's
+thread listing. That listing keeps upstream's output and leaves the summary out:
+the summary is meant for app-server clients reading the thread stream, not for an
+untruncated dump into a model-facing payload.
+
 Upstream tests that asserted the pre-fork behaviour are adapted rather than left
 to fail: the provider-capability tests now expect forced-local compaction, and
 the app-server test that asserted remote dispatch now asserts that a provider
