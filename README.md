@@ -15,6 +15,7 @@ Standalone Docker image definitions used by Taurus-managed containers.
 - `codex-app-server-smoke.mjs` — build-time JSON-RPC smoke test for `codex app-server --listen stdio://`
 - `patches/codex-local-compaction.patch` — the Taurus fork patch applied to the pinned Codex source; see [Codex fork patch](#codex-fork-patch) for everything it changes
 - `browser-cli.mjs` — Playwright-backed browser helper copied into the main `taurus-base` image
+- `npm/` — the manifest and lockfile for each set of npm packages installed into an image; see [`npm/README.md`](npm/README.md)
 
 ## `taurus-base`
 

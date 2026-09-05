@@ -1,0 +1,11 @@
+{
+  "name": "taurus-base-subscription-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "CLI and SDK baked into the Taurus subscription sidecar image.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.207",
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}

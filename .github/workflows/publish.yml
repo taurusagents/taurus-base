@@ -20,6 +20,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-24.04
+    # Without a cap a wedged step holds a runner for GitHub's six-hour default
+    # and the image simply is not republished that night. The two images have
+    # very different healthy durations, so each carries its own.
+    timeout-minutes: ${{ matrix.job_timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -28,10 +32,15 @@ jobs:
             image: ghcr.io/taurusagents/taurus-base
             dockerfile: Dockerfile
             smoke_tag: taurus-base-smoke
+            # Healthy runs finish in well under ten minutes.
+            job_timeout_minutes: 30
           - image_key: subscription
             image: ghcr.io/taurusagents/taurus-base-subscription
             dockerfile: Dockerfile.subscription
             smoke_tag: taurus-base-subscription-smoke
+            # Compiling Codex single-threaded takes an hour and three quarters
+            # on its own, and runner speed varies, so this sits well clear of it.
+            job_timeout_minutes: 210
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -60,6 +69,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Smoke test image
+        # The base smoke takes a couple of minutes when healthy. This is the
+        # backstop for a command inside it that stops responding: the job cap
+        # would eventually catch that too, but this reports it in minutes and
+        # names the step.
+        timeout-minutes: 15
         run: |
           case "${{ matrix.image_key }}" in
             base)
@@ -74,15 +88,20 @@ jobs:
                 "${{ matrix.smoke_tag }}" bash -lc "
                   python3 --version &&
                   node --version &&
+                  npm --version &&
+                  tsc --version &&
+                  prettier --version &&
+                  eslint --version &&
                   go version &&
                   rg --version &&
                   fd --version &&
                   playwright --version &&
+                  node -e 'const { createRequire } = require(\"node:module\"); const viaNodePath = require(\"playwright\"); const viaGlobalDir = createRequire(\"/usr/lib/node_modules/\")(\"playwright\"); if (typeof viaNodePath.chromium.launch !== \"function\" || typeof viaGlobalDir.chromium.launch !== \"function\") { process.exit(1); } console.log(\"playwright resolves through NODE_PATH and through /usr/lib/node_modules\");' &&
                   dig -v &&
                   /usr/bin/time --version &&
                   ss --version &&
                   pdftotext -v &&
-                  convert -version > /dev/null &&
+                  convert -version &&
                   node /tmp/browser-image-smoke.mjs
                 "
               ;;
@@ -90,6 +109,7 @@ jobs:
               docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
                 python3 --version &&
                 node --version &&
+                npm --version &&
                 sqlite3 --version &&
                 tmp_db=\$(mktemp /tmp/codex-rollout.XXXXXX.sqlite) &&
                 sqlite3 \"\$tmp_db\" \"CREATE TABLE threads (id TEXT, rollout_path TEXT, updated_at TEXT); INSERT INTO threads (id, rollout_path, updated_at) VALUES ('thread-1', 'sessions/run/rollout.jsonl', '2026-01-01T00:00:00Z');\" &&

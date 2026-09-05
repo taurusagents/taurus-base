@@ -1,0 +1,10 @@
+{
+  "name": "taurus-base-playwright",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Playwright CLI and library baked into the Taurus base image.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "playwright": "1.60.0"
+  }
+}

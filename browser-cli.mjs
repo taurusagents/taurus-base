@@ -91,6 +91,34 @@ const FRESH_BROWSER_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
 const MAX_WAIT_MS = 60_000;
+// Dropping a CDP connection is a local operation, but it also happens after an
+// action was abandoned at its deadline, and the abandoned call still holds that
+// connection. Bounded so teardown cannot inherit the hang it is cleaning up.
+const CONNECTION_CLOSE_TIMEOUT_MS = 5_000;
+// Destroying a browser context is asked of the browser process, not of the page
+// being destroyed, so it answers even when that page is unresponsive — unless
+// the browser process itself is the problem, which is exactly the situation the
+// callers below are trying to recover from.
+const DISPOSE_CONTEXT_TIMEOUT_MS = 5_000;
+// Closing a single page is asked of the browser process too, for the same
+// reason, and is bounded for the same reason.
+const CLOSE_TARGET_TIMEOUT_MS = 5_000;
+// The action lock is only ever held across setting a session up or finalising
+// one, and neither is anywhere near this long in ordinary use. Waiting longer
+// than this means the holder is stuck, or that something outside this helper
+// holds the lock file; saying so beats waiting on a silent process. It is not a
+// claim about the worst case — sweeping several idle sessions out of the way can
+// take longer than this on its own, and a caller that waits behind that is told
+// about the lock rather than left guessing.
+const LOCK_ACQUIRE_TIMEOUT_MS = 30_000;
+// Releasing is a formality — closing the child's input ends it — but it sits in
+// the same cleanup paths as the waits above and must not outlive them either.
+const LOCK_RELEASE_TIMEOUT_MS = 5_000;
+// What the action leaves behind for itself: closing the page it abandoned,
+// taking the lock again to release its lease, and dropping the connection.
+const ACTION_CLEANUP_RESERVE_MS = 20_000;
+// Less budget than this left for the action is not worth starting it with.
+const MIN_ACTION_TIMEOUT_MS = 10_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
 const SESSION_KEY_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
 const INVALID_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -361,6 +389,36 @@ const MAX_BROWSER_SESSIONS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_MAX_SESSIONS',
   DEFAULT_BROWSER_MAX_SESSIONS,
 );
+// How long this whole process is allowed to take. Taurus starts counting when
+// it writes the command, not when this process gets going, and when it expires
+// it interrupts the job and retires the agent's whole shell session — so
+// overrunning costs the agent far more than the Browser call it was making.
+//
+// Nothing here bounds the process by it. The waits below that are measured
+// against what is left of it are the big, obvious ones, and there are many more
+// that are not: some belong to Playwright, and a `wait` action's own timer runs
+// in this process, where abandoning its promise does not stop it. What the
+// clamps buy is that a call whose page has stopped answering usually reports and
+// closes that page before the caller loses patience, rather than being killed
+// mid-action. A call that overruns anyway is still killed, and raising either
+// setting makes that likelier.
+const DEFAULT_PROCESS_BUDGET_MS = 120_000;
+const PROCESS_BUDGET_MS = readPositiveIntegerEnv(
+  'TAURUS_BROWSER_PROCESS_BUDGET_MS',
+  DEFAULT_PROCESS_BUDGET_MS,
+);
+// A quarter of a second after the caller started counting: it writes a shell
+// command, and this file only runs once Node and Playwright have loaded.
+const PROCESS_STARTED_AT_MS = Date.now();
+// The most an action is ever given, however much budget happens to be spare.
+// Nothing legitimately needs more: a `wait` is the longest an action can be
+// asked to take and everything else is interactive, so waiting longer than this
+// only delays telling the agent that its page is not coming back.
+const DEFAULT_MAX_ACTION_TIMEOUT_MS = MAX_WAIT_MS + 10_000;
+const MAX_ACTION_TIMEOUT_MS = readPositiveIntegerEnv(
+  'TAURUS_BROWSER_ACTION_TIMEOUT_MS',
+  DEFAULT_MAX_ACTION_TIMEOUT_MS,
+);
 
 function signalBrowserProcess(signalArgs) {
   try {
@@ -485,15 +543,47 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** What is left of the time the caller is prepared to wait for this process. */
+function remainingBudgetMs() {
+  return PROCESS_BUDGET_MS - (Date.now() - PROCESS_STARTED_AT_MS);
+}
+
+/**
+ * How much of the process budget is left for the page action itself, once
+ * setting the session up has taken its share and the cleanup after a timeout
+ * has been set aside.
+ *
+ * Derived rather than fixed, because the steps before the action can add up to
+ * more than the whole budget on their own — waiting for the lock, connecting to
+ * a cold browser, sweeping idle sessions and preparing the page are each bounded
+ * in tens of seconds. A constant deadline was fine whenever setup was quick and
+ * ran past the caller's patience whenever it was not, which is precisely when
+ * the cleanup after the deadline matters most.
+ */
+function actionBudgetMs() {
+  return remainingBudgetMs() - ACTION_CLEANUP_RESERVE_MS;
+}
+
 /**
  * Rejects if `promise` has not settled within `ms`. Used for best-effort steps
  * that must never turn into a hang; the underlying call is simply abandoned.
+ * `description` names the abandoned step, for the callers whose timeout is
+ * reported to the agent rather than swallowed.
+ *
+ * The rejection is marked so a caller can tell "we gave up on this" from "this
+ * failed", which are cleaned up differently: an abandoned call is still running.
  */
-function withTimeout(promise, ms) {
+function withTimeout(promise, ms, description = null) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms).unref();
+      setTimeout(
+        () => reject(Object.assign(
+          new Error(`${description ? `${description} ` : ''}timed out after ${ms}ms`),
+          { timedOut: true },
+        )),
+        ms,
+      ).unref();
     }),
   ]);
 }
@@ -1370,6 +1460,9 @@ function getSessionViewport(session) {
 
 async function acquireBrowserActionLock() {
   const readyToken = `__taurus_browser_lock_ready_${randomUUID()}__`;
+  // Never wait past the point where the caller gives up on this process: a lock
+  // taken with no time left to use it is worse than failing to take it.
+  const waitMs = Math.min(LOCK_ACQUIRE_TIMEOUT_MS, remainingBudgetMs());
   const child = spawn('flock', [
     '-x',
     BROWSER_ACTION_LOCK,
@@ -1385,7 +1478,22 @@ async function acquireBrowserActionLock() {
     let stderr = '';
     let stdout = '';
 
+    // Nothing releases the lock on this helper's behalf, so a holder that never
+    // finishes — or an unrelated process holding the same file — would leave
+    // every Browser call in the container waiting with no output.
+    const waitDeadline = setTimeout(() => {
+      // Kill the queued `flock` child so it cannot take the lock later with
+      // nobody here to release it. If it was still queued this is enough. If it
+      // took the lock in the moment before this fired, `flock` has already
+      // handed the descriptor to children this cannot see, and the lock is held
+      // until they notice their input has gone — which happens when this
+      // process exits.
+      child.kill('SIGKILL');
+      reject(new Error(`Could not acquire the browser action lock within ${waitMs}ms. Another Browser call, or another process holding ${BROWSER_ACTION_LOCK}, has not released it.`));
+    }, waitMs);
+
     const onExit = (code, signal) => {
+      clearTimeout(waitDeadline);
       if (!ready) {
         reject(new Error(`Could not acquire the browser action lock (code ${code ?? 'null'}, signal ${signal ?? 'none'}): ${stderr.trim() || 'no error output'}`));
       }
@@ -1393,6 +1501,7 @@ async function acquireBrowserActionLock() {
 
     child.once('exit', onExit);
     child.once('error', err => {
+      clearTimeout(waitDeadline);
       if (!ready) {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -1406,14 +1515,15 @@ async function acquireBrowserActionLock() {
       stdout += chunk;
       if (ready || !stdout.includes(readyToken)) return;
       ready = true;
+      clearTimeout(waitDeadline);
       child.removeListener('exit', onExit);
       resolve({
         async release() {
           if (child.killed || child.exitCode !== null) return;
           child.stdin.end();
-          await new Promise(resolveRelease => {
+          await withTimeout(new Promise(resolveRelease => {
             child.once('exit', () => resolveRelease());
-          });
+          }), LOCK_RELEASE_TIMEOUT_MS).catch(() => {});
         },
       });
     });
@@ -1555,8 +1665,8 @@ async function ensureBrowserConnection(state) {
 }
 
 async function closeConnection(browser, rootCdp) {
-  await rootCdp?.detach?.().catch(() => {});
-  await browser?.close?.().catch(() => {});
+  await withTimeout(rootCdp?.detach?.(), CONNECTION_CLOSE_TIMEOUT_MS).catch(() => {});
+  await withTimeout(browser?.close?.(), CONNECTION_CLOSE_TIMEOUT_MS).catch(() => {});
 }
 
 async function discardAllPages(browser) {
@@ -1670,10 +1780,36 @@ async function primeIsolatedPage(page, session, sessionKey) {
   session.viewport = viewport;
 }
 
+/**
+ * Destroys a browser context and everything running inside it, including pages
+ * that have stopped answering: the request goes to the browser process, not to
+ * the page. Every caller reaches this while cleaning up, so a browser that has
+ * stopped answering entirely must not turn cleanup into the next thing to hang.
+ */
+async function disposeBrowserContext(rootCdp, browserContextId) {
+  await withTimeout(
+    rootCdp.send('Target.disposeBrowserContext', { browserContextId }),
+    DISPOSE_CONTEXT_TIMEOUT_MS,
+  ).catch(() => {});
+}
+
+/**
+ * Closes one page and leaves the browser context it lived in alone, so the
+ * session keeps its cookies and its local storage. The browser process closes
+ * the page on its own authority, so this works on a page that has stopped
+ * answering, and on one whose unload handler asks to stay.
+ */
+async function closePageTarget(rootCdp, targetId) {
+  await withTimeout(
+    rootCdp.send('Target.closeTarget', { targetId }),
+    CLOSE_TARGET_TIMEOUT_MS,
+  ).catch(() => {});
+}
+
 async function disposeSession(rootCdp, state, sessionKey) {
   const session = state.sessions[sessionKey];
   if (!session) return false;
-  await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+  await disposeBrowserContext(rootCdp, session.browserContextId);
   delete state.sessions[sessionKey];
   return true;
 }
@@ -2004,7 +2140,7 @@ async function recoverUnavailableBrowserForClose(state, sessionKey) {
       let rootCdp = null;
       try {
         ({ browser, rootCdp } = await connectToBrowser(cdpUrl, ATTACH_RECOVERY_TIMEOUT_MS));
-        await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+        await disposeBrowserContext(rootCdp, session.browserContextId);
       } catch {
         continue;
       } finally {
@@ -2161,28 +2297,64 @@ async function handleSessionAction(input, sessionRequest) {
 
   let viewportAfter = null;
   try {
-    return await performActionOnPage(input, page, {
-      async onViewportChanged(viewport) {
-        viewportAfter = viewport;
-      },
-    });
+    const actionBudget = actionBudgetMs();
+    if (actionBudget < MIN_ACTION_TIMEOUT_MS) {
+      throw new Error(`Only ${Math.max(0, remainingBudgetMs())}ms of this Browser call's ${PROCESS_BUDGET_MS}ms was left after setting the session up, and ${ACTION_CLEANUP_RESERVE_MS}ms of that is held back to close the page and tidy up afterwards. The browser is warm now, so trying again should be quick.`);
+    }
+    return await withTimeout(
+      performActionOnPage(input, page, {
+        async onViewportChanged(viewport) {
+          viewportAfter = viewport;
+        },
+      }),
+      Math.min(MAX_ACTION_TIMEOUT_MS, actionBudget),
+      `Browser action "${input.action}"`,
+    );
+  } catch (err) {
+    if (err?.timedOut === true) {
+      // The deadline gave up on the call; it did not cancel it. Whatever the
+      // page was doing is still running, and handing that page to the next call
+      // would let it inherit an unfinished action's side effects, or wait behind
+      // a page that never became responsive again. Closing the page ends both,
+      // and leaves the session's browser context — its cookies, its storage,
+      // whatever it is signed into — untouched. The next call finds no page for
+      // this session and opens a new one in the same context.
+      //
+      // Done here rather than under the lock below: closing a page changes no
+      // shared state, and if the lock could not be taken the page would never
+      // be closed at all.
+      await closePageTarget(rootCdp, session.targetId);
+    }
+    throw err;
   } finally {
-    const finalizeLock = await acquireBrowserActionLock();
+    // Everything from here is bookkeeping; the answer, if there is one, already
+    // exists. If the lock cannot be taken in what is left of the budget, that is
+    // not worth failing a call that worked over: the lease it would have removed
+    // is pruned by the next call that finds this process gone.
+    const finalizeLock = await acquireBrowserActionLock().catch(() => null);
     try {
-      const finalizeState = loadState();
-      pruneDeadSessionLeases(finalizeState);
-      const currentSession = finalizeState.sessions[sessionRequest.sessionKey];
-      if (currentSession) {
-        removeSessionLease(currentSession, lease.leaseId);
-        currentSession.lastSeenAt = nowIso();
-        if (viewportAfter) {
-          currentSession.viewport = viewportAfter;
+      if (finalizeLock) {
+        const finalizeState = loadState();
+        pruneDeadSessionLeases(finalizeState);
+        const currentSession = finalizeState.sessions[sessionRequest.sessionKey];
+        if (currentSession) {
+          removeSessionLease(currentSession, lease.leaseId);
+          currentSession.lastSeenAt = nowIso();
+          if (viewportAfter) {
+            currentSession.viewport = viewportAfter;
+          }
         }
+        saveState(finalizeState);
       }
-      saveState(finalizeState);
+    } catch {
+      // Reading or writing the session record can fail as readily as taking the
+      // lock for it, and it is the same bookkeeping either way. What is lost is
+      // a lease the next call prunes anyway, and a viewport a resize had just
+      // set, which the next call will put back to the recorded one. Neither is
+      // worth failing a call that has already produced its answer.
     } finally {
       await closeConnection(browser, rootCdp);
-      await finalizeLock.release();
+      await finalizeLock?.release();
     }
   }
 }
