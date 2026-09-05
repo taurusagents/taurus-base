@@ -82,9 +82,13 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends nodejs=24.15.0-1nodesource1 \
     && rm -rf /var/lib/apt/lists/* \
 # Ship a pinned pnpm in-image via Corepack so containers do not depend on a
-# network fetch the first time pnpm is used.
+# network fetch the first time pnpm is used. The trailing hash is part of the
+# version string Corepack accepts: it hashes the downloaded tarball and refuses
+# to install anything that does not match, instead of trusting whatever the
+# registry serves for that version number. This is the same string Taurus
+# projects pin, so a container's pnpm and its projects' pnpm are the same bytes.
     && corepack enable pnpm --install-directory /usr/bin \
-    && corepack prepare pnpm@10.33.0 --activate
+    && corepack prepare pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e --activate
 
 # ── TypeScript / Prettier / ESLint ──
 # `npm ci` installs exactly the tree recorded in the lockfile, so every version
