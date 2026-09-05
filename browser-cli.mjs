@@ -390,16 +390,29 @@ const MAX_BROWSER_SESSIONS = readPositiveIntegerEnv(
 // it writes the command, not when this process gets going, and when it expires
 // it interrupts the job and retires the agent's whole shell session — so
 // overrunning costs the agent far more than the Browser call it was making.
-// Every wait below that could last tens of seconds is measured against what is
-// left of this, so the total cannot grow past it however slow any one step is.
+//
+// The watchdog below is what keeps the process inside this. The individual
+// waits measured against what is left of it are not a guarantee on their own,
+// and were never going to be: there are dozens of them, some are in Playwright
+// rather than here, and a `wait` action's own timer runs in this process where
+// abandoning the promise does not stop it. What clamping the big ones buys is
+// that the ordinary path — answer, close the abandoned page, exit — usually
+// finishes on its own, so the watchdog stays the last resort it should be.
+// Overriding either setting upwards puts the process back outside what the
+// caller will wait for; nothing here can stop that, and nothing tries to.
 const DEFAULT_PROCESS_BUDGET_MS = 120_000;
 const PROCESS_BUDGET_MS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_PROCESS_BUDGET_MS',
   DEFAULT_PROCESS_BUDGET_MS,
 );
-// Close enough to when the caller started counting: the shell it wrote the
-// command to spawns this process straight away.
+// The caller's clock started before this: it writes a shell command, and this
+// file only runs once Node and Playwright have loaded, about a quarter of a
+// second later. The watchdog margin covers that difference and the time it
+// takes to write an answer out.
 const PROCESS_STARTED_AT_MS = Date.now();
+const WATCHDOG_MARGIN_MS = 5_000;
+// If the answer cannot reach the pipe in this long, nobody is reading it.
+const WATCHDOG_FLUSH_GRACE_MS = 2_000;
 // The most an action is ever given, however much budget happens to be spare.
 // Nothing legitimately needs more: a `wait` is the longest an action can be
 // asked to take and everything else is interactive, so waiting longer than this
@@ -552,6 +565,72 @@ function remainingBudgetMs() {
  */
 function actionBudgetMs() {
   return remainingBudgetMs() - ACTION_CLEANUP_RESERVE_MS;
+}
+
+/**
+ * `cap`, or less if the budget is nearly gone. A wait that would still be going
+ * when the watchdog steps in cannot produce anything the caller will see, and a
+ * wait that ends first can say what it was waiting for.
+ */
+function budgetedWaitMs(cap) {
+  return Math.min(cap, remainingBudgetMs() - WATCHDOG_MARGIN_MS);
+}
+
+/**
+ * Writes this call's answer and stops.
+ *
+ * Stopping is the point. The caller does not have its answer when this process
+ * writes one; it has it when this process exits, and until then its own timeout
+ * is still running. Work that outlives the answer — a `wait` action's timer,
+ * say, which the action deadline abandons but cannot cancel — would otherwise
+ * keep the process alive for as long as it was originally going to take.
+ *
+ * Exiting can cut short a write to a pipe, and the caller parses this output
+ * for a result, so wait for the write to be taken before leaving. If it never
+ * is, nobody is reading, and staying would make this the hang it exists to end.
+ */
+let answering = false;
+
+function writeAndExit(stream, text, exitCode) {
+  answering = true;
+  const leave = () => process.exit(exitCode);
+  const grace = setTimeout(leave, WATCHDOG_FLUSH_GRACE_MS);
+  stream.write(text, () => {
+    clearTimeout(grace);
+    leave();
+  });
+}
+
+/**
+ * Answers and exits if this process is still running when the caller is about
+ * to give up on it.
+ *
+ * The caller does not get its answer when this process writes one; it gets it
+ * when this process exits. And being killed instead of exiting is not just a
+ * lost call — Taurus interrupts the job and retires the agent's whole shell
+ * session with it. So a poor answer under our own steam beats a good one that
+ * arrives after the process has been killed for taking too long.
+ *
+ * The timer is unreferenced, so it is never the reason this process is still
+ * alive: it fires only when something else is holding the loop open, which is
+ * exactly the case it is here for. A `wait` action is the plain example — its
+ * timer keeps running after the deadline has abandoned the promise, and no
+ * amount of cleanup in Chromium touches it.
+ */
+function armProcessWatchdog(input, sessionRequest) {
+  const deadlineMs = Math.max(0, remainingBudgetMs() - WATCHDOG_MARGIN_MS);
+  setTimeout(() => {
+    // An answer already on its way out is the answer; this only had to make
+    // sure the process ends, and writing a second one would leave the caller
+    // two results to choose between.
+    if (answering) return;
+    const message = `This Browser call was still running ${Math.round((Date.now() - PROCESS_STARTED_AT_MS) / 1_000)}s after it started, with ${JSON.stringify(input?.action ?? 'unknown')} outstanding, and was stopped here so it could report instead of being killed for taking too long.`;
+    if (sessionRequest.nonce !== null) {
+      writeAndExit(process.stdout, JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)), 0);
+    } else {
+      writeAndExit(process.stderr, `Browser error: ${message}\n`, 1);
+    }
+  }, deadlineMs).unref();
 }
 
 /**
@@ -1450,9 +1529,8 @@ function getSessionViewport(session) {
 
 async function acquireBrowserActionLock() {
   const readyToken = `__taurus_browser_lock_ready_${randomUUID()}__`;
-  // Never wait past the point where the caller gives up on this process: a lock
-  // taken with no time left to use it is worse than failing to take it.
-  const waitMs = Math.min(LOCK_ACQUIRE_TIMEOUT_MS, remainingBudgetMs());
+  // A lock taken with no time left to use it is worse than failing to take it.
+  const waitMs = budgetedWaitMs(LOCK_ACQUIRE_TIMEOUT_MS);
   const child = spawn('flock', [
     '-x',
     BROWSER_ACTION_LOCK,
@@ -2403,19 +2481,19 @@ function formatAXNodes(nodes) {
 try {
   const input = JSON.parse(process.argv[2] || '{}');
   const sessionRequest = getSessionRequest(input);
+  armProcessWatchdog(input, sessionRequest);
   if (sessionRequest.nonce !== null) {
     try {
       const result = await handleSessionAction(input, sessionRequest);
-      process.stdout.write(renderHelperSuccessOutput(sessionRequest, result));
+      writeAndExit(process.stdout, renderHelperSuccessOutput(sessionRequest, result), 0);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      process.stdout.write(JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)));
+      writeAndExit(process.stdout, JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)), 0);
     }
   } else {
     const result = await handleSessionAction(input, sessionRequest);
-    process.stdout.write(renderHelperSuccessOutput(sessionRequest, result));
+    writeAndExit(process.stdout, renderHelperSuccessOutput(sessionRequest, result), 0);
   }
 } catch (err) {
-  process.stderr.write(`Browser error: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
+  writeAndExit(process.stderr, `Browser error: ${err instanceof Error ? err.message : String(err)}\n`, 1);
 }
