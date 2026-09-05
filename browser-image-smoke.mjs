@@ -887,6 +887,12 @@ async function runAbandonedActionRecoverySmoke(origin) {
   // rather than from a constant: given a budget this size, an action can only
   // be allowed the remainder, which is far below what the helper would other-
   // wise permit.
+  //
+  // An expression that never settles, rather than a page that stops responding:
+  // this runs alongside the rest of the case, and a page that stops responding
+  // makes the browser refuse to attach for every other session. Chromium gives
+  // up on an unsettled expression of its own accord after about thirty seconds,
+  // so the deadline being measured has to stay well inside that.
   const derivedDeadline = isolatedBrowserAsync(smokeSessionKey('budget-deadline'), {
     action: 'evaluate',
     expression: 'new Promise(() => {})',
@@ -1005,7 +1011,10 @@ async function runAbandonedActionRecoverySmoke(origin) {
   const derived = await derivedDeadline;
   assert.equal(derived.isError, true, 'an action that never settles should not succeed');
   const derivedMatch = /timed out after (\d+)ms/.exec(derived.output);
-  assert.ok(derivedMatch, `expected a deadline in ${derived.output}`);
+  assert.ok(
+    derivedMatch,
+    `an action given a ${DERIVED_DEADLINE_BUDGET_MS}ms call budget should have ended at a deadline drawn from what was left of it, but the call ended with: ${derived.output}`,
+  );
   const derivedMs = Number(derivedMatch[1]);
   assert.ok(
     derivedMs <= DERIVED_DEADLINE_CEILING_MS,
