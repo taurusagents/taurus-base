@@ -20,6 +20,7 @@ const SMOKE_SESSION_NAMES = [
   'abandoned-action',
   'abandoned-wedge',
   'abandoned-popup',
+  'budget-deadline',
   'hostile-wedge',
   'hostile-survivor',
   'hostile-escalation-closee',
@@ -761,7 +762,7 @@ async function runSmoke() {
       runExternalBlankTabSmoke(pageServer.origin);
       runSessionResetSmoke(pageServer.origin);
     }
-    runAbandonedActionRecoverySmoke(pageServer.origin);
+    await runAbandonedActionRecoverySmoke(pageServer.origin);
     runHostilePageIsolationSmoke(pageServer.origin);
     runHostilePageEscalationSmoke(pageServer.origin);
     await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
@@ -855,9 +856,20 @@ const ABANDONED_ACTION_TIMEOUT_MS = 2_000;
 // page has certainly already made the change the next call must not see.
 const ABANDONED_ACTION_MUTATION_DELAY_MS = 200;
 const ABANDONED_ACTION_MARKER = 'abandoned action kept running';
-// Smaller than the helper's own cleanup reserve, so no action can be started
-// with it however quickly the session is set up.
+// Too small for the helper to start an action with, however quickly the session
+// is set up: it holds back a fixed reserve for cleaning up afterwards and
+// refuses to begin with less than ten seconds left after that.
 const EXHAUSTED_BUDGET_MS = 25_000;
+// Big enough to start an action with, and small enough that the time left over
+// is what limits the action rather than the helper's own ceiling on how long an
+// action may take. Leaves several seconds of slack for a slow setup before the
+// call would be refused instead.
+const DERIVED_DEADLINE_BUDGET_MS = 35_000;
+// The most the deadline can possibly be if it came from the budget: the whole
+// budget less the cleanup reserve, with setup taking no time at all. The
+// helper's ceiling is far above this, so a deadline that stopped being derived
+// from the budget cannot land under it.
+const DERIVED_DEADLINE_CEILING_MS = 15_000;
 const ABANDONED_ACTION_STORAGE_KEY = 'smokeSignIn';
 const ABANDONED_ACTION_STORAGE_VALUE = 'kept';
 
@@ -869,9 +881,21 @@ const ABANDONED_ACTION_STORAGE_VALUE = 'kept';
  * unfinished action's side effects, and with a renderer that never recovers it
  * would leave the session broken from then on.
  */
-function runAbandonedActionRecoverySmoke(origin) {
+async function runAbandonedActionRecoverySmoke(origin) {
   phase('abandoned action recovery');
   const session = smokeSessionKey('abandoned-action');
+
+  // Started here and settled at the end of this case, because it has to sit
+  // through a deadline of its own and there is no reason for the rest to wait.
+  // What it pins is that the deadline comes from the time the call has left
+  // rather than from a constant: given a budget this size, an action can only
+  // be allowed the remainder, which is far below what the helper would other-
+  // wise permit.
+  const derivedDeadline = isolatedBrowserAsync(smokeSessionKey('budget-deadline'), {
+    action: 'evaluate',
+    expression: 'new Promise(() => {})',
+  }, { env: { TAURUS_BROWSER_PROCESS_BUDGET_MS: String(DERIVED_DEADLINE_BUDGET_MS) } });
+
   assert.match(isolatedText(session, { action: 'open', url: `${origin}/stable` }), /stable page/);
 
   // Whatever the agent had signed into, in the two forms a site keeps it in.
@@ -1013,9 +1037,20 @@ function runAbandonedActionRecoverySmoke(origin) {
     'the budget it ran out of should be in the message',
   );
 
+  const derived = await derivedDeadline;
+  assert.equal(derived.isError, true, 'an action that never settles should not succeed');
+  const derivedMatch = /timed out after (\d+)ms/.exec(derived.output);
+  assert.ok(derivedMatch, `expected a deadline in ${derived.output}`);
+  const derivedMs = Number(derivedMatch[1]);
+  assert.ok(
+    derivedMs <= DERIVED_DEADLINE_CEILING_MS,
+    `an action's deadline should come from the time its call has left, but it ran for ${derivedMs}ms of a ${DERIVED_DEADLINE_BUDGET_MS}ms budget`,
+  );
+
   assert.match(isolatedText(session, { action: 'close' }), /Browser session closed/);
   assert.match(isolatedText(wedgedSession, { action: 'close' }), /Browser session closed/);
   assert.match(isolatedText(popupSession, { action: 'close' }), /Browser session closed/);
+  assert.match(isolatedText(smokeSessionKey('budget-deadline'), { action: 'close' }), /Browser session closed/);
 }
 
 // Long enough for another helper call to be made and answered before the first
