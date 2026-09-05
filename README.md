@@ -127,14 +127,23 @@ before the build. The resulting binary is identified by `codexVariant` in
 changes. What it does:
 
 - **Forces local compaction.** The configured model provider reports remote
-  compaction as unsupported. That capability is the single thing both compaction
-  dispatch sites consult, so a requested compaction and an automatic one alike
-  run Codex's own client-side summarization instead of the provider-side task.
-  Everything below depends on it: on the remote path Codex never sees the summary
-  text at all.
+  compaction as unsupported. Both sites that dispatch on that capability — a
+  requested compaction and an automatic one — therefore run Codex's own
+  client-side summarization instead of the provider-side task. Everything below
+  depends on it: on the remote path Codex never sees the summary text at all.
+  The capability is not the only thing that decides, though. Both sites check
+  Codex's `token_budget` feature before they look at it, and that path asks the
+  provider nothing and produces no summary. It is off by default and this fork
+  relies on it staying off; turning it on silently disables everything here.
 - **Exposes the summary on the wire.** The app-server v2 `contextCompaction`
   item carries a `summary` field holding the plain summary body, without the
   `SUMMARY_PREFIX` boilerplate Codex prepends for the model's own benefit.
+  This is a live-stream field only. Rebuilt thread history — a `threadItems/list`
+  or a resume — materializes compaction items from the legacy compaction event,
+  which has no summary on it, so those read the field back as absent. A client
+  that needs the text has to keep it when it streams; asking for it later
+  returns nothing, and nothing distinguishes that from a compaction that
+  genuinely produced no summary.
 - **Scopes the summary to the compaction turn.** The summary is read from the
   items that compaction request produced, not from a backwards scan of the whole
   session history — a compaction that answered with nothing would otherwise
@@ -166,14 +175,21 @@ thread listing. That listing keeps upstream's output and leaves the summary out:
 the summary is meant for app-server clients reading the thread stream, not for an
 untruncated dump into a model-facing payload.
 
-Upstream tests that asserted the pre-fork behaviour are adapted rather than left
-to fail: the provider-capability tests now expect forced-local compaction, and
-the app-server test that asserted remote dispatch now asserts that a provider
+The tests this fork's own behaviour depends on are adapted rather than left to
+fail: the provider-capability tests now expect forced-local compaction, the
+app-server test that asserted remote dispatch now asserts that a provider
 upstream would route remotely still compacts locally and never calls the compact
-endpoint. One exception is deliberate — `codex-rs/core/tests/common/context_snapshot.rs`
-hard-codes the old summary preamble and is left as upstream wrote it, being test
-code that the `-p codex-cli --bin codex` build this image performs does not
-compile.
+endpoint, and the local compaction test asserts the summary that reaches the
+client.
+
+Upstream's suite as a whole is *not* expected to pass on this fork, and adapting
+it is not a goal. `codex-rs/core/tests/suite/compact_remote.rs` drives compaction
+through the capability dispatch with an OpenAI-named provider across roughly
+thirty tests that now take the local path; `codex-rs/core/tests/common/context_snapshot.rs`
+hard-codes the old summary preamble; and the generated schema fixtures under
+`codex-rs/app-server-protocol/schema/` do not know about the added `summary`
+field, so the fixture-comparison tests fail too. None of it is compiled by the
+`-p codex-cli --bin codex` build this image performs.
 
 ## Automatic publishing
 

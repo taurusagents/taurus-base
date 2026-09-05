@@ -112,6 +112,7 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends nodejs=24.15.0-1nodesource1 \
     && rm -rf /var/lib/apt/lists/*
 
+ARG CODEX_GIT_COMMIT
 COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
 COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/taurus-npm/subscription/
 # `npm ci` installs exactly the tree recorded in the lockfile, so every version
@@ -125,6 +126,13 @@ COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/tauru
 # stops if they have drifted rather than shipping an image whose manifest
 # describes something other than what is in it.
 #
+# The manifest's Codex fields are checked the same way and for the same reason.
+# Nothing else in the build reads codexSourceRef, so without this a manifest
+# naming a commit other than the one actually compiled would ship unnoticed —
+# and a manifest that lies about where the binary came from defeats the point of
+# recording it. The variant string is required to describe the version it claims
+# to be a build of, which catches half-finished version bumps.
+#
 # `--ignore-scripts` blocks install hooks, which is how a hostile npm package
 # normally gets to run code. Exactly one hook here is load-bearing: the Claude
 # Code wrapper ships a stub and its postinstall copies the real platform binary
@@ -136,7 +144,7 @@ COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/tauru
 # MCP SDK from that directory, and /usr/bin/claude is called by absolute path.
 # Node resolves a symlink to its real location before looking for a package's
 # own dependencies, so both packages still find theirs inside this tree.
-RUN node -e "const manifest = require('/tmp/subscription-runtime-versions.json'); const pinned = require('/opt/taurus-npm/subscription/package.json').dependencies; for (const [key, name] of [['claudeCode', '@anthropic-ai/claude-code'], ['mcpSdk', '@modelcontextprotocol/sdk']]) { if (manifest[key] !== pinned[name]) { console.error('Version drift: the runtime manifest says ' + key + '=' + manifest[key] + ', but ' + name + ' is pinned at ' + pinned[name]); process.exit(1); } }" \
+RUN node -e "const manifest = require('/tmp/subscription-runtime-versions.json'); const pinned = require('/opt/taurus-npm/subscription/package.json').dependencies; for (const [key, name] of [['claudeCode', '@anthropic-ai/claude-code'], ['mcpSdk', '@modelcontextprotocol/sdk']]) { if (manifest[key] !== pinned[name]) { console.error('Version drift: the runtime manifest says ' + key + '=' + manifest[key] + ', but ' + name + ' is pinned at ' + pinned[name]); process.exit(1); } } const builtRef = 'openai/codex@' + process.env.CODEX_GIT_COMMIT; if (manifest.codexSourceRef !== builtRef) { console.error('Version drift: the runtime manifest says codexSourceRef=' + manifest.codexSourceRef + ', but this image compiles ' + builtRef); process.exit(1); } if (!manifest.codexVariant.startsWith(manifest.codex + '+')) { console.error('Version drift: codexVariant ' + manifest.codexVariant + ' does not describe a build of codex ' + manifest.codex); process.exit(1); }" \
     && npm ci --prefix /opt/taurus-npm/subscription --ignore-scripts \
     && mkdir -p /usr/lib/node_modules/@anthropic-ai /usr/lib/node_modules/@modelcontextprotocol \
     && ln -s /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code /usr/lib/node_modules/@anthropic-ai/claude-code \
@@ -153,10 +161,14 @@ COPY codex-app-server-smoke.mjs /tmp/codex-app-server-smoke.mjs
 COPY --from=codex-builder /out/codex /usr/bin/codex
 # Fail the image build immediately if the patched Codex binary cannot start the
 # same stdio app-server Taurus uses in subscription sidecars.
+#
+# The version the binary must report is read out of the manifest rather than
+# written here as a second copy of the same string, so a bump has one place to
+# change and this check cannot silently pass against a stale literal.
 RUN chmod 0755 /usr/bin/codex \
     && ln -sf /usr/bin/codex /usr/local/bin/codex \
     && /usr/bin/codex --version | tee /tmp/codex-version \
-    && grep -F '0.153.4' /tmp/codex-version \
+    && grep -F "$(node -p "require('/usr/local/lib/taurus-subscription/runtime-versions.json').codex")" /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
     && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
     && rm -f /tmp/codex-app-server-smoke.mjs /tmp/codex-local-compaction.patch
