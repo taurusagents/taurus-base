@@ -848,6 +848,9 @@ const ABANDONED_ACTION_TIMEOUT_MS = 2_000;
 // page has certainly already made the change the next call must not see.
 const ABANDONED_ACTION_MUTATION_DELAY_MS = 200;
 const ABANDONED_ACTION_MARKER = 'abandoned action kept running';
+// Smaller than the helper's own cleanup reserve, so no action can be started
+// with it however quickly the session is set up.
+const EXHAUSTED_BUDGET_MS = 25_000;
 const ABANDONED_ACTION_STORAGE_KEY = 'smokeSignIn';
 const ABANDONED_ACTION_STORAGE_VALUE = 'kept';
 
@@ -949,6 +952,27 @@ function runAbandonedActionRecoverySmoke(origin) {
     isolatedText(wedgedSession, { action: 'evaluate', expression: 'location.href' }),
     'about:blank',
     'the session whose action was abandoned should come back on a fresh page',
+  );
+
+  // Setting a session up can consume the time the caller allows for the whole
+  // call. Saying so beats starting an action that will be killed part-way
+  // through, which costs the agent its shell session rather than just this call.
+  const exhausted = isolatedBrowser(session, {
+    action: 'evaluate',
+    expression: '1 + 1',
+  }, {
+    expectFailure: true,
+    env: { TAURUS_BROWSER_PROCESS_BUDGET_MS: String(EXHAUSTED_BUDGET_MS) },
+  });
+  assert.match(
+    exhausted.output,
+    new RegExp(`was left after setting the session up`),
+    'an action with no time left to run in should say that, not fail obscurely',
+  );
+  assert.match(
+    exhausted.output,
+    new RegExp(`${EXHAUSTED_BUDGET_MS}ms`),
+    'the budget it ran out of should be in the message',
   );
 
   assert.match(isolatedText(session, { action: 'close' }), /Browser session closed/);

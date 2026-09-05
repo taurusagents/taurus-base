@@ -108,6 +108,14 @@ const CLOSE_TARGET_TIMEOUT_MS = 5_000;
 // stuck, or that something outside this helper holds the lock file; saying so
 // beats waiting for a caller to give up on a silent process.
 const LOCK_ACQUIRE_TIMEOUT_MS = 30_000;
+// Releasing is a formality — closing the child's input ends it — but it sits in
+// the same cleanup paths as the waits above and must not outlive them either.
+const LOCK_RELEASE_TIMEOUT_MS = 5_000;
+// What the action leaves behind for itself: closing the page it abandoned,
+// taking the lock again to release its lease, and dropping the connection.
+const ACTION_CLEANUP_RESERVE_MS = 20_000;
+// Less budget than this left for the action is not worth starting it with.
+const MIN_ACTION_TIMEOUT_MS = 10_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
 const SESSION_KEY_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
 const INVALID_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -378,23 +386,28 @@ const MAX_BROWSER_SESSIONS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_MAX_SESSIONS',
   DEFAULT_BROWSER_MAX_SESSIONS,
 );
-// Ceiling for one page action. Most of what an action does already carries its
-// own timeout — navigation, clicks, fills, screenshots — but several steps have
-// none to give: `evaluate` accepts no timeout option at all, and mouse and
-// keyboard input is dispatched to the page without one.
-//
-// Two things set this number. It has to clear MAX_WAIT_MS, the longest an
-// action can legitimately be asked to take, with room for the work around it.
-// And it has to fire before whatever timeout the caller puts on this process as
-// a whole — Taurus allows two minutes, counted from spawn rather than from the
-// moment the action starts — because if the caller kills the helper first, the
-// recovery that follows a deadline never runs at all. Session setup takes under
-// a second on a warm browser and under four on a cold one, and is capped near
-// twenty by its own timeouts, so seventy leaves the deadline comfortably first.
-const DEFAULT_ACTION_TIMEOUT_MS = 70_000;
-const ACTION_TIMEOUT_MS = readPositiveIntegerEnv(
+// How long this whole process is allowed to take. Taurus starts counting when
+// it writes the command, not when this process gets going, and when it expires
+// it interrupts the job and retires the agent's whole shell session — so
+// overrunning costs the agent far more than the Browser call it was making.
+// Every wait below that could last tens of seconds is measured against what is
+// left of this, so the total cannot grow past it however slow any one step is.
+const DEFAULT_PROCESS_BUDGET_MS = 120_000;
+const PROCESS_BUDGET_MS = readPositiveIntegerEnv(
+  'TAURUS_BROWSER_PROCESS_BUDGET_MS',
+  DEFAULT_PROCESS_BUDGET_MS,
+);
+// Close enough to when the caller started counting: the shell it wrote the
+// command to spawns this process straight away.
+const PROCESS_STARTED_AT_MS = Date.now();
+// The most an action is ever given, however much budget happens to be spare.
+// Nothing legitimately needs more: a `wait` is the longest an action can be
+// asked to take and everything else is interactive, so waiting longer than this
+// only delays telling the agent that its page is not coming back.
+const DEFAULT_MAX_ACTION_TIMEOUT_MS = MAX_WAIT_MS + 10_000;
+const MAX_ACTION_TIMEOUT_MS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_ACTION_TIMEOUT_MS',
-  DEFAULT_ACTION_TIMEOUT_MS,
+  DEFAULT_MAX_ACTION_TIMEOUT_MS,
 );
 
 function signalBrowserProcess(signalArgs) {
@@ -518,6 +531,27 @@ function isBrowserAttachBlockedError(err) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** What is left of the time the caller is prepared to wait for this process. */
+function remainingBudgetMs() {
+  return PROCESS_BUDGET_MS - (Date.now() - PROCESS_STARTED_AT_MS);
+}
+
+/**
+ * How much of the process budget is left for the page action itself, once
+ * setting the session up has taken its share and the cleanup after a timeout
+ * has been set aside.
+ *
+ * Derived rather than fixed, because the steps before the action can add up to
+ * more than the whole budget on their own — waiting for the lock, connecting to
+ * a cold browser, sweeping idle sessions and preparing the page are each bounded
+ * in tens of seconds. A constant deadline was fine whenever setup was quick and
+ * ran past the caller's patience whenever it was not, which is precisely when
+ * the cleanup after the deadline matters most.
+ */
+function actionBudgetMs() {
+  return remainingBudgetMs() - ACTION_CLEANUP_RESERVE_MS;
 }
 
 /**
@@ -1416,6 +1450,9 @@ function getSessionViewport(session) {
 
 async function acquireBrowserActionLock() {
   const readyToken = `__taurus_browser_lock_ready_${randomUUID()}__`;
+  // Never wait past the point where the caller gives up on this process: a lock
+  // taken with no time left to use it is worse than failing to take it.
+  const waitMs = Math.min(LOCK_ACQUIRE_TIMEOUT_MS, remainingBudgetMs());
   const child = spawn('flock', [
     '-x',
     BROWSER_ACTION_LOCK,
@@ -1435,11 +1472,15 @@ async function acquireBrowserActionLock() {
     // finishes — or an unrelated process holding the same file — would leave
     // every Browser call in the container waiting with no output.
     const waitDeadline = setTimeout(() => {
-      // Kill the queued `flock` child: left alive it could take the lock later,
-      // with nobody here to release it.
+      // Kill the queued `flock` child so it cannot take the lock later with
+      // nobody here to release it. If it was still queued this is enough. If it
+      // took the lock in the moment before this fired, `flock` has already
+      // handed the descriptor to children this cannot see, and the lock is held
+      // until they notice their input has gone — which happens when this
+      // process exits.
       child.kill('SIGKILL');
-      reject(new Error(`Could not acquire the browser action lock within ${LOCK_ACQUIRE_TIMEOUT_MS}ms. Another Browser call, or another process holding ${BROWSER_ACTION_LOCK}, has not released it.`));
-    }, LOCK_ACQUIRE_TIMEOUT_MS);
+      reject(new Error(`Could not acquire the browser action lock within ${waitMs}ms. Another Browser call, or another process holding ${BROWSER_ACTION_LOCK}, has not released it.`));
+    }, waitMs);
 
     const onExit = (code, signal) => {
       clearTimeout(waitDeadline);
@@ -1470,9 +1511,9 @@ async function acquireBrowserActionLock() {
         async release() {
           if (child.killed || child.exitCode !== null) return;
           child.stdin.end();
-          await new Promise(resolveRelease => {
+          await withTimeout(new Promise(resolveRelease => {
             child.once('exit', () => resolveRelease());
-          });
+          }), LOCK_RELEASE_TIMEOUT_MS).catch(() => {});
         },
       });
     });
@@ -2246,13 +2287,17 @@ async function handleSessionAction(input, sessionRequest) {
 
   let viewportAfter = null;
   try {
+    const actionBudget = actionBudgetMs();
+    if (actionBudget < MIN_ACTION_TIMEOUT_MS) {
+      throw new Error(`Only ${Math.max(0, remainingBudgetMs())}ms of this Browser call's ${PROCESS_BUDGET_MS}ms was left after setting the session up, and ${ACTION_CLEANUP_RESERVE_MS}ms of that is held back to close the page and tidy up afterwards. The browser is warm now, so trying again should be quick.`);
+    }
     return await withTimeout(
       performActionOnPage(input, page, {
         async onViewportChanged(viewport) {
           viewportAfter = viewport;
         },
       }),
-      ACTION_TIMEOUT_MS,
+      Math.min(MAX_ACTION_TIMEOUT_MS, actionBudget),
       `Browser action "${input.action}"`,
     );
   } catch (err) {
@@ -2272,22 +2317,28 @@ async function handleSessionAction(input, sessionRequest) {
     }
     throw err;
   } finally {
-    const finalizeLock = await acquireBrowserActionLock();
+    // Everything from here is bookkeeping; the answer, if there is one, already
+    // exists. If the lock cannot be taken in what is left of the budget, that is
+    // not worth failing a call that worked over: the lease it would have removed
+    // is pruned by the next call that finds this process gone.
+    const finalizeLock = await acquireBrowserActionLock().catch(() => null);
     try {
-      const finalizeState = loadState();
-      pruneDeadSessionLeases(finalizeState);
-      const currentSession = finalizeState.sessions[sessionRequest.sessionKey];
-      if (currentSession) {
-        removeSessionLease(currentSession, lease.leaseId);
-        currentSession.lastSeenAt = nowIso();
-        if (viewportAfter) {
-          currentSession.viewport = viewportAfter;
+      if (finalizeLock) {
+        const finalizeState = loadState();
+        pruneDeadSessionLeases(finalizeState);
+        const currentSession = finalizeState.sessions[sessionRequest.sessionKey];
+        if (currentSession) {
+          removeSessionLease(currentSession, lease.leaseId);
+          currentSession.lastSeenAt = nowIso();
+          if (viewportAfter) {
+            currentSession.viewport = viewportAfter;
+          }
         }
+        saveState(finalizeState);
       }
-      saveState(finalizeState);
     } finally {
       await closeConnection(browser, rootCdp);
-      await finalizeLock.release();
+      await finalizeLock?.release();
     }
   }
 }
