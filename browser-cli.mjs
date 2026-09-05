@@ -2441,6 +2441,12 @@ async function handleSessionAction(input, sessionRequest) {
         }
         saveState(finalizeState);
       }
+    } catch {
+      // Reading or writing the session record can fail as readily as taking the
+      // lock for it, and it is the same bookkeeping either way. What is lost is
+      // a lease the next call prunes anyway, and a viewport a resize had just
+      // set, which the next call will put back to the recorded one. Neither is
+      // worth failing a call that has already produced its answer.
     } finally {
       await closeConnection(browser, rootCdp);
       await finalizeLock?.release();
