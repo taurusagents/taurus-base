@@ -1053,9 +1053,9 @@ async function runAbandonedActionRecoverySmoke(origin) {
   assert.match(isolatedText(smokeSessionKey('budget-deadline'), { action: 'close' }), /Browser session closed/);
 }
 
-// Long enough for another helper call to be made and answered before the first
-// armed page stops responding, which the escalation case below needs.
-const SPIN_ARMING_DELAY_MS = 3_000;
+// Covers the remaining work of one probe process: a couple of evaluations over
+// a connection it has already made, and dropping that connection.
+const SPIN_ARMING_DELAY_MS = 1_000;
 
 /**
  * Makes a page stop responding to anything, from a call of its own rather than
@@ -1079,6 +1079,44 @@ function armSpinningRenderer(sessionKey, delayMs) {
     }),
     'armed',
     `could not arm the spinning renderer for ${sessionKey}`,
+  );
+}
+
+/**
+ * Arms every page showing `url`, through one connection made once.
+ *
+ * The escalation case below needs two pages spinning at the same time, and it
+ * cannot arm them with two Browser calls: the moment the first one stops
+ * responding, the browser refuses to attach and the second call cannot be made.
+ * Arming them one after another over a connection that is already open takes a
+ * round trip each, so the delay they share only has to outlast that rather than
+ * a whole helper process spawning, taking the session lock, attaching and
+ * preparing a page.
+ */
+function armSpinningRenderersOnPages(url, expectedPages, delayMs) {
+  const probe = spawnSync('node', ['-e', `
+    (async () => {
+      const { createRequire } = require('module');
+      const requireFromGlobal = createRequire('/usr/lib/node_modules/');
+      const { chromium } = requireFromGlobal('playwright');
+      const browser = await chromium.connectOverCDP('http://127.0.0.1:9222', { timeout: 5000 });
+      let armed = 0;
+      for (const context of browser.contexts()) {
+        for (const page of context.pages()) {
+          if (page.url() !== ${JSON.stringify(url)}) continue;
+          await page.evaluate(delay => { setTimeout(() => { while (true) {} }, delay); }, ${delayMs});
+          armed += 1;
+        }
+      }
+      await browser.close().catch(() => {});
+      console.log(String(armed));
+    })().catch(error => console.log('failed:' + error.message));
+  `], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  assertChildCompleted('spinning renderer arming', probe, PROBE_TIMEOUT_MS);
+  assert.equal(
+    (probe.stdout || '').trim(),
+    String(expectedPages),
+    `expected to arm ${expectedPages} pages showing ${url}: ${probe.stdout || probe.stderr}`,
   );
 }
 
@@ -1145,10 +1183,7 @@ function runHostilePageEscalationSmoke(origin) {
   assert.match(isolatedText(survivingSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
   assert.match(isolatedText(closeeSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
   assert.match(isolatedText(hiddenSession, { action: 'open', url: `${origin}/wedge-slow` }), /wedge slow page/);
-  // Both pages are armed before either stops responding, because once one has,
-  // the browser refuses to attach and the second call could not be made at all.
-  armSpinningRenderer(closeeSession, SPIN_ARMING_DELAY_MS);
-  armSpinningRenderer(hiddenSession, SPIN_ARMING_DELAY_MS);
+  armSpinningRenderersOnPages(`${origin}/wedge-slow`, 2, SPIN_ARMING_DELAY_MS);
   deletePersistedSessionRecord(hiddenSession);
   waitForPageTargets(
     urls => urls.filter(url => url === `${origin}/wedge-slow`).length >= 2,
