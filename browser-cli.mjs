@@ -104,6 +104,16 @@ const ACTION_TIMEOUT_MS = MAX_WAIT_MS + 60_000;
 // action was abandoned at its deadline, and the abandoned call still holds that
 // connection. Bounded so teardown cannot inherit the hang it is cleaning up.
 const CONNECTION_CLOSE_TIMEOUT_MS = 5_000;
+// Destroying a browser context is asked of the browser process, not of the page
+// being destroyed, so it answers even when that page is unresponsive — unless
+// the browser process itself is the problem, which is exactly the situation the
+// callers below are trying to recover from.
+const DISPOSE_CONTEXT_TIMEOUT_MS = 5_000;
+// The action lock is only ever held across session setup or session finalising,
+// both of which are bounded well inside this. Waiting longer means the holder is
+// stuck, or that something outside this helper holds the lock file; saying so
+// beats waiting for a caller to give up on a silent process.
+const LOCK_ACQUIRE_TIMEOUT_MS = 30_000;
 const VALID_MOUSE_BUTTONS = new Set(['left', 'right', 'middle']);
 const SESSION_KEY_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
 const INVALID_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -1403,7 +1413,18 @@ async function acquireBrowserActionLock() {
     let stderr = '';
     let stdout = '';
 
+    // Nothing releases the lock on this helper's behalf, so a holder that never
+    // finishes — or an unrelated process holding the same file — would leave
+    // every Browser call in the container waiting with no output.
+    const waitDeadline = setTimeout(() => {
+      // Kill the queued `flock` child: left alive it could take the lock later,
+      // with nobody here to release it.
+      child.kill('SIGKILL');
+      reject(new Error(`Could not acquire the browser action lock within ${LOCK_ACQUIRE_TIMEOUT_MS}ms. Another Browser call, or another process holding ${BROWSER_ACTION_LOCK}, has not released it.`));
+    }, LOCK_ACQUIRE_TIMEOUT_MS);
+
     const onExit = (code, signal) => {
+      clearTimeout(waitDeadline);
       if (!ready) {
         reject(new Error(`Could not acquire the browser action lock (code ${code ?? 'null'}, signal ${signal ?? 'none'}): ${stderr.trim() || 'no error output'}`));
       }
@@ -1411,6 +1432,7 @@ async function acquireBrowserActionLock() {
 
     child.once('exit', onExit);
     child.once('error', err => {
+      clearTimeout(waitDeadline);
       if (!ready) {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -1424,6 +1446,7 @@ async function acquireBrowserActionLock() {
       stdout += chunk;
       if (ready || !stdout.includes(readyToken)) return;
       ready = true;
+      clearTimeout(waitDeadline);
       child.removeListener('exit', onExit);
       resolve({
         async release() {
@@ -1688,10 +1711,23 @@ async function primeIsolatedPage(page, session, sessionKey) {
   session.viewport = viewport;
 }
 
+/**
+ * Destroys a browser context and everything running inside it, including pages
+ * that have stopped answering: the request goes to the browser process, not to
+ * the page. Every caller reaches this while cleaning up, so a browser that has
+ * stopped answering entirely must not turn cleanup into the next thing to hang.
+ */
+async function disposeBrowserContext(rootCdp, browserContextId) {
+  await withTimeout(
+    rootCdp.send('Target.disposeBrowserContext', { browserContextId }),
+    DISPOSE_CONTEXT_TIMEOUT_MS,
+  ).catch(() => {});
+}
+
 async function disposeSession(rootCdp, state, sessionKey) {
   const session = state.sessions[sessionKey];
   if (!session) return false;
-  await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+  await disposeBrowserContext(rootCdp, session.browserContextId);
   delete state.sessions[sessionKey];
   return true;
 }
@@ -2022,7 +2058,7 @@ async function recoverUnavailableBrowserForClose(state, sessionKey) {
       let rootCdp = null;
       try {
         ({ browser, rootCdp } = await connectToBrowser(cdpUrl, ATTACH_RECOVERY_TIMEOUT_MS));
-        await rootCdp.send('Target.disposeBrowserContext', { browserContextId: session.browserContextId }).catch(() => {});
+        await disposeBrowserContext(rootCdp, session.browserContextId);
       } catch {
         continue;
       } finally {
