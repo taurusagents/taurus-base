@@ -100,8 +100,8 @@ const CONNECTION_CLOSE_TIMEOUT_MS = 5_000;
 // the browser process itself is the problem, which is exactly the situation the
 // callers below are trying to recover from.
 const DISPOSE_CONTEXT_TIMEOUT_MS = 5_000;
-// Closing a single page is asked of the browser process too, for the same
-// reason, and is bounded for the same reason.
+// Closing pages is asked of the browser process too, for the same reason, and is
+// bounded for the same reason. One bound covers a whole context's worth.
 const CLOSE_TARGET_TIMEOUT_MS = 5_000;
 // The action lock is only ever held across session setup or session finalising,
 // both of which are bounded well inside this. Waiting longer means the holder is
@@ -375,6 +375,11 @@ const BROWSER_PROTOCOL_VERSION = 2;
 const STATE_SCHEMA_VERSION = 2;
 const BROWSER_ACTION_LOCK = '/tmp/.browser-cli.action.lock';
 const DEFAULT_SHARED_SESSION_KEY = 'default';
+// Stands in for the page id of a session whose pages were given up on. It has to
+// be a string a real target id can never be, and one an operator reading the
+// state file can make sense of. Anything that looks for this page finds nothing
+// and opens a fresh one in the session's existing context.
+const RETIRED_TARGET_ID = 'retired-after-abandoned-action';
 const DEFAULT_SESSION_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
 const DEFAULT_BROWSER_MAX_SESSIONS = 8;
 const MAX_SESSION_LEASE_AGE_MS = 10 * 60 * 1_000;
@@ -1862,16 +1867,26 @@ async function disposeBrowserContext(rootCdp, browserContextId) {
 }
 
 /**
- * Closes one page and leaves the browser context it lived in alone, so the
- * session keeps its cookies and its local storage. The browser process closes
- * the page on its own authority, so this works on a page that has stopped
- * answering, and on one whose unload handler asks to stay.
+ * Closes every page a browser context is holding and leaves the context itself
+ * alone, so the session keeps its cookies and its local storage. The browser
+ * process closes a page on its own authority, so this works on one that has
+ * stopped answering, and on one whose unload handler asks to stay.
+ *
+ * Every page, not just the one an action was driving: an action can open more
+ * before it is abandoned, and one page left spinning anywhere makes Chromium
+ * refuse to attach for every session in the container, not only this one.
+ *
+ * One bound covers the whole sweep, so a context holding many pages cannot take
+ * proportionally longer over it.
  */
-async function closePageTarget(rootCdp, targetId) {
-  await withTimeout(
-    rootCdp.send('Target.closeTarget', { targetId }),
-    CLOSE_TARGET_TIMEOUT_MS,
-  ).catch(() => {});
+async function closeContextPageTargets(rootCdp, browserContextId) {
+  await withTimeout((async () => {
+    const { targetInfos } = await rootCdp.send('Target.getTargets');
+    for (const target of targetInfos) {
+      if (target.type !== 'page' || target.browserContextId !== browserContextId) continue;
+      await rootCdp.send('Target.closeTarget', { targetId: target.targetId });
+    }
+  })(), CLOSE_TARGET_TIMEOUT_MS).catch(() => {});
 }
 
 async function disposeSession(rootCdp, state, sessionKey) {
@@ -2364,6 +2379,7 @@ async function handleSessionAction(input, sessionRequest) {
   }
 
   let viewportAfter = null;
+  let actionAbandoned = false;
   try {
     const actionBudget = actionBudgetMs();
     if (actionBudget < MIN_ACTION_TIMEOUT_MS) {
@@ -2380,18 +2396,19 @@ async function handleSessionAction(input, sessionRequest) {
     );
   } catch (err) {
     if (err?.timedOut === true) {
+      actionAbandoned = true;
       // The deadline gave up on the call; it did not cancel it. Whatever the
-      // page was doing is still running, and handing that page to the next call
-      // would let it inherit an unfinished action's side effects, or wait behind
-      // a page that never became responsive again. Closing the page ends both,
-      // and leaves the session's browser context — its cookies, its storage,
-      // whatever it is signed into — untouched. The next call finds no page for
-      // this session and opens a new one in the same context.
+      // pages were doing is still running, and handing one back to the next
+      // call would let it inherit an unfinished action's side effects, or wait
+      // behind a page that never became responsive again. Closing them ends
+      // both, and leaves the session's browser context — its cookies, its
+      // storage, whatever it is signed into — untouched. The next call finds no
+      // page for this session and opens a new one in the same context.
       //
       // Done here rather than under the lock below: closing a page changes no
-      // shared state, and if the lock could not be taken the page would never
+      // shared state, and if the lock could not be taken the pages would never
       // be closed at all.
-      await closePageTarget(rootCdp, session.targetId);
+      await closeContextPageTargets(rootCdp, session.browserContextId);
     }
     throw err;
   } finally {
@@ -2410,6 +2427,16 @@ async function handleSessionAction(input, sessionRequest) {
           currentSession.lastSeenAt = nowIso();
           if (viewportAfter) {
             currentSession.viewport = viewportAfter;
+          }
+          if (actionAbandoned) {
+            // Stop the record naming a page this call gave up on, whether or not
+            // closing it worked. A close can fail, or time out with the page
+            // still alive, and the next call would otherwise find that page by
+            // id and carry on inside it. If this write is lost too — the lock
+            // above is best-effort — the old id stays and that reuse becomes
+            // possible again: having closed the pages first is what makes it
+            // unlikely, not what makes it impossible.
+            currentSession.targetId = RETIRED_TARGET_ID;
           }
         }
         saveState(finalizeState);
