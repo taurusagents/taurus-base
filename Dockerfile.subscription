@@ -158,7 +158,6 @@ RUN chmod 0755 /usr/bin/codex \
     && /usr/bin/codex --version | tee /tmp/codex-version \
     && grep -F '0.149.1' /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
-    && mkdir -p /usr/local/lib/taurus-subscription \
     && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
     && rm -f /tmp/codex-app-server-smoke.mjs /tmp/codex-local-compaction.patch
 

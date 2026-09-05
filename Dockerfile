@@ -104,8 +104,9 @@ RUN mkdir -p /etc/apt/keyrings \
 # network fetch the first time pnpm is used. The trailing hash is part of the
 # version string Corepack accepts: it hashes the downloaded tarball and refuses
 # to install anything that does not match, instead of trusting whatever the
-# registry serves for that version number. This is the same string Taurus
-# projects pin, so a container's pnpm and its projects' pnpm are the same bytes.
+# registry serves for that version number. A project that pins the same string
+# in its own manifest therefore gets these exact bytes rather than a second
+# download; one that pins a different version still fetches that version.
     && corepack enable pnpm --install-directory /usr/bin \
     && corepack prepare pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e --activate
 
