@@ -100,8 +100,8 @@ const CONNECTION_CLOSE_TIMEOUT_MS = 5_000;
 // the browser process itself is the problem, which is exactly the situation the
 // callers below are trying to recover from.
 const DISPOSE_CONTEXT_TIMEOUT_MS = 5_000;
-// Closing pages is asked of the browser process too, for the same reason, and is
-// bounded for the same reason. One bound covers a whole context's worth.
+// Closing a single page is asked of the browser process too, for the same
+// reason, and is bounded for the same reason.
 const CLOSE_TARGET_TIMEOUT_MS = 5_000;
 // The action lock is only ever held across setting a session up or finalising
 // one, and neither is anywhere near this long in ordinary use. Waiting longer
@@ -378,11 +378,6 @@ const BROWSER_PROTOCOL_VERSION = 2;
 const STATE_SCHEMA_VERSION = 2;
 const BROWSER_ACTION_LOCK = '/tmp/.browser-cli.action.lock';
 const DEFAULT_SHARED_SESSION_KEY = 'default';
-// Stands in for the page id of a session whose pages were given up on. It has to
-// be a string a real target id can never be, and one an operator reading the
-// state file can make sense of. Anything that looks for this page finds nothing
-// and opens a fresh one in the session's existing context.
-const RETIRED_TARGET_ID = 'retired-after-abandoned-action';
 const DEFAULT_SESSION_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
 const DEFAULT_BROWSER_MAX_SESSIONS = 8;
 const MAX_SESSION_LEASE_AGE_MS = 10 * 60 * 1_000;
@@ -399,28 +394,22 @@ const MAX_BROWSER_SESSIONS = readPositiveIntegerEnv(
 // it interrupts the job and retires the agent's whole shell session — so
 // overrunning costs the agent far more than the Browser call it was making.
 //
-// The watchdog below is what keeps the process inside this. The individual
-// waits measured against what is left of it are not a guarantee on their own,
-// and were never going to be: there are dozens of them, some are in Playwright
-// rather than here, and a `wait` action's own timer runs in this process where
-// abandoning the promise does not stop it. What clamping the big ones buys is
-// that the ordinary path — answer, close the abandoned page, exit — usually
-// finishes on its own, so the watchdog stays the last resort it should be.
-// Overriding either setting upwards puts the process back outside what the
-// caller will wait for; nothing here can stop that, and nothing tries to.
+// Nothing here bounds the process by it. The waits below that are measured
+// against what is left of it are the big, obvious ones, and there are many more
+// that are not: some belong to Playwright, and a `wait` action's own timer runs
+// in this process, where abandoning its promise does not stop it. What the
+// clamps buy is that a call whose page has stopped answering usually reports and
+// closes that page before the caller loses patience, rather than being killed
+// mid-action. A call that overruns anyway is still killed, and raising either
+// setting makes that likelier.
 const DEFAULT_PROCESS_BUDGET_MS = 120_000;
 const PROCESS_BUDGET_MS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_PROCESS_BUDGET_MS',
   DEFAULT_PROCESS_BUDGET_MS,
 );
-// The caller's clock started before this: it writes a shell command, and this
-// file only runs once Node and Playwright have loaded, about a quarter of a
-// second later. The watchdog margin covers that difference and the time it
-// takes to write an answer out.
+// A quarter of a second after the caller started counting: it writes a shell
+// command, and this file only runs once Node and Playwright have loaded.
 const PROCESS_STARTED_AT_MS = Date.now();
-const WATCHDOG_MARGIN_MS = 5_000;
-// If the answer cannot reach the pipe in this long, nobody is reading it.
-const WATCHDOG_FLUSH_GRACE_MS = 2_000;
 // The most an action is ever given, however much budget happens to be spare.
 // Nothing legitimately needs more: a `wait` is the longest an action can be
 // asked to take and everything else is interactive, so waiting longer than this
@@ -573,72 +562,6 @@ function remainingBudgetMs() {
  */
 function actionBudgetMs() {
   return remainingBudgetMs() - ACTION_CLEANUP_RESERVE_MS;
-}
-
-/**
- * `cap`, or less if the budget is nearly gone. A wait that would still be going
- * when the watchdog steps in cannot produce anything the caller will see, and a
- * wait that ends first can say what it was waiting for.
- */
-function budgetedWaitMs(cap) {
-  return Math.min(cap, remainingBudgetMs() - WATCHDOG_MARGIN_MS);
-}
-
-let answering = false;
-
-/**
- * Writes this call's answer and stops.
- *
- * Stopping is the point. The caller does not have its answer when this process
- * writes one; it has it when this process exits, and until then its own timeout
- * is still running. Work that outlives the answer — a `wait` action's timer,
- * say, which the action deadline abandons but cannot cancel — would otherwise
- * keep the process alive for as long as it was originally going to take.
- *
- * Exiting can cut short a write to a pipe, and the caller parses this output
- * for a result, so wait for the write to be taken before leaving. If it never
- * is, nobody is reading, and staying would make this the hang it exists to end.
- */
-function writeAndExit(stream, text, exitCode) {
-  answering = true;
-  const leave = () => process.exit(exitCode);
-  const grace = setTimeout(leave, WATCHDOG_FLUSH_GRACE_MS);
-  stream.write(text, () => {
-    clearTimeout(grace);
-    leave();
-  });
-}
-
-/**
- * Answers and exits if this process is still running when the caller is about
- * to give up on it.
- *
- * The caller does not get its answer when this process writes one; it gets it
- * when this process exits. And being killed instead of exiting is not just a
- * lost call — Taurus interrupts the job and retires the agent's whole shell
- * session with it. So a poor answer under our own steam beats a good one that
- * arrives after the process has been killed for taking too long.
- *
- * The timer is unreferenced, so it is never the reason this process is still
- * alive: it fires only when something else is holding the loop open, which is
- * exactly the case it is here for. A `wait` action is the plain example — its
- * timer keeps running after the deadline has abandoned the promise, and no
- * amount of cleanup in Chromium touches it.
- */
-function armProcessWatchdog(input, sessionRequest) {
-  const deadlineMs = Math.max(0, remainingBudgetMs() - WATCHDOG_MARGIN_MS);
-  setTimeout(() => {
-    // An answer already on its way out is the answer; this only had to make
-    // sure the process ends, and writing a second one would leave the caller
-    // two results to choose between.
-    if (answering) return;
-    const message = `This Browser call was still running ${Math.round((Date.now() - PROCESS_STARTED_AT_MS) / 1_000)}s after it started, with ${JSON.stringify(input?.action ?? 'unknown')} outstanding, and was stopped here so it could report instead of being killed for taking too long.`;
-    if (sessionRequest.nonce !== null) {
-      writeAndExit(process.stdout, JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)), 0);
-    } else {
-      writeAndExit(process.stderr, `Browser error: ${message}\n`, 1);
-    }
-  }, deadlineMs).unref();
 }
 
 /**
@@ -1537,8 +1460,9 @@ function getSessionViewport(session) {
 
 async function acquireBrowserActionLock() {
   const readyToken = `__taurus_browser_lock_ready_${randomUUID()}__`;
-  // A lock taken with no time left to use it is worse than failing to take it.
-  const waitMs = budgetedWaitMs(LOCK_ACQUIRE_TIMEOUT_MS);
+  // Never wait past the point where the caller gives up on this process: a lock
+  // taken with no time left to use it is worse than failing to take it.
+  const waitMs = Math.min(LOCK_ACQUIRE_TIMEOUT_MS, remainingBudgetMs());
   const child = spawn('flock', [
     '-x',
     BROWSER_ACTION_LOCK,
@@ -1870,26 +1794,16 @@ async function disposeBrowserContext(rootCdp, browserContextId) {
 }
 
 /**
- * Closes every page a browser context is holding and leaves the context itself
- * alone, so the session keeps its cookies and its local storage. The browser
- * process closes a page on its own authority, so this works on one that has
- * stopped answering, and on one whose unload handler asks to stay.
- *
- * Every page, not just the one an action was driving: an action can open more
- * before it is abandoned, and one page left spinning anywhere makes Chromium
- * refuse to attach for every session in the container, not only this one.
- *
- * One bound covers the whole sweep, so a context holding many pages cannot take
- * proportionally longer over it.
+ * Closes one page and leaves the browser context it lived in alone, so the
+ * session keeps its cookies and its local storage. The browser process closes
+ * the page on its own authority, so this works on a page that has stopped
+ * answering, and on one whose unload handler asks to stay.
  */
-async function closeContextPageTargets(rootCdp, browserContextId) {
-  await withTimeout((async () => {
-    const { targetInfos } = await rootCdp.send('Target.getTargets');
-    for (const target of targetInfos) {
-      if (target.type !== 'page' || target.browserContextId !== browserContextId) continue;
-      await rootCdp.send('Target.closeTarget', { targetId: target.targetId });
-    }
-  })(), CLOSE_TARGET_TIMEOUT_MS).catch(() => {});
+async function closePageTarget(rootCdp, targetId) {
+  await withTimeout(
+    rootCdp.send('Target.closeTarget', { targetId }),
+    CLOSE_TARGET_TIMEOUT_MS,
+  ).catch(() => {});
 }
 
 async function disposeSession(rootCdp, state, sessionKey) {
@@ -2382,7 +2296,6 @@ async function handleSessionAction(input, sessionRequest) {
   }
 
   let viewportAfter = null;
-  let actionAbandoned = false;
   try {
     const actionBudget = actionBudgetMs();
     if (actionBudget < MIN_ACTION_TIMEOUT_MS) {
@@ -2399,19 +2312,18 @@ async function handleSessionAction(input, sessionRequest) {
     );
   } catch (err) {
     if (err?.timedOut === true) {
-      actionAbandoned = true;
       // The deadline gave up on the call; it did not cancel it. Whatever the
-      // pages were doing is still running, and handing one back to the next
-      // call would let it inherit an unfinished action's side effects, or wait
-      // behind a page that never became responsive again. Closing them ends
-      // both, and leaves the session's browser context — its cookies, its
-      // storage, whatever it is signed into — untouched. The next call finds no
-      // page for this session and opens a new one in the same context.
+      // page was doing is still running, and handing that page to the next call
+      // would let it inherit an unfinished action's side effects, or wait behind
+      // a page that never became responsive again. Closing the page ends both,
+      // and leaves the session's browser context — its cookies, its storage,
+      // whatever it is signed into — untouched. The next call finds no page for
+      // this session and opens a new one in the same context.
       //
       // Done here rather than under the lock below: closing a page changes no
-      // shared state, and if the lock could not be taken the pages would never
+      // shared state, and if the lock could not be taken the page would never
       // be closed at all.
-      await closeContextPageTargets(rootCdp, session.browserContextId);
+      await closePageTarget(rootCdp, session.targetId);
     }
     throw err;
   } finally {
@@ -2430,16 +2342,6 @@ async function handleSessionAction(input, sessionRequest) {
           currentSession.lastSeenAt = nowIso();
           if (viewportAfter) {
             currentSession.viewport = viewportAfter;
-          }
-          if (actionAbandoned) {
-            // Stop the record naming a page this call gave up on, whether or not
-            // closing it worked. A close can fail, or time out with the page
-            // still alive, and the next call would otherwise find that page by
-            // id and carry on inside it. If this write is lost too — the lock
-            // above is best-effort — the old id stays and that reuse becomes
-            // possible again: having closed the pages first is what makes it
-            // unlikely, not what makes it impossible.
-            currentSession.targetId = RETIRED_TARGET_ID;
           }
         }
         saveState(finalizeState);
@@ -2517,19 +2419,19 @@ function formatAXNodes(nodes) {
 try {
   const input = JSON.parse(process.argv[2] || '{}');
   const sessionRequest = getSessionRequest(input);
-  armProcessWatchdog(input, sessionRequest);
   if (sessionRequest.nonce !== null) {
     try {
       const result = await handleSessionAction(input, sessionRequest);
-      writeAndExit(process.stdout, renderHelperSuccessOutput(sessionRequest, result), 0);
+      process.stdout.write(renderHelperSuccessOutput(sessionRequest, result));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      writeAndExit(process.stdout, JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)), 0);
+      process.stdout.write(JSON.stringify(buildProtocolErrorEnvelope(sessionRequest.nonce, message)));
     }
   } else {
     const result = await handleSessionAction(input, sessionRequest);
-    writeAndExit(process.stdout, renderHelperSuccessOutput(sessionRequest, result), 0);
+    process.stdout.write(renderHelperSuccessOutput(sessionRequest, result));
   }
 } catch (err) {
-  writeAndExit(process.stderr, `Browser error: ${err instanceof Error ? err.message : String(err)}\n`, 1);
+  process.stderr.write(`Browser error: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.exit(1);
 }

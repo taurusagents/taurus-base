@@ -19,7 +19,6 @@ const SMOKE_SESSION_NAMES = [
   'oversized-output',
   'abandoned-action',
   'abandoned-wedge',
-  'abandoned-popup',
   'budget-deadline',
   'hostile-wedge',
   'hostile-survivor',
@@ -839,9 +838,6 @@ setTimeout(() => { throw new Error("game crash"); }, 10);
 new Image().src = "http://127.0.0.1:9/sprite.png";
 </script>`,
   '/stable': '<!doctype html><title>stable page</title><h1>stable</h1>',
-  // Opened by a page rather than by the helper, so an abandoned action can leave
-  // a second target behind for the cleanup to find.
-  '/popup': '<!doctype html><title>popup page</title><h1>popup</h1>',
   // These two are ordinary pages. What makes them stop responding is asked for
   // afterwards, by armSpinningRenderer, and the two names only say which
   // scenario a page belongs to.
@@ -985,37 +981,6 @@ async function runAbandonedActionRecoverySmoke(origin) {
     'the session whose action was abandoned should come back on a fresh page',
   );
 
-  // An action can open more pages before it is abandoned, and closing only the
-  // one it was driving leaves the others running. A page still spinning anywhere
-  // makes Chromium refuse to attach for every session in the container, so the
-  // cost of missing one is not confined to the session that made it.
-  const popupSession = smokeSessionKey('abandoned-popup');
-  assert.match(isolatedText(popupSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
-  const popupAbandoned = isolatedBrowser(popupSession, {
-    action: 'evaluate',
-    expression: `(() => { const popup = window.open(${JSON.stringify(`${origin}/popup`)}); setTimeout(() => { popup.eval("while (true) {}"); }, ${ABANDONED_ACTION_MUTATION_DELAY_MS}); return new Promise(() => {}); })()`,
-  }, {
-    expectFailure: true,
-    env: { TAURUS_BROWSER_ACTION_TIMEOUT_MS: String(ABANDONED_ACTION_TIMEOUT_MS) },
-  });
-  assert.match(
-    popupAbandoned.output,
-    new RegExp(`Browser action "evaluate" timed out after ${ABANDONED_ACTION_TIMEOUT_MS}ms`),
-  );
-  // Polled, not read once: a page that has stopped responding is still listed
-  // for a moment after the browser has been told to close it, because it cannot
-  // be torn down until its renderer comes back.
-  waitForPageTargets(
-    urls => !urls.includes(`${origin}/popup`),
-    'a page the abandoned action opened must be closed along with the one it was driving',
-  );
-  assert.equal(
-    isolatedText(session, { action: 'evaluate', expression: 'location.pathname' }),
-    '/stable',
-    'a page left behind by an abandoned action must not be able to stop every other session attaching',
-  );
-  assert.match(isolatedText(popupSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
-
   // Setting a session up can consume the time the caller allows for the whole
   // call. Saying so beats starting an action that will be killed part-way
   // through, which costs the agent its shell session rather than just this call.
@@ -1049,7 +1014,6 @@ async function runAbandonedActionRecoverySmoke(origin) {
 
   assert.match(isolatedText(session, { action: 'close' }), /Browser session closed/);
   assert.match(isolatedText(wedgedSession, { action: 'close' }), /Browser session closed/);
-  assert.match(isolatedText(popupSession, { action: 'close' }), /Browser session closed/);
   assert.match(isolatedText(smokeSessionKey('budget-deadline'), { action: 'close' }), /Browser session closed/);
 }
 
