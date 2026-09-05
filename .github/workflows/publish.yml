@@ -74,10 +74,15 @@ jobs:
                 "${{ matrix.smoke_tag }}" bash -lc "
                   python3 --version &&
                   node --version &&
+                  npm --version &&
+                  tsc --version &&
+                  prettier --version &&
+                  eslint --version &&
                   go version &&
                   rg --version &&
                   fd --version &&
                   playwright --version &&
+                  node -e 'const { createRequire } = require(\"node:module\"); const viaNodePath = require(\"playwright\"); const viaGlobalDir = createRequire(\"/usr/lib/node_modules/\")(\"playwright\"); if (typeof viaNodePath.chromium.launch !== \"function\" || typeof viaGlobalDir.chromium.launch !== \"function\") { process.exit(1); } console.log(\"playwright resolves through NODE_PATH and through /usr/lib/node_modules\");' &&
                   dig -v &&
                   /usr/bin/time --version &&
                   ss --version &&
@@ -90,6 +95,7 @@ jobs:
               docker run --rm "${{ matrix.smoke_tag }}" bash -lc "
                 python3 --version &&
                 node --version &&
+                npm --version &&
                 sqlite3 --version &&
                 tmp_db=\$(mktemp /tmp/codex-rollout.XXXXXX.sqlite) &&
                 sqlite3 \"\$tmp_db\" \"CREATE TABLE threads (id TEXT, rollout_path TEXT, updated_at TEXT); INSERT INTO threads (id, rollout_path, updated_at) VALUES ('thread-1', 'sessions/run/rollout.jsonl', '2026-01-01T00:00:00Z');\" &&

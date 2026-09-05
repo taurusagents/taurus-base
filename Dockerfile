@@ -81,19 +81,41 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get update \
     && apt-get install -y --no-install-recommends nodejs=24.15.0-1nodesource1 \
     && rm -rf /var/lib/apt/lists/* \
-# A global npm install pins only the top-level version and re-resolves the whole
-# tree below it on every rebuild. `--min-release-age=3` holds that resolution
-# three days behind the registry, the same cooldown Taurus's pnpm projects use,
-# so a package published moments ago cannot reach this image before anyone has
-# had a chance to notice it. Raising a pinned version to a release younger than
-# the cooldown fails the build until that release ages in. `--ignore-scripts`
-# blocks install hooks, which is how a hostile npm package normally gets to run
-# code; nothing installed here declares one.
-    && npm install -g --ignore-scripts --min-release-age=3 typescript@6.0.3 prettier@3.8.3 eslint@10.4.0 \
 # Ship a pinned pnpm in-image via Corepack so containers do not depend on a
 # network fetch the first time pnpm is used.
     && corepack enable pnpm --install-directory /usr/bin \
     && corepack prepare pnpm@10.33.0 --activate
+
+# ── TypeScript / Prettier / ESLint ──
+# `npm ci` installs exactly the tree recorded in the lockfile, so every version
+# and tarball hash in it — not just the ones named in package.json — is fixed at
+# the moment the lockfile was committed and reviewed. Each set keeps its own
+# directory: a shared one would hoist the trees together, and one set's
+# dependency could then quietly change another's.
+#
+# `--ignore-scripts` blocks install hooks, which is how a hostile npm package
+# normally gets to run code. Nothing in this set declares one.
+#
+# The symlinks put the results back where the rest of the system looks for them:
+# NODE_PATH points at /usr/lib/node_modules and other tools call the binaries by
+# absolute path. Node resolves a symlink to its real location before looking for
+# a package's own dependencies, so each package still finds those inside its own
+# set rather than across sets.
+COPY npm/base-toolchain/package.json npm/base-toolchain/package-lock.json /opt/taurus-npm/base-toolchain/
+RUN npm ci --prefix /opt/taurus-npm/base-toolchain --ignore-scripts \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript /usr/lib/node_modules/typescript \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/prettier /usr/lib/node_modules/prettier \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/eslint /usr/lib/node_modules/eslint \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript/bin/tsc /usr/bin/tsc \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/typescript/bin/tsserver /usr/bin/tsserver \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/prettier/bin/prettier.cjs /usr/bin/prettier \
+    && ln -s /opt/taurus-npm/base-toolchain/node_modules/eslint/bin/eslint.js /usr/bin/eslint \
+    && tsc --version \
+    && prettier --version \
+    && eslint --version \
+# tsserver reads a request stream rather than answering --version, so the most
+# it can be asked at build time is whether the link leads to a runnable file.
+    && test -x /usr/bin/tsserver
 
 # ── Go ──
 RUN curl -fsSL https://go.dev/dl/go1.24.3.linux-$(dpkg --print-architecture).tar.gz \
@@ -130,9 +152,13 @@ RUN useradd -r -m -d /home/taurus-browser -s /usr/sbin/nologin taurus-browser \
 
 # ── Playwright + Chromium ──
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-# Chromium is downloaded by the pinned Playwright CLI on the next line rather
-# than by an install hook, so blocking hooks does not affect it.
-RUN npm install -g --ignore-scripts --min-release-age=3 playwright@1.60.0 \
+# Installed from its own lockfile into its own tree, exactly like the toolchain
+# set above. Chromium itself is downloaded afterwards by the installed Playwright
+# CLI rather than by an install hook, so blocking hooks does not affect it.
+COPY npm/playwright/package.json npm/playwright/package-lock.json /opt/taurus-npm/playwright/
+RUN npm ci --prefix /opt/taurus-npm/playwright --ignore-scripts \
+    && ln -s /opt/taurus-npm/playwright/node_modules/playwright /usr/lib/node_modules/playwright \
+    && ln -s /opt/taurus-npm/playwright/node_modules/playwright/cli.js /usr/bin/playwright \
     && playwright install --with-deps chromium \
     && chmod -R a+rX /ms-playwright
 

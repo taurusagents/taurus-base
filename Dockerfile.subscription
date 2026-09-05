@@ -96,38 +96,53 @@ RUN mkdir -p /etc/apt/keyrings \
     && rm -rf /var/lib/apt/lists/*
 
 COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
-COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
-COPY codex-app-server-smoke.mjs /tmp/codex-app-server-smoke.mjs
-COPY --from=codex-builder /out/codex /usr/bin/codex
-# A global npm install pins only the top-level version and re-resolves the whole
-# tree below it on every rebuild. `--min-release-age=3` holds that resolution
-# three days behind the registry, the same cooldown Taurus's pnpm projects use,
-# so a package published moments ago cannot reach this image before anyone has
-# had a chance to notice it. Raising a pinned version to a release younger than
-# the cooldown fails the build until that release ages in.
+COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/taurus-npm/subscription/
+# `npm ci` installs exactly the tree recorded in the lockfile, so every version
+# and tarball hash in it — not just the two named in package.json — is fixed at
+# the moment the lockfile was committed and reviewed.
+#
+# The two CLI versions are written down twice: once in package.json, which
+# decides what is installed, and once in the runtime manifest below, which is
+# what Taurus and the workflow smoke read back. They are separate files a human
+# edits by hand, so the build compares them first and stops if they have drifted
+# rather than shipping an image whose manifest describes something else.
 #
 # `--ignore-scripts` blocks install hooks, which is how a hostile npm package
 # normally gets to run code. Exactly one hook here is load-bearing: the Claude
 # Code wrapper ships a stub and its postinstall copies the real platform binary
 # over it, so that single reviewed script is run explicitly below. It exits 0
 # even when it finds no binary to place, hence the version check that follows.
-RUN packages=$(node -p "const versions = require('/tmp/subscription-runtime-versions.json'); ['@anthropic-ai/claude-code@' + versions.claudeCode, '@modelcontextprotocol/sdk@' + versions.mcpSdk].join(' ')") \
-    && npm install -g --ignore-scripts --min-release-age=3 ${packages} \
-    && node /usr/lib/node_modules/@anthropic-ai/claude-code/install.cjs \
+#
+# The symlinks put the packages back where the rest of Taurus looks for them:
+# NODE_PATH points at /usr/lib/node_modules, the sidecar wrapper resolves the
+# MCP SDK from that directory, and /usr/bin/claude is called by absolute path.
+# Node resolves a symlink to its real location before looking for a package's
+# own dependencies, so both packages still find theirs inside this tree.
+RUN node -e "const manifest = require('/tmp/subscription-runtime-versions.json'); const pinned = require('/opt/taurus-npm/subscription/package.json').dependencies; for (const [key, name] of [['claudeCode', '@anthropic-ai/claude-code'], ['mcpSdk', '@modelcontextprotocol/sdk']]) { if (manifest[key] !== pinned[name]) { console.error('Version drift: the runtime manifest says ' + key + '=' + manifest[key] + ', but ' + name + ' is pinned at ' + pinned[name]); process.exit(1); } }" \
+    && npm ci --prefix /opt/taurus-npm/subscription --ignore-scripts \
+    && mkdir -p /usr/lib/node_modules/@anthropic-ai /usr/lib/node_modules/@modelcontextprotocol \
+    && ln -s /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code /usr/lib/node_modules/@anthropic-ai/claude-code \
+    && ln -s /opt/taurus-npm/subscription/node_modules/@modelcontextprotocol/sdk /usr/lib/node_modules/@modelcontextprotocol/sdk \
+    && ln -s /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/bin/claude \
+    && node /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code/install.cjs \
     && claude --version \
-    && ln -sf /usr/bin/codex /usr/local/bin/codex \
     && mkdir -p /usr/local/lib/taurus-subscription \
     && cp /tmp/subscription-runtime-versions.json /usr/local/lib/taurus-subscription/runtime-versions.json \
-    && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
-    && rm -f /tmp/subscription-runtime-versions.json /tmp/codex-local-compaction.patch
+    && rm -f /tmp/subscription-runtime-versions.json
 
+COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
+COPY codex-app-server-smoke.mjs /tmp/codex-app-server-smoke.mjs
+COPY --from=codex-builder /out/codex /usr/bin/codex
 # Fail the image build immediately if the patched Codex binary cannot start the
 # same stdio app-server Taurus uses in subscription sidecars.
 RUN chmod 0755 /usr/bin/codex \
+    && ln -sf /usr/bin/codex /usr/local/bin/codex \
     && /usr/bin/codex --version | tee /tmp/codex-version \
     && grep -F '0.149.1' /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
-    && rm -f /tmp/codex-app-server-smoke.mjs
+    && mkdir -p /usr/local/lib/taurus-subscription \
+    && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
+    && rm -f /tmp/codex-app-server-smoke.mjs /tmp/codex-local-compaction.patch
 
 ENV NODE_PATH=/usr/lib/node_modules
 
