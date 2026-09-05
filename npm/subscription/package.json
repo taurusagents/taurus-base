@@ -5,7 +5,7 @@
   "description": "CLI and SDK baked into the Taurus subscription sidecar image.",
   "license": "UNLICENSED",
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.207",
+    "@anthropic-ai/claude-code": "2.1.258",
     "@modelcontextprotocol/sdk": "1.29.0"
   }
 }

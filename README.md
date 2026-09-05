@@ -63,7 +63,7 @@ Taurus expects inside the sidecar:
 
 - Node.js 24
 - Python 3
-- `@anthropic-ai/claude-code@2.1.207`
+- `@anthropic-ai/claude-code@2.1.258`
 - patched source build of `openai/codex` `rust-v0.153.4` (the Taurus fork — see [Codex fork patch](#codex-fork-patch))
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
