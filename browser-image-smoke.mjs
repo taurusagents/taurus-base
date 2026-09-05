@@ -17,6 +17,8 @@ const SMOKE_SESSION_NAMES = [
   'evict-b',
   'evict-c',
   'oversized-output',
+  'abandoned-action',
+  'abandoned-wedge',
   'hostile-wedge',
   'hostile-survivor',
   'hostile-escalation-closee',
@@ -758,6 +760,7 @@ async function runSmoke() {
       runExternalBlankTabSmoke(pageServer.origin);
       runSessionResetSmoke(pageServer.origin);
     }
+    runAbandonedActionRecoverySmoke(pageServer.origin);
     runHostilePageIsolationSmoke(pageServer.origin);
     runHostilePageEscalationSmoke(pageServer.origin);
     await runIsolatedSessionSmoke(pageServer.origin, { closeDefaultSession: defaultSessionOwnedBySmoke });
@@ -837,6 +840,92 @@ new Image().src = "http://127.0.0.1:9/sprite.png";
   '/wedge': '<!doctype html><title>wedge page</title><h1>wedge</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>',
   '/wedge-slow': '<!doctype html><title>wedge slow page</title><h1>wedge slow</h1><script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 1200));</script>',
 };
+
+// The deadline the helper puts on one action, lowered for the case below so it
+// fires in seconds rather than in the minute-plus a real action is allowed.
+const ABANDONED_ACTION_TIMEOUT_MS = 2_000;
+// Scheduled well inside that deadline, so by the time the helper gives up, the
+// page has certainly already made the change the next call must not see.
+const ABANDONED_ACTION_MUTATION_DELAY_MS = 200;
+const ABANDONED_ACTION_MARKER = 'abandoned action kept running';
+
+/**
+ * An action that never settles. The deadline makes the helper give up on the
+ * call, but nothing cancels what the page is doing: it keeps running, and the
+ * session's page is still its page. So the next call on that session has to get
+ * a fresh one. Handing back the old page would let a later call observe an
+ * unfinished action's side effects, and with a renderer that never recovers it
+ * would leave the session broken from then on.
+ */
+function runAbandonedActionRecoverySmoke(origin) {
+  phase('abandoned action recovery');
+  const session = smokeSessionKey('abandoned-action');
+  assert.match(isolatedText(session, { action: 'open', url: `${origin}/stable` }), /stable page/);
+
+  const abandoned = isolatedBrowser(session, {
+    action: 'evaluate',
+    expression: `(() => { setTimeout(() => { document.title = ${JSON.stringify(ABANDONED_ACTION_MARKER)}; }, ${ABANDONED_ACTION_MUTATION_DELAY_MS}); return new Promise(() => {}); })()`,
+  }, {
+    expectFailure: true,
+    env: { TAURUS_BROWSER_ACTION_TIMEOUT_MS: String(ABANDONED_ACTION_TIMEOUT_MS) },
+  });
+  assert.match(
+    abandoned.output,
+    new RegExp(`Browser action "evaluate" timed out after ${ABANDONED_ACTION_TIMEOUT_MS}ms`),
+    'an action that never settles should be reported as the abandoned action it is',
+  );
+
+  const recovered = JSON.parse(isolatedText(session, {
+    action: 'evaluate',
+    expression: 'JSON.stringify({ href: location.href, title: document.title })',
+  }));
+  assert.equal(
+    recovered.title,
+    '',
+    'a later call must not be able to observe what the abandoned action did to its page',
+  );
+  assert.equal(
+    recovered.href,
+    'about:blank',
+    'the session should come back on a fresh page instead of the one the abandoned action still has',
+  );
+
+  // Still a working session, not just a blank one.
+  assert.match(isolatedText(session, { action: 'open', url: `${origin}/stable` }), /stable page/);
+
+  // The same thing where the page will never respond again. Chromium refuses to
+  // attach to the whole browser while any page is spinning its renderer, so an
+  // abandoned action left holding one of those does not just cost this session:
+  // every Browser call in the container fails until someone closes it by hand.
+  const wedgedSession = smokeSessionKey('abandoned-wedge');
+  assert.match(isolatedText(wedgedSession, { action: 'open', url: `${origin}/stable` }), /stable page/);
+  const wedged = isolatedBrowser(wedgedSession, {
+    action: 'evaluate',
+    expression: 'while (true) {}',
+  }, {
+    expectFailure: true,
+    env: { TAURUS_BROWSER_ACTION_TIMEOUT_MS: String(ABANDONED_ACTION_TIMEOUT_MS) },
+  });
+  assert.match(
+    wedged.output,
+    new RegExp(`Browser action "evaluate" timed out after ${ABANDONED_ACTION_TIMEOUT_MS}ms`),
+    'an action against a page that stopped responding should be reported as the abandoned action it is',
+  );
+
+  assert.equal(
+    isolatedText(session, { action: 'evaluate', expression: 'location.pathname' }),
+    '/stable',
+    'abandoning an action must not leave a spinning page behind for every other session to fail against',
+  );
+  assert.equal(
+    isolatedText(wedgedSession, { action: 'evaluate', expression: 'location.href' }),
+    'about:blank',
+    'the session whose action was abandoned should come back on a fresh page',
+  );
+
+  assert.match(isolatedText(session, { action: 'close' }), /Browser session closed/);
+  assert.match(isolatedText(wedgedSession, { action: 'close' }), /Browser session closed/);
+}
 
 function runHostilePageIsolationSmoke(origin) {
   phase('hostile page isolation');

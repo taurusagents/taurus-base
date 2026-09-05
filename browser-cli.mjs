@@ -91,15 +91,6 @@ const FRESH_BROWSER_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_DRAG_STEPS = 10;
 const MAX_DRAG_STEPS = 1_000;
 const MAX_WAIT_MS = 60_000;
-// Ceiling for one page action. Most of what an action does already carries its
-// own timeout — navigation, clicks, fills, screenshots — but several steps have
-// none to give: `evaluate` accepts no timeout option at all, and mouse and
-// keyboard input is dispatched to the page without one. A page that spins its
-// renderer, or an expression that simply never returns, would otherwise keep
-// this helper and whoever is waiting on it alive indefinitely. A `wait` action
-// may legitimately sleep for MAX_WAIT_MS, so the ceiling clears that with room
-// for the page work around it.
-const ACTION_TIMEOUT_MS = MAX_WAIT_MS + 60_000;
 // Dropping a CDP connection is a local operation, but it also happens after an
 // action was abandoned at its deadline, and the abandoned call still holds that
 // connection. Bounded so teardown cannot inherit the hang it is cleaning up.
@@ -384,6 +375,24 @@ const MAX_BROWSER_SESSIONS = readPositiveIntegerEnv(
   'TAURUS_BROWSER_MAX_SESSIONS',
   DEFAULT_BROWSER_MAX_SESSIONS,
 );
+// Ceiling for one page action. Most of what an action does already carries its
+// own timeout — navigation, clicks, fills, screenshots — but several steps have
+// none to give: `evaluate` accepts no timeout option at all, and mouse and
+// keyboard input is dispatched to the page without one.
+//
+// Two things set this number. It has to clear MAX_WAIT_MS, the longest an
+// action can legitimately be asked to take, with room for the work around it.
+// And it has to fire before whatever timeout the caller puts on this process as
+// a whole — Taurus allows two minutes, counted from spawn rather than from the
+// moment the action starts — because if the caller kills the helper first, the
+// recovery that follows a deadline never runs at all. Session setup takes under
+// a second on a warm browser and under four on a cold one, and is capped near
+// twenty by its own timeouts, so seventy leaves the deadline comfortably first.
+const DEFAULT_ACTION_TIMEOUT_MS = 70_000;
+const ACTION_TIMEOUT_MS = readPositiveIntegerEnv(
+  'TAURUS_BROWSER_ACTION_TIMEOUT_MS',
+  DEFAULT_ACTION_TIMEOUT_MS,
+);
 
 function signalBrowserProcess(signalArgs) {
   try {
@@ -513,13 +522,19 @@ function sleep(ms) {
  * that must never turn into a hang; the underlying call is simply abandoned.
  * `description` names the abandoned step, for the callers whose timeout is
  * reported to the agent rather than swallowed.
+ *
+ * The rejection is marked so a caller can tell "we gave up on this" from "this
+ * failed", which are cleaned up differently: an abandoned call is still running.
  */
 function withTimeout(promise, ms, description = null) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
       setTimeout(
-        () => reject(new Error(`${description ? `${description} ` : ''}timed out after ${ms}ms`)),
+        () => reject(Object.assign(
+          new Error(`${description ? `${description} ` : ''}timed out after ${ms}ms`),
+          { timedOut: true },
+        )),
         ms,
       ).unref();
     }),
@@ -2214,6 +2229,7 @@ async function handleSessionAction(input, sessionRequest) {
   }
 
   let viewportAfter = null;
+  let actionAbandoned = false;
   try {
     return await withTimeout(
       performActionOnPage(input, page, {
@@ -2224,6 +2240,9 @@ async function handleSessionAction(input, sessionRequest) {
       ACTION_TIMEOUT_MS,
       `Browser action "${input.action}"`,
     );
+  } catch (err) {
+    actionAbandoned = err?.timedOut === true;
+    throw err;
   } finally {
     const finalizeLock = await acquireBrowserActionLock();
     try {
@@ -2235,6 +2254,15 @@ async function handleSessionAction(input, sessionRequest) {
         currentSession.lastSeenAt = nowIso();
         if (viewportAfter) {
           currentSession.viewport = viewportAfter;
+        }
+        if (actionAbandoned) {
+          // The deadline gave up on the call; it did not cancel it. Whatever the
+          // page was doing is still running, and handing that page to the next
+          // call would let it inherit an unfinished action's side effects, or
+          // wait behind a page that never became responsive again. Destroying
+          // the context ends both. The session itself survives: the next call
+          // rebuilds a page for it, with the viewport it had.
+          await disposeBrowserContext(rootCdp, currentSession.browserContextId);
         }
       }
       saveState(finalizeState);
