@@ -3,8 +3,8 @@
 # Usage: hidden Taurus subscription sidecars use this image instead of the
 # user-visible default agent container image.
 
-ARG CODEX_GIT_REF=rust-v0.149.1
-ARG CODEX_GIT_COMMIT=ff29a44391deccde0aba0f8390337d7f3c319ea4
+ARG CODEX_GIT_REF=rust-v0.153.4
+ARG CODEX_GIT_COMMIT=3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
 ARG CODEX_RUST_VERSION=1.95.0
 ARG CODEX_BUILD_JOBS=1
 
@@ -156,7 +156,7 @@ COPY --from=codex-builder /out/codex /usr/bin/codex
 RUN chmod 0755 /usr/bin/codex \
     && ln -sf /usr/bin/codex /usr/local/bin/codex \
     && /usr/bin/codex --version | tee /tmp/codex-version \
-    && grep -F '0.149.1' /tmp/codex-version \
+    && grep -F '0.153.4' /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
     && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
     && rm -f /tmp/codex-app-server-smoke.mjs /tmp/codex-local-compaction.patch

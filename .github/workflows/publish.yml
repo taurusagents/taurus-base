@@ -119,9 +119,9 @@ jobs:
                 claude --version | tee /tmp/claude-version &&
                 grep -F '2.1.207' /tmp/claude-version &&
                 codex --version | tee /tmp/codex-version &&
-                grep -F '0.149.1' /tmp/codex-version &&
+                grep -F '0.153.4' /tmp/codex-version &&
                 test -f /usr/local/lib/taurus-subscription/runtime-versions.json &&
-                node -e 'const manifest = require(\"/usr/local/lib/taurus-subscription/runtime-versions.json\"); if (manifest.claudeCode !== \"2.1.207\" || manifest.codex !== \"0.149.1\" || manifest.mcpSdk !== \"1.29.0\") { console.error(JSON.stringify(manifest)); process.exit(1); } console.log(JSON.stringify(manifest)); console.log(require.resolve(\"@modelcontextprotocol/sdk/server/index.js\"));'
+                node -e 'const manifest = require(\"/usr/local/lib/taurus-subscription/runtime-versions.json\"); if (manifest.claudeCode !== \"2.1.207\" || manifest.codex !== \"0.153.4\" || manifest.mcpSdk !== \"1.29.0\") { console.error(JSON.stringify(manifest)); process.exit(1); } console.log(JSON.stringify(manifest)); console.log(require.resolve(\"@modelcontextprotocol/sdk/server/index.js\"));'
               "
               ;;
             *)

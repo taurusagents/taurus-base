@@ -1,7 +1,7 @@
 {
   "claudeCode": "2.1.207",
-  "codex": "0.149.1",
-  "codexSourceRef": "openai/codex@ff29a44391deccde0aba0f8390337d7f3c319ea4",
-  "codexVariant": "0.149.1+taurus.local-compaction.3",
+  "codex": "0.153.4",
+  "codexSourceRef": "openai/codex@3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+  "codexVariant": "0.153.4+taurus.local-compaction.4",
   "mcpSdk": "1.29.0"
 }
