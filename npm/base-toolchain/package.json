@@ -1,0 +1,12 @@
+{
+  "name": "taurus-base-toolchain",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Formatter/linter/compiler CLIs baked into the Taurus base image.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "eslint": "10.4.0",
+    "prettier": "3.8.3",
+    "typescript": "6.0.3"
+  }
+}
