@@ -8,6 +8,24 @@ ARG CODEX_GIT_COMMIT=3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
 ARG CODEX_RUST_VERSION=1.95.0
 ARG CODEX_BUILD_JOBS=1
 
+# The Rust build below needs exactly one field out of the runtime manifest: the
+# SHA-256 of the patch it is about to apply. Copying the whole manifest into the
+# builder would tie a cached Rust compile to every edit the manifest ever gets,
+# so bumping an unrelated field — a Claude Code version, say — would throw away
+# an hours-long build for nothing. This stage reduces the manifest to that one
+# field, and the builder depends on the reduction, which changes only when the
+# digest does.
+#
+# jq is what fails closed here: a manifest that cannot be read or cannot be
+# parsed exits non-zero and stops the build before the builder starts. A
+# manifest missing the key parses fine and yields the string "null", which is
+# not a digest and is rejected on the other side.
+FROM ubuntu:22.04 AS codex-patch-digest
+RUN apt-get update && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
+COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
+RUN jq -r '.codexPatchSha256' /tmp/subscription-runtime-versions.json > /codex-patch-sha256
+
 FROM ubuntu:22.04 AS codex-builder
 
 ARG CODEX_GIT_REF
@@ -33,7 +51,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     git \
-    jq \
     libcap-dev \
     libclang-dev \
     libssl-dev \
@@ -41,30 +58,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
-COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
+COPY --from=codex-patch-digest /codex-patch-sha256 /tmp/codex-patch-sha256
 # The manifest's codexVariant names a revision of the patch below, and the rule
 # that the revision moves whenever the patch does was prose only: the patch
 # could be edited with the string left alone and nothing would notice. The
-# manifest also records the patch's SHA-256, and this refuses to build anything
-# else — so the two can only be changed together.
+# manifest also records the patch's SHA-256, and this refuses to compile a patch
+# whose bytes hash to anything else. That is narrower than it sounds and worth
+# stating exactly: it binds the patch to the digest recorded beside it, so an
+# edited patch can no longer ship under a manifest nobody remembered to update.
+# It does not bind either of them to codexVariant — editing the patch and the
+# digest together while leaving the revision number stale builds cleanly, and
+# keeping that string honest stays a matter of discipline.
 #
 # It runs before the toolchain install and the compile because a mismatch here
 # says the inputs are wrong, and finding that out after an hours-long Rust build
-# helps nobody. The cost of copying the manifest in this early is that any edit
-# to it invalidates the cached Rust build on a machine that had one; published
-# builds have no such cache, so this is a local-rebuild cost, paid for failing
-# in seconds instead of hours.
+# helps nobody. Only the digest is copied in, not the manifest it came from, so
+# a manifest edit that leaves the patch alone no longer invalidates a cached
+# Rust build on a machine that had one.
 #
-# Both ways of learning nothing are refused rather than treated as agreement. A
-# manifest that cannot be read or parsed fails jq, and `set -e` stops there. A
-# manifest missing the key parses fine and yields the string "null", so the
-# digest is required to look like one before it is used — otherwise an absent
-# key would be compared as an empty pattern, which is the failure this check
+# Learning nothing is refused rather than treated as agreement. The extracting
+# stage has already failed the build on a manifest it could not read or parse;
+# what reaches here is either a digest or the string "null" that jq prints for
+# an absent key, so the value is required to look like a SHA-256 — 64 lowercase
+# hex characters — before it is used. Without that, an absent or malformed key
+# would be handed to sha256sum as a pattern, which is the failure this check
 # exists to prevent, wearing the check's own clothes.
 RUN set -e; \
-    expected="$(jq -r '.codexPatchSha256' /tmp/subscription-runtime-versions.json)"; \
-    if [ ${#expected} -ne 64 ]; then \
-      echo "The runtime manifest's codexPatchSha256 is not a SHA-256 digest: '$expected'" >&2; \
+    expected="$(cat /tmp/codex-patch-sha256)"; \
+    hex=1; \
+    case "$expected" in *[!0-9a-f]*) hex=0 ;; esac; \
+    if [ "$hex" -ne 1 ] || [ ${#expected} -ne 64 ]; then \
+      echo "The runtime manifest's codexPatchSha256 is not a SHA-256 digest (64 lowercase hex characters): '$expected'" >&2; \
       exit 1; \
     fi; \
     echo "$expected  /tmp/codex-local-compaction.patch" | sha256sum -c -
@@ -186,7 +210,7 @@ RUN node -e "const manifest = require('/tmp/subscription-runtime-versions.json')
     && ln -s /opt/taurus-npm/subscription/node_modules/@modelcontextprotocol/sdk /usr/lib/node_modules/@modelcontextprotocol/sdk \
     && ln -s /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/bin/claude \
     && node /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code/install.cjs \
-    && timeout 60 claude --version > /tmp/claude-version \
+    && timeout -k 10 60 claude --version > /tmp/claude-version 2>&1 \
     && cat /tmp/claude-version \
     && node /tmp/subscription-cli-version-check.mjs /tmp/subscription-runtime-versions.json claudeCode /tmp/claude-version \
     && rm -f /tmp/claude-version \
@@ -208,12 +232,22 @@ COPY --from=codex-builder /out/codex /usr/bin/codex
 # manifest it cannot read or a key that is not there, and a substitution that
 # produces nothing reads to `grep` as a pattern that matches every line.
 #
-# `timeout` is the answer to the other way a version check goes quiet: a binary
-# that hangs instead of failing would otherwise hold the build until the job's
-# own cap kills it, hours later and without naming the cause.
+# `timeout -k 10 60` is the answer to the other way a version check goes quiet:
+# a binary that hangs instead of failing would otherwise hold the build until
+# the job's own cap kills it, hours later and without naming the cause. The
+# `-k` matters — plain `timeout` sends SIGTERM and then waits indefinitely for a
+# process that ignores it, which is the same hang with extra steps. Both CLI
+# checks are spelled this way for that reason.
+#
+# Both also fold stderr into the captured file. A CLI that prints its banner to
+# stderr would otherwise leave an empty file for the comparison while the real
+# text scrolled past in the build log, where nothing reads it: an empty capture
+# fails the check, but for the wrong reason and with a misleading message. The
+# cost is that any stderr noise is compared too, which can only mask a mismatch
+# if the noise happens to contain the exact version the manifest expects.
 RUN chmod 0755 /usr/bin/codex \
     && ln -sf /usr/bin/codex /usr/local/bin/codex \
-    && timeout 60 /usr/bin/codex --version > /tmp/codex-version \
+    && timeout -k 10 60 /usr/bin/codex --version > /tmp/codex-version 2>&1 \
     && cat /tmp/codex-version \
     && node /tmp/subscription-cli-version-check.mjs /usr/local/lib/taurus-subscription/runtime-versions.json codex /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
