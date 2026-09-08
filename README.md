@@ -75,16 +75,15 @@ serving a runtime it was not written for. An image bump and the matching change
 to those strings therefore belong in the same window; the check exists to make
 the gap between them loud rather than to be relied on as normal.
 
-⚠️ Bumping `@anthropic-ai/claude-code` has four prerequisites. None of them
-runs in any automated suite, so whatever a bump leaves out is simply not checked
-before the image ships.
-
-Nor is it caught afterwards by a cautious rollout, because there isn't one.
-Publishing an image does not deploy it: an operator pins the new tag and
-recreates every container in a single attended window. There is no subset of
-users who meet the new CLI first and no watching phase in which a problem could
-be noticed before it is universal. Whatever the new binary does differently,
-everyone gets it at the same moment.
+⚠️ Bumping `@anthropic-ai/claude-code` has the four prerequisites below. None
+of them runs in any automated suite, so whatever a bump leaves out is simply not
+checked before the image ships — and nothing catches it afterwards either,
+because there is no cautious rollout to catch it in. Publishing an image does
+not deploy it: an operator pins the new tag and recreates every container in a
+single attended window. There is no subset of users who meet the new CLI first,
+and no watching phase in which a problem could be noticed before it is
+universal. Whatever the new binary does differently, everyone gets at the same
+moment.
 
 - Run `tests/staging/cc-session-repair-canary.ts` from the `taurus-agents`
   repository against the new CLI binary, pointed at it via
