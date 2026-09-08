@@ -75,6 +75,15 @@ serving a runtime it was not written for. An image bump and the matching change
 to those strings therefore belong in the same window; the check exists to make
 the gap between them loud rather than to be relied on as normal.
 
+That also fixes the order the two halves land in: this repository goes first.
+The other repository's copy describes a container image, so it is a claim about
+the world rather than a change to it, and it is only true once the image has
+been built and published here, an operator has pinned it, and containers have
+been recreated on it. Landing that copy earlier breaks nothing — every sidecar
+simply disagrees with it, out loud, until the pin moves — but it is worth being
+clear that the pin is the deploy, and that the check reporting a disagreement
+is describing an ordinary intermediate state rather than an incident.
+
 ⚠️ Bumping `@anthropic-ai/claude-code` has the four prerequisites below. None
 of them runs in any automated suite, so whatever a bump leaves out is simply not
 checked before the image ships — and nothing catches it afterwards either,
@@ -82,8 +91,8 @@ because there is no cautious rollout to catch it in. Publishing an image does
 not deploy it: an operator pins the new tag and recreates every container in a
 single attended window. There is no subset of users who meet the new CLI first,
 and no watching phase in which a problem could be noticed before it is
-universal. Whatever the new binary does differently, everyone gets at the same
-moment.
+universal. Whatever the new binary does differently, everyone gets it at the
+same moment.
 
 - Run `tests/staging/cc-session-repair-canary.ts` from the `taurus-agents`
   repository against the new CLI binary, pointed at it via
@@ -124,10 +133,13 @@ Its reach has widened, though: at 2.1.260 the same variable also disables a
 additional effect matters here was not established, and nothing above should be
 read as saying it was.
 
-The fourth item has had no such reading. `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`
-is set at this pin and its effect on 2.1.260 is unverified; it is written down
-as a prerequisite precisely because the bump that made it load-bearing is the
-one that shipped without it being checked.
+The fourth item has had no such reading, and still has none as this image is
+published. `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` is set at this pin and its
+effect on 2.1.260 is unverified; it is written down as a prerequisite precisely
+because the bump that made it load-bearing is the one that shipped without it
+being checked. Read that together with the paragraph above about how this
+deploys: the window that pins this image is the first thing that will exercise
+the variable at all, and it will exercise it on every container at once.
 
 The session-repair canary has one known-failing row. As of the 2026-09-07 run
 for the 2.1.207 → 2.1.260 bump, `snapshot 2b: path-resume tip mirror survives a
