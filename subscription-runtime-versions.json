@@ -3,5 +3,6 @@
   "codex": "0.153.4",
   "codexSourceRef": "openai/codex@3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
   "codexVariant": "0.153.4+taurus.local-compaction.4",
+  "codexPatchSha256": "5d653aa60df7a1f569e3a6e4399b9161cac91673eb443263ef54341ef0aad43e",
   "mcpSdk": "1.29.0"
 }

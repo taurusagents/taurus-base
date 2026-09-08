@@ -131,8 +131,20 @@ without rebuilding the image.
 
 `patches/codex-local-compaction.patch` is applied to the pinned upstream source
 before the build. The resulting binary is identified by `codexVariant` in
-`subscription-runtime-versions.json`; bump that string whenever the patch
-changes. What it does:
+`subscription-runtime-versions.json`, whose trailing revision number names a
+revision of this patch; bump that string whenever the patch changes.
+
+`codexPatchSha256` in the same manifest is what makes that identification true
+rather than merely intended. It is the SHA-256 of the patch file, and the build
+hashes the patch it is about to apply and refuses to compile anything the
+manifest does not name — before the toolchain is installed, so a mismatch is
+reported in seconds instead of after the Rust build. Without it, "bump the
+variant whenever the patch changes" was a rule written down only in this
+paragraph, and prose does not stop anyone editing the patch and leaving the
+string alone. Editing the patch therefore means updating both fields in the same
+commit; `sha256sum patches/codex-local-compaction.patch` gives the new value.
+
+What the patch does:
 
 - **Forces local compaction.** The configured model provider reports remote
   compaction as unsupported. Both sites that dispatch on that capability — a

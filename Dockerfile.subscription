@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     git \
+    jq \
     libcap-dev \
     libclang-dev \
     libssl-dev \
@@ -40,6 +41,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY patches/codex-local-compaction.patch /tmp/codex-local-compaction.patch
+COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
+# The manifest's codexVariant names a revision of the patch below, and the rule
+# that the revision moves whenever the patch does was prose only: the patch
+# could be edited with the string left alone and nothing would notice. The
+# manifest also records the patch's SHA-256, and this refuses to build anything
+# else — so the two can only be changed together.
+#
+# It runs before the toolchain install and the compile because a mismatch here
+# says the inputs are wrong, and finding that out after an hours-long Rust build
+# helps nobody. The cost of copying the manifest in this early is that any edit
+# to it invalidates the cached Rust build on a machine that had one; published
+# builds have no such cache, so this is a local-rebuild cost, paid for failing
+# in seconds instead of hours.
+#
+# Both ways of learning nothing are refused rather than treated as agreement. A
+# manifest that cannot be read or parsed fails jq, and `set -e` stops there. A
+# manifest missing the key parses fine and yields the string "null", so the
+# digest is required to look like one before it is used — otherwise an absent
+# key would be compared as an empty pattern, which is the failure this check
+# exists to prevent, wearing the check's own clothes.
+RUN set -e; \
+    expected="$(jq -r '.codexPatchSha256' /tmp/subscription-runtime-versions.json)"; \
+    if [ ${#expected} -ne 64 ]; then \
+      echo "The runtime manifest's codexPatchSha256 is not a SHA-256 digest: '$expected'" >&2; \
+      exit 1; \
+    fi; \
+    echo "$expected  /tmp/codex-local-compaction.patch" | sha256sum -c -
 # Dependencies are downloaded and compiled in two separate steps so that no
 # third-party code ever runs while the network is reachable. `cargo fetch` only
 # downloads. Every crate build script — arbitrary code, run at compile time —
