@@ -142,6 +142,7 @@ RUN mkdir -p /etc/apt/keyrings \
 
 ARG CODEX_GIT_COMMIT
 COPY subscription-runtime-versions.json /tmp/subscription-runtime-versions.json
+COPY subscription-cli-version-check.mjs /tmp/subscription-cli-version-check.mjs
 COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/taurus-npm/subscription/
 # `npm ci` installs exactly the tree recorded in the lockfile, so every version
 # and tarball hash in it — not just the two named in package.json — is fixed at
@@ -149,7 +150,10 @@ COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/tauru
 #
 # The two CLI versions are written down twice: in package.json, which decides
 # what is installed, and in subscription-runtime-versions.json, the manifest
-# baked into this image for Taurus and the workflow smoke to read back. They are
+# baked into this image. The workflow smoke reads it back, and so does Taurus:
+# when it brings a sidecar up it compares the manifest against the CLI versions
+# the application itself was built for, so a node still on an older image
+# announces itself instead of quietly serving the wrong runtime. They are
 # separate files a human edits by hand, so the build compares them first and
 # stops if they have drifted rather than shipping an image whose manifest
 # describes something other than what is in it.
@@ -165,7 +169,10 @@ COPY npm/subscription/package.json npm/subscription/package-lock.json /opt/tauru
 # normally gets to run code. Exactly one hook here is load-bearing: the Claude
 # Code wrapper ships a stub and its postinstall copies the real platform binary
 # over it, so that single reviewed script is run explicitly below. It exits 0
-# even when it finds no binary to place, hence the version check that follows.
+# even when it finds no binary to place, hence the version check that follows —
+# which compares what the binary reports against the manifest rather than merely
+# proving that something answers, since a stub that runs is exactly the failure
+# being guarded against.
 #
 # The symlinks put the packages back where the rest of Taurus looks for them:
 # NODE_PATH points at /usr/lib/node_modules, the sidecar wrapper resolves the
@@ -179,7 +186,10 @@ RUN node -e "const manifest = require('/tmp/subscription-runtime-versions.json')
     && ln -s /opt/taurus-npm/subscription/node_modules/@modelcontextprotocol/sdk /usr/lib/node_modules/@modelcontextprotocol/sdk \
     && ln -s /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/bin/claude \
     && node /opt/taurus-npm/subscription/node_modules/@anthropic-ai/claude-code/install.cjs \
-    && claude --version \
+    && timeout 60 claude --version > /tmp/claude-version \
+    && cat /tmp/claude-version \
+    && node /tmp/subscription-cli-version-check.mjs /tmp/subscription-runtime-versions.json claudeCode /tmp/claude-version \
+    && rm -f /tmp/claude-version \
     && mkdir -p /usr/local/lib/taurus-subscription \
     && cp /tmp/subscription-runtime-versions.json /usr/local/lib/taurus-subscription/runtime-versions.json \
     && rm -f /tmp/subscription-runtime-versions.json
@@ -190,16 +200,25 @@ COPY --from=codex-builder /out/codex /usr/bin/codex
 # Fail the image build immediately if the patched Codex binary cannot start the
 # same stdio app-server Taurus uses in subscription sidecars.
 #
-# The version the binary must report is read out of the manifest rather than
-# written here as a second copy of the same string, so a bump has one place to
-# change and this check cannot silently pass against a stale literal.
+# Both baked CLIs are checked the same way, by the same script: the version the
+# binary must report is read out of the manifest rather than written here as a
+# second copy of the same string, so a bump has one place to change and neither
+# check can silently pass against a stale literal. The comparison lives in a
+# script instead of a shell one-liner because it has to fail closed on a
+# manifest it cannot read or a key that is not there, and a substitution that
+# produces nothing reads to `grep` as a pattern that matches every line.
+#
+# `timeout` is the answer to the other way a version check goes quiet: a binary
+# that hangs instead of failing would otherwise hold the build until the job's
+# own cap kills it, hours later and without naming the cause.
 RUN chmod 0755 /usr/bin/codex \
     && ln -sf /usr/bin/codex /usr/local/bin/codex \
-    && /usr/bin/codex --version | tee /tmp/codex-version \
-    && grep -F "$(node -p "require('/usr/local/lib/taurus-subscription/runtime-versions.json').codex")" /tmp/codex-version \
+    && timeout 60 /usr/bin/codex --version > /tmp/codex-version \
+    && cat /tmp/codex-version \
+    && node /tmp/subscription-cli-version-check.mjs /usr/local/lib/taurus-subscription/runtime-versions.json codex /tmp/codex-version \
     && CODEX_HOME=/root/.codex-smoke-home node /tmp/codex-app-server-smoke.mjs /usr/bin/codex \
     && cp /tmp/codex-local-compaction.patch /usr/local/lib/taurus-subscription/codex-local-compaction.patch \
-    && rm -f /tmp/codex-app-server-smoke.mjs /tmp/codex-local-compaction.patch
+    && rm -f /tmp/codex-app-server-smoke.mjs /tmp/codex-local-compaction.patch /tmp/codex-version /tmp/subscription-cli-version-check.mjs
 
 ENV NODE_PATH=/usr/lib/node_modules
 
