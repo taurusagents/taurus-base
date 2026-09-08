@@ -75,9 +75,16 @@ serving a runtime it was not written for. An image bump and the matching change
 to those strings therefore belong in the same window; the check exists to make
 the gap between them loud rather than to be relied on as normal.
 
-⚠️ Bumping `@anthropic-ai/claude-code` has three prerequisites. None of them
+⚠️ Bumping `@anthropic-ai/claude-code` has four prerequisites. None of them
 runs in any automated suite, so whatever a bump leaves out is simply not checked
 before the image ships.
+
+Nor is it caught afterwards by a cautious rollout, because there isn't one.
+Publishing an image does not deploy it: an operator pins the new tag and
+recreates every container in a single attended window. There is no subset of
+users who meet the new CLI first and no watching phase in which a problem could
+be noticed before it is universal. Whatever the new binary does differently,
+everyone gets it at the same moment.
 
 - Run `tests/staging/cc-session-repair-canary.ts` from the `taurus-agents`
   repository against the new CLI binary, pointed at it via
@@ -94,9 +101,20 @@ before the image ships.
   never exposes the attachment UX, and nothing observable at runtime reports
   whether the variable is still honoured, so only reading the new binary can
   answer it.
+- Re-verify that `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` still stops the CLI
+  moving a long-running MCP tool call into a background task. Taurus parks a
+  blocking tool by holding its MCP call pending with no traffic at all, for as
+  long as the park lasts; from 2.1.212 the CLI backgrounds such a call after two
+  minutes unless that variable turns the behaviour off. Same shape of problem as
+  the attachment switch — nothing observable at runtime says whether the
+  variable was honoured — with the added edge that the variable was written down
+  while the pin was 2.1.207, which predates the feature entirely, so it has
+  never been read against a binary that has it. Get this wrong and, because
+  every container is recreated in one window, every parked tool call in the
+  fleet breaks simultaneously.
 
-Both canaries carry that re-run requirement in their own headers too. The third
-prerequisite has no such home, which is why it is written down here.
+Both canaries carry that re-run requirement in their own headers too. The last
+two prerequisites have no such home, which is why they are written down here.
 
 What reading the 2.1.260 binary established for that third item: both gates the
 `@path` pipeline passes through are present and structurally identical to the
@@ -106,6 +124,11 @@ Its reach has widened, though: at 2.1.260 the same variable also disables a
 "kept deferred tools" feature it did not previously touch. Whether that
 additional effect matters here was not established, and nothing above should be
 read as saying it was.
+
+The fourth item has had no such reading. `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`
+is set at this pin and its effect on 2.1.260 is unverified; it is written down
+as a prerequisite precisely because the bump that made it load-bearing is the
+one that shipped without it being checked.
 
 The session-repair canary has one known-failing row. As of the 2026-09-07 run
 for the 2.1.207 → 2.1.260 bump, `snapshot 2b: path-resume tip mirror survives a
@@ -147,10 +170,16 @@ the pin, re-verify in the new source that:
    `bundled.enabled` fail-open, so a shape change re-enables bundled skills with
    nothing louder than a stderr warning.
 
-All four were re-verified unchanged at `rust-v0.153.4`. They are pinned from the
-other side as well: a tripwire test in the `taurus-agents` repository asserts the
-Codex version recorded here and fails when it moves, so the obligations are
-re-read rather than remembered.
+All four were re-verified unchanged at `rust-v0.153.4`. The other side records
+the version too, but the two records are joined more loosely than that sounds. A
+test in the `taurus-agents` repository asserts *that repository's own* copy of
+the Codex version and fails when *it* moves, which is what makes the obligations
+above get re-read there; editing the manifest in this repository is not an input
+to it and fails nothing. What relates the two copies at all is a runtime check:
+Taurus reads this manifest out of a running sidecar and reports a disagreement
+with its own constants. That check reports, it does not enforce, and it has
+nothing to say until an operator has pinned the new image and recreated
+containers on it. Both copies still have to be moved by whoever moves either.
 
 The subscription Dockerfile now clones the pinned upstream Codex source,
 applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
@@ -203,15 +232,21 @@ before the build. The resulting binary is identified by `codexVariant` in
 `subscription-runtime-versions.json`, whose trailing revision number names a
 revision of this patch; bump that string whenever the patch changes.
 
-`codexPatchSha256` in the same manifest is what makes that identification true
-rather than merely intended. It is the SHA-256 of the patch file, and the build
-hashes the patch it is about to apply and refuses to compile anything the
+`codexPatchSha256` in the same manifest narrows the ways that identification can
+go wrong, without making it true. It is the SHA-256 of the patch file, and the
+build hashes the patch it is about to apply and refuses to compile anything the
 manifest does not name — before the toolchain is installed, so a mismatch is
-reported in seconds instead of after the Rust build. Without it, "bump the
-variant whenever the patch changes" was a rule written down only in this
-paragraph, and prose does not stop anyone editing the patch and leaving the
-string alone. Editing the patch therefore means updating both fields in the same
-commit; `sha256sum patches/codex-local-compaction.patch` gives the new value.
+reported in seconds instead of after the Rust build.
+
+What that buys is that the patch and its recorded digest can only move together:
+an edited patch cannot ship under an unchanged manifest, so forgetting the
+manifest is no longer something that happens silently. What it does not buy is
+an honest `codexVariant`. Nothing compares that string to the patch, and a
+commit that edits the patch and the digest while leaving the revision number
+alone builds cleanly. Bumping the revision whenever the patch changes remains a
+discipline, and the digest does not enforce it. Editing the patch therefore
+means updating both fields in the same commit;
+`sha256sum patches/codex-local-compaction.patch` gives the new value.
 
 What the patch does:
 
