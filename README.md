@@ -68,20 +68,89 @@ Taurus expects inside the sidecar:
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
 
-⚠️ When bumping `@anthropic-ai/claude-code`, run both of the `taurus-agents`
-repo's operator-run canaries before shipping the image, each pointed at the new
-CLI binary via `CC_CANARY_CLAUDE_BIN`:
+The manifest is not only a record. The `taurus-agents` repository keeps its own
+copy of these version strings, and when Taurus brings a sidecar up it reads the
+manifest out of the container and reports any disagreement instead of quietly
+serving a runtime it was not written for. An image bump and the matching change
+to those strings therefore belong in the same window; the check exists to make
+the gap between them loud rather than to be relied on as normal.
 
-- `tests/staging/cc-session-repair-canary.ts` — Taurus ports the CLI's
-  resume-time session-repair classifier, and this re-verifies every known
-  session-tail shape against the real binary; a silent semantic change there
-  can reintroduce transcript pollution.
-- `tests/staging/claude-session-ownership-canary.ts` — covers the session fork
-  and crash re-entry behaviour Taurus resumes on top of, which is undocumented
-  in the same way and can break independently of the repair classifier.
+⚠️ Bumping `@anthropic-ai/claude-code` has three prerequisites. None of them
+runs in any automated suite, so whatever a bump leaves out is simply not checked
+before the image ships.
 
-Both carry the same version-bump requirement in their own headers, and neither
-runs in any automated suite, so a bump that skips them ships unverified.
+- Run `tests/staging/cc-session-repair-canary.ts` from the `taurus-agents`
+  repository against the new CLI binary, pointed at it via
+  `CC_CANARY_CLAUDE_BIN`. Taurus ports the CLI's resume-time session-repair
+  classifier, and this re-verifies every known session-tail shape against the
+  real binary; a silent semantic change there can reintroduce transcript
+  pollution.
+- Run `tests/staging/claude-session-ownership-canary.ts` from the same
+  repository, the same way. It covers the session fork and crash re-entry
+  behaviour Taurus resumes on top of, which is undocumented in the same way and
+  can break independently of the repair classifier.
+- Re-verify that `CLAUDE_CODE_DISABLE_ATTACHMENTS` still disables the CLI's
+  `@path` file-read pipeline. Taurus sets that variable in every sidecar and
+  never exposes the attachment UX, and nothing observable at runtime reports
+  whether the variable is still honoured, so only reading the new binary can
+  answer it.
+
+Both canaries carry that re-run requirement in their own headers too. The third
+prerequisite has no such home, which is why it is written down here.
+
+What reading the 2.1.260 binary established for that third item: both gates the
+`@path` pipeline passes through are present and structurally identical to the
+ones in 2.1.207, and the variable is now read through a centralised environment
+accessor instead of at each gate — a refactor rather than a behaviour change.
+Its reach has widened, though: at 2.1.260 the same variable also disables a
+"kept deferred tools" feature it did not previously touch. Whether that
+additional effect matters here was not established, and nothing above should be
+read as saying it was.
+
+The session-repair canary has one known-failing row. As of the 2026-09-07 run
+for the 2.1.207 → 2.1.260 bump, `snapshot 2b: path-resume tip mirror survives a
+trailing system child on the live branch` fails — and a baseline run of the same
+canary against 2.1.207 fails the identical row. It is a pre-existing divergence
+between the application's mirror of the CLI's resume-tip selection and the CLI
+itself, not something the bump introduced, and it is tracked separately in the
+`taurus-agents` repository. Every other row passed on both binaries. Exactly
+that one row, by that name, is expected red; any other failing row is a real
+signal, and a red run should be compared against this paragraph rather than
+waved through.
+
+⚠️ Bumping the pinned Codex source carries obligations too, and they are
+quieter than the Claude ones because the config key they rest on fails open.
+Taurus hands Codex a compaction prompt through
+`experimental_compact_prompt_file` in the config it generates for the sidecar.
+That key is experimental: if a later Codex renames or drops it, the line is
+ignored — no validation error, no warning — and every run on this binary falls
+back to Codex's own short built-in summarization prompt instead. Before moving
+the pin, re-verify in the new source that:
+
+1. `experimental_compact_prompt_file` still exists and still reaches local
+   compaction. It is read once while the config loads and folded into the same
+   field an inline `compact_prompt` would set, and both local entry points — a
+   requested compaction and an automatic one — use that field, falling back to
+   the built-in prompt when it is unset.
+2. The rebuild shape that prompt describes to the model still holds: the
+   retained tail is a roughly twenty-thousand-token budget of the most recent
+   user messages, the oldest truncated to fit, and the summary is appended as
+   the final message after that tail.
+3. The summary preamble Codex prepends when it re-inserts a summary
+   (codex-rs `prompts/templates/compact/summary_prefix.md`) still both marks the
+   text as a summary and attributes it to the model itself. Note the preamble
+   this image ships is the fork's reframed wording, not upstream's — see
+   [Codex fork patch](#codex-fork-patch).
+4. The `[skills]` keys the sidecar's generated config pins
+   (`include_instructions`, `bundled.enabled`) still exist and still gate the
+   skills instruction block and bundled-skill loading. Codex parses
+   `bundled.enabled` fail-open, so a shape change re-enables bundled skills with
+   nothing louder than a stderr warning.
+
+All four were re-verified unchanged at `rust-v0.153.4`. They are pinned from the
+other side as well: a tripwire test in the `taurus-agents` repository asserts the
+Codex version recorded here and fails when it moves, so the obligations are
+re-read rather than remembered.
 
 The subscription Dockerfile now clones the pinned upstream Codex source,
 applies [`patches/codex-local-compaction.patch`](patches/codex-local-compaction.patch),
