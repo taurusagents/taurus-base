@@ -124,19 +124,26 @@ same moment.
 Both canaries carry that re-run requirement in their own headers too. The last
 two prerequisites have no such home, which is why they are written down here.
 
-Neither environment-variable prerequisite has been re-verified for 2.1.296.
-A previous reading of the 2.1.260 binary established that both gates in the
-`@path` pipeline were present and structurally identical to 2.1.207, with the
-variable read through a centralised environment accessor. That reading does not
-establish the behaviour of 2.1.296. It also found that the variable disabled a
-"kept deferred tools" feature at 2.1.260; whether that additional effect matters
-here was not established.
+Both environment-variable prerequisites were statically re-verified against the
+shipping 2.1.296 binary on 2026-10-17; the binary was read, not executed. The
+`CLAUDE_CODE_DISABLE_ATTACHMENTS` gate still closes the sole `@path` file-read
+pipeline. Its reach is wider than that name suggests: the disabled branch still
+emits environment, model/permission-mode and output-style/language attachments,
+while also suppressing several other CLI-authored prompt additions. Since
+2.1.290, repository and local `settings.json` files can no longer override this
+variable, so the environment value supplied by the sidecar cannot be defeated
+from the working tree.
 
-The fourth item still has no source reading at the new pin.
-`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` is set for 2.1.296, but its effect is
-unverified. Read that together with the paragraph above about how this deploys:
-the attended window that pins this image will exercise the new binary on every
-container at once.
+The same reading established for the first time against a binary containing the
+feature that `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` means never background: an
+explicit zero is preserved instead of falling through to the 120-second default,
+and closes both the timed route and a new timer-less route. That second guarantee
+depends on a `> 0` term inside `isMcpCallMovableWithoutTimer`, so it remains a
+load-bearing point for every future reading. The binary also has a separate
+print-mode escalation that can interrupt a parked call after a specially shaped
+stdin user frame; Taurus's frames carry neither field that arms it. That frame
+shape is pinned and its behavioral staging backstop is tracked in the
+`taurus-agents` repository as issue #722.
 
 Neither session canary has been run against 2.1.296. The session-repair canary
 has one known-failing row in its prior baseline: as of the 2026-09-07 run for
