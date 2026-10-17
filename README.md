@@ -63,8 +63,8 @@ Taurus expects inside the sidecar:
 
 - Node.js 24
 - Python 3
-- `@anthropic-ai/claude-code@2.1.260`
-- patched source build of `openai/codex` `rust-v0.153.4` (the Taurus fork — see [Codex fork patch](#codex-fork-patch))
+- `@anthropic-ai/claude-code@2.1.296`
+- patched source build of `openai/codex` `rust-v0.163.0` (the Taurus fork — see [Codex fork patch](#codex-fork-patch))
 - `@modelcontextprotocol/sdk@1.29.0`
 - version manifest at `/usr/local/lib/taurus-subscription/runtime-versions.json`
 
@@ -124,25 +124,23 @@ same moment.
 Both canaries carry that re-run requirement in their own headers too. The last
 two prerequisites have no such home, which is why they are written down here.
 
-What reading the 2.1.260 binary established for that third item: both gates the
-`@path` pipeline passes through are present and structurally identical to the
-ones in 2.1.207, and the variable is now read through a centralised environment
-accessor instead of at each gate — a refactor rather than a behaviour change.
-Its reach has widened, though: at 2.1.260 the same variable also disables a
-"kept deferred tools" feature it did not previously touch. Whether that
-additional effect matters here was not established, and nothing above should be
-read as saying it was.
+Neither environment-variable prerequisite has been re-verified for 2.1.296.
+A previous reading of the 2.1.260 binary established that both gates in the
+`@path` pipeline were present and structurally identical to 2.1.207, with the
+variable read through a centralised environment accessor. That reading does not
+establish the behaviour of 2.1.296. It also found that the variable disabled a
+"kept deferred tools" feature at 2.1.260; whether that additional effect matters
+here was not established.
 
-The fourth item has had no such reading, and still has none as this image is
-published. `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` is set at this pin and its
-effect on 2.1.260 is unverified; it is written down as a prerequisite precisely
-because the bump that made it load-bearing is the one that shipped without it
-being checked. Read that together with the paragraph above about how this
-deploys: the window that pins this image is the first thing that will exercise
-the variable at all, and it will exercise it on every container at once.
+The fourth item still has no source reading at the new pin.
+`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` is set for 2.1.296, but its effect is
+unverified. Read that together with the paragraph above about how this deploys:
+the attended window that pins this image will exercise the new binary on every
+container at once.
 
-The session-repair canary has one known-failing row. As of the 2026-09-07 run
-for the 2.1.207 → 2.1.260 bump, `snapshot 2b: path-resume tip mirror survives a
+Neither session canary has been run against 2.1.296. The session-repair canary
+has one known-failing row in its prior baseline: as of the 2026-09-07 run for
+the 2.1.207 → 2.1.260 bump, `snapshot 2b: path-resume tip mirror survives a
 trailing system child on the live branch` fails — and a baseline run of the same
 canary against 2.1.207 fails the identical row. It is a pre-existing divergence
 between the application's mirror of the CLI's resume-tip selection and the CLI
@@ -181,8 +179,8 @@ the pin, re-verify in the new source that:
    `bundled.enabled` fail-open, so a shape change re-enables bundled skills with
    nothing louder than a stderr warning.
 
-All four were re-verified unchanged at `rust-v0.153.4`. The other side records
-the version too, but the two records are joined more loosely than that sounds. A
+All four were re-verified unchanged at `rust-v0.163.0` on 2026-10-17. The
+other side records the version too, but the two records are joined more loosely than that sounds. A
 test in the `taurus-agents` repository asserts *that repository's own* copy of
 the Codex version and fails when *it* moves, which is what makes the obligations
 above get re-read there; editing the manifest in this repository is not an input
@@ -261,15 +259,17 @@ means updating both fields in the same commit;
 
 What the patch does:
 
-- **Forces local compaction.** The configured model provider reports remote
-  compaction as unsupported. Both sites that dispatch on that capability — a
-  requested compaction and an automatic one — therefore run Codex's own
-  client-side summarization instead of the provider-side task. Everything below
-  depends on it: on the remote path Codex never sees the summary text at all.
-  The capability is not the only thing that decides, though. Both sites check
-  Codex's `token_budget` feature before they look at it, and that path asks the
-  provider nothing and produces no summary. It is off by default and this fork
-  relies on it staying off; turning it on silently disables everything here.
+- **Forces local compaction.** Configured providers clamp remote compaction to
+  unsupported after provider defaults and config overrides are resolved, and
+  the Bedrock provider does the same. Requested and automatic foreground
+  compaction therefore run Codex's client-side summarization, while speculative
+  background compaction cannot start because it requires remote V2 support.
+  Everything below depends on that answer: on a remote path Codex never sees the
+  summary text at all. The capability is not the only foreground decision,
+  though. Requested and automatic compaction check Codex's `token_budget`
+  feature first, and that path asks the provider nothing and produces no
+  summary. It is off by default and this fork relies on it staying off; turning
+  it on silently disables everything here.
 - **Exposes the summary on the wire.** The app-server v2 `contextCompaction`
   item carries a `summary` field holding the plain summary body, without the
   `SUMMARY_PREFIX` boilerplate Codex prepends for the model's own benefit.
@@ -304,18 +304,17 @@ What the patch does:
   `wrapPostCompactionMaterial` (`src/agents/post-compaction-material.ts` in the
   `taurus-agents` repository); neither side may change it alone.
 
-Adding `summary` to the compaction item makes any exhaustive match on that item
-a compile error, so the patch also relaxes the one such match, in the TUI's
-thread listing. That listing keeps upstream's output and leaves the summary out:
-the summary is meant for app-server clients reading the thread stream, not for an
-untruncated dump into a model-facing payload.
+Adding `summary` to the compaction item makes exhaustive matches and fixtures
+name the new field, so the patch adapts the affected protocol and TUI sites. The
+TUI's model-facing thread listing keeps upstream's output and leaves the summary
+out rather than emitting an untruncated copy.
 
 The tests this fork's own behaviour depends on are adapted rather than left to
-fail: the provider-capability tests now expect forced-local compaction, the
-app-server test that asserted remote dispatch now asserts that a provider
-upstream would route remotely still compacts locally and never calls the compact
-endpoint, and the local compaction test asserts the summary that reaches the
-client.
+fail: provider-capability tests cover configured overrides and both Bedrock
+endpoints, app-server tests assert that an OpenAI provider still compacts locally
+without a `compaction_trigger`, and lifecycle coverage asserts that only the
+completed item carries the plain summary. A focused unit test covers stale
+post-compaction-note filtering.
 
 Upstream's suite as a whole is *not* expected to pass on this fork, and adapting
 it is not a goal. `codex-rs/core/tests/suite/compact_remote.rs` drives compaction
