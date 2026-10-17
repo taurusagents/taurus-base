@@ -283,8 +283,10 @@ What the patch does:
   items that compaction request produced, not from a backwards scan of the whole
   session history — a compaction that answered with nothing would otherwise
   publish the last assistant message of the actual task as its "summary". When
-  the compaction turn produced no assistant reply, `summary` is absent from the
-  item and the replacement history says `(no summary available)`.
+  a foreground local compaction produces no assistant reply, `summary` is absent
+  from the item and the replacement history says `(no summary available)`.
+  Post-turn compaction keeps upstream's stricter behavior: an empty summary is
+  an error, so the just-completed turn's history remains intact.
 - **Reframes `SUMMARY_PREFIX` for self-continuity.** The preamble that
   introduces a carried-over summary used to describe it as the work of "another
   language model"; it now addresses the model as the author of its own earlier
@@ -313,8 +315,8 @@ The tests this fork's own behaviour depends on are adapted rather than left to
 fail: provider-capability tests cover configured overrides and both Bedrock
 endpoints, app-server tests assert that an OpenAI provider still compacts locally
 without a `compaction_trigger`, and lifecycle coverage asserts that only the
-completed item carries the plain summary. A focused unit test covers stale
-post-compaction-note filtering.
+completed item carries the plain summary. Focused tests cover the split empty-
+summary behavior and stale post-compaction-note filtering.
 
 Upstream's suite as a whole is *not* expected to pass on this fork, and adapting
 it is not a goal. `codex-rs/core/tests/suite/compact_remote.rs` drives compaction

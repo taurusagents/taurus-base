@@ -260,7 +260,7 @@ index 47082d837..f084f0b81 100644
      };
 
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 71761349e..5f8101e7f 100644
+index 71761349e..40cc9c67c 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
 @@ -268,9 +268,12 @@ async fn run_compact_task_inner_impl(
@@ -279,34 +279,33 @@ index 71761349e..5f8101e7f 100644
      let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
      let mut history = sess.clone_history().await;
-@@ -379,18 +382,16 @@ async fn run_compact_task_inner_impl(
+@@ -379,6 +382,8 @@ async fn run_compact_task_inner_impl(
 
      let history_snapshot = sess.clone_history().await;
      let history_items = history_snapshot.annotated_items();
--    let summary_suffix = if matches!(compaction_metadata.phase(), CompactionPhase::PostTurn) {
--        get_last_assistant_message_from_turn(compaction_response.output.iter())
--            .filter(|summary| !summary.trim().is_empty())
--            .ok_or_else(|| {
--                CodexErr::Stream(
--                    "Post-turn compaction completed without an assistant summary".to_string(),
--                )
--            })?
 +    // Use only this request's output. A history scan can mistake an earlier task
 +    // response for the summary when the compaction request returns no text.
-+    let summary_suffix =
-+        get_last_assistant_message_from_turn(compaction_response.output.iter()).unwrap_or_default();
-+    let summary_body = if summary_suffix.is_empty() {
-+        "(no summary available)"
+     let summary_suffix = if matches!(compaction_metadata.phase(), CompactionPhase::PostTurn) {
+         get_last_assistant_message_from_turn(compaction_response.output.iter())
+             .filter(|summary| !summary.trim().is_empty())
+@@ -388,9 +393,14 @@ async fn run_compact_task_inner_impl(
+                 )
+             })?
      } else {
 -        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default()
-+        summary_suffix.as_str()
++        get_last_assistant_message_from_turn(compaction_response.output.iter()).unwrap_or_default()
      };
 -    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
++    let summary_body = if summary_suffix.is_empty() {
++        "(no summary available)"
++    } else {
++        summary_suffix.as_str()
++    };
 +    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_body}");
      let user_messages = collect_annotated_user_messages(history_items);
 
      let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
-@@ -426,8 +427,16 @@ async fn run_compact_task_inner_impl(
+@@ -426,8 +436,16 @@ async fn run_compact_task_inner_impl(
      sess.recompute_token_usage(&replacement_step_context.turn)
          .await;
 
@@ -325,7 +324,7 @@ index 71761349e..5f8101e7f 100644
      let warning = EventMsg::Warning(WarningEvent {
          message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
      });
-@@ -598,7 +607,7 @@ fn compacted_user_message<'a>(
+@@ -598,7 +616,7 @@ fn compacted_user_message<'a>(
          return None;
      };
      let message = user.message();
@@ -334,12 +333,16 @@ index 71761349e..5f8101e7f 100644
          return None;
      }
      Some(CompactedUserMessage {
-@@ -608,6 +617,14 @@ fn compacted_user_message<'a>(
+@@ -608,6 +626,18 @@ fn compacted_user_message<'a>(
      })
  }
 
-+// These notes describe the compaction boundary where they were injected. They
-+// become stale if retained as ordinary user messages in a later rebuild.
++/// Opening tag of the note the Taurus runtime steers in as a user message right
++/// after a compaction. It describes the boundary it was written at, so keeping
++/// it in a rebuilt history moves it to a point it does not describe. The literal
++/// is a contract with that runtime, which writes the envelope in
++/// `wrapPostCompactionMaterial` (`src/agents/post-compaction-material.ts` in the
++/// taurus-agents repository); neither side may change it alone.
 +const POST_COMPACTION_NOTE_OPENING: &str = "<post-compaction-note";
 +
 +fn is_post_compaction_note(message: &str) -> bool {
@@ -349,7 +352,7 @@ index 71761349e..5f8101e7f 100644
  pub(crate) fn is_summary_message(message: &str) -> bool {
      message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
  }
-@@ -824,11 +841,8 @@ async fn drain_to_completed(
+@@ -824,11 +854,8 @@ async fn drain_to_completed(
          };
          match event {
              Ok(ResponseEvent::OutputItemDone(item)) => {
@@ -364,10 +367,114 @@ index 71761349e..5f8101e7f 100644
                          turn_context,
                          turn_context.model_info(),
 diff --git a/codex-rs/core/src/compact_tests.rs b/codex-rs/core/src/compact_tests.rs
-index 2b5f93c69..1cc3adac0 100644
+index 2b5f93c69..ca660e871 100644
 --- a/codex-rs/core/src/compact_tests.rs
 +++ b/codex-rs/core/src/compact_tests.rs
-@@ -431,6 +431,21 @@ do things
+@@ -211,6 +211,103 @@ async fn local_compaction_respects_tool_metadata_state(
+     Ok(())
+ }
+
++#[test_case(CompactionPhase::StandaloneTurn; "foreground local fallback")]
++#[test_case(CompactionPhase::PostTurn; "post-turn preserves history")]
++#[tokio::test]
++async fn empty_summary_preserves_phase_specific_behavior(
++    phase: CompactionPhase,
++) -> anyhow::Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = responses::start_mock_server().await;
++    let provider = ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
++    let (session, turn, _events) = make_session_and_context_with_auth_and_config_and_rx(
++        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
++        Vec::new(),
++        move |config| {
++            config.model = Some("gpt-5.2".to_string());
++            config.model_provider = provider;
++            config.model_provider.supports_websockets = false;
++        },
++    )
++    .await;
++    session
++        .record_conversation_items(
++            &turn,
++            turn.model_info(),
++            &[user_message("History that must survive a failed post-turn compaction")],
++        )
++        .await;
++    let initial_history = session
++        .clone_history()
++        .await
++        .raw_items()
++        .cloned()
++        .collect::<Vec<_>>();
++
++    let _mock = responses::mount_sse_once(
++        &server,
++        responses::sse(vec![responses::ev_completed("compact-response")]),
++    )
++    .await;
++    let step = session
++        .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
++        .await?;
++    let world_state = Arc::new(
++        session
++            .build_world_state_for_step(&step, /*new_window*/ true)
++            .await?,
++    );
++    let is_post_turn = matches!(phase, CompactionPhase::PostTurn);
++    let result = if is_post_turn {
++        run_inline_auto_compact_task(
++            Arc::clone(&session),
++            Arc::clone(&step.turn),
++            step,
++            world_state,
++            CompactionReason::ContextLimit,
++            phase,
++        )
++        .await
++    } else {
++        run_compact_task(
++            Arc::clone(&session),
++            step,
++            world_state,
++            vec![UserInput::Text {
++                text: "Summarize the conversation.".to_string(),
++                text_elements: Vec::new(),
++            }],
++        )
++        .await
++    };
++
++    let current_history = session
++        .clone_history()
++        .await
++        .raw_items()
++        .cloned()
++        .collect::<Vec<_>>();
++    if is_post_turn {
++        let err = result.expect_err("post-turn compaction without a summary must fail");
++        assert!(matches!(
++            err,
++            CodexErr::Stream(message)
++                if message == "Post-turn compaction completed without an assistant summary"
++        ));
++        assert_eq!(current_history, initial_history);
++    } else {
++        result.expect("foreground local compaction should install the fallback summary");
++        let expected_summary = format!("{SUMMARY_PREFIX}\n(no summary available)");
++        assert!(current_history.iter().any(|item| {
++            matches!(item, ResponseItem::Message { role, content, .. }
++                if role == "user"
++                    && content_items_to_text(content).as_deref()
++                        == Some(expected_summary.as_str()))
++        }));
++    }
++    Ok(())
++}
++
+ fn annotated(items: Vec<ResponseItem>) -> Vec<ResponseItemEnvelope> {
+     items.into_iter().map(ResponseItemEnvelope::new).collect()
+ }
+@@ -431,6 +528,21 @@ do things
      );
  }
 
@@ -428,7 +535,7 @@ index 21ab79ce0..104eb6108 100644
          );
      }
 diff --git a/codex-rs/model-provider/src/provider.rs b/codex-rs/model-provider/src/provider.rs
-index f8f0790dd..2019c78ad 100644
+index f8f0790dd..840a4864b 100644
 --- a/codex-rs/model-provider/src/provider.rs
 +++ b/codex-rs/model-provider/src/provider.rs
 @@ -426,7 +426,11 @@ impl ModelProvider for ConfiguredModelProvider {
@@ -439,7 +546,7 @@ index f8f0790dd..2019c78ad 100644
 +        // Clamp after resolving provider defaults and user overrides so no
 +        // configured provider can select a remote compaction protocol.
 +        let mut capabilities = ProviderCapabilities::from_config(&self.info);
-+        capabilities.remote_compaction = RemoteCompactionSupport::Unsupported;
++        capabilities.remote_compaction = crate::RemoteCompactionSupport::Unsupported;
 +        capabilities
      }
 
