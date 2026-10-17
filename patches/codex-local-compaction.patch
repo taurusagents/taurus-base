@@ -260,7 +260,7 @@ index 47082d837..f084f0b81 100644
      };
 
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 71761349e..40cc9c67c 100644
+index 71761349e..0925d2469 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
 @@ -268,9 +268,12 @@ async fn run_compact_task_inner_impl(
@@ -352,7 +352,7 @@ index 71761349e..40cc9c67c 100644
  pub(crate) fn is_summary_message(message: &str) -> bool {
      message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
  }
-@@ -824,11 +854,8 @@ async fn drain_to_completed(
+@@ -824,11 +854,10 @@ async fn drain_to_completed(
          };
          match event {
              Ok(ResponseEvent::OutputItemDone(item)) => {
@@ -362,12 +362,14 @@ index 71761349e..40cc9c67c 100644
 -                    output.push(item);
 -                } else {
 +                output.push(item.clone());
++                // Commit post-turn summaries only after success; failures must leave both
++                // the live history and persisted rollout intact.
 +                if !matches!(phase, CompactionPhase::PostTurn) {
                      sess.record_annotated_conversation_items(
                          turn_context,
                          turn_context.model_info(),
 diff --git a/codex-rs/core/src/compact_tests.rs b/codex-rs/core/src/compact_tests.rs
-index 2b5f93c69..ca660e871 100644
+index 2b5f93c69..f31ed0eee 100644
 --- a/codex-rs/core/src/compact_tests.rs
 +++ b/codex-rs/core/src/compact_tests.rs
 @@ -211,6 +211,103 @@ async fn local_compaction_respects_tool_metadata_state(
@@ -453,8 +455,8 @@ index 2b5f93c69..ca660e871 100644
 +    if is_post_turn {
 +        let err = result.expect_err("post-turn compaction without a summary must fail");
 +        assert!(matches!(
-+            err,
-+            CodexErr::Stream(message)
++            err.details(),
++            CodexErrorDetails::Stream(message)
 +                if message == "Post-turn compaction completed without an assistant summary"
 +        ));
 +        assert_eq!(current_history, initial_history);

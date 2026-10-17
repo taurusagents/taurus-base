@@ -240,6 +240,8 @@ without rebuilding the image.
 before the build. The resulting binary is identified by `codexVariant` in
 `subscription-runtime-versions.json`, whose trailing revision number names a
 revision of this patch; bump that string whenever the patch changes.
+That revision names what an image ships with: an unpublished bump branch may
+iterate without another increment, while each shipped revision gets one.
 
 `codexPatchSha256` in the same manifest narrows the ways that identification can
 go wrong, without making it true. It is the SHA-256 of the patch file, and the
