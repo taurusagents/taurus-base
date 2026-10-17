@@ -127,9 +127,10 @@ two prerequisites have no such home, which is why they are written down here.
 Both environment-variable prerequisites were statically re-verified against the
 shipping 2.1.296 binary on 2026-10-17; the binary was read, not executed. The
 `CLAUDE_CODE_DISABLE_ATTACHMENTS` gate still closes the sole `@path` file-read
-pipeline. Its reach is wider than that name suggests: the disabled branch still
-emits environment, model/permission-mode and output-style/language attachments,
-while also suppressing several other CLI-authored prompt additions. Since
+pipeline. Its reach is wider than that name suggests — it also suppresses
+several other CLI-authored prompt additions — while a floor remains: the
+disabled branch still emits environment, model/permission-mode and
+output-style/language attachments. Since
 2.1.290, repository and local `settings.json` files can no longer override this
 variable, so the environment value supplied by the sidecar cannot be defeated
 from the working tree.
