@@ -254,9 +254,10 @@ an edited patch cannot ship under an unchanged manifest, so forgetting the
 manifest is no longer something that happens silently. What it does not buy is
 an honest `codexVariant`. Nothing compares that string to the patch, and a
 commit that edits the patch and the digest while leaving the revision number
-alone builds cleanly. Bumping the revision whenever the patch changes remains a
-discipline, and the digest does not enforce it. Editing the patch therefore
-means updating both fields in the same commit;
+alone builds cleanly. Bumping the revision whenever the shipped patch changes
+remains a discipline, and the digest does not enforce it. Editing the patch
+therefore means updating the digest in the same commit, and the revision
+according to the shipping rule above;
 `sha256sum patches/codex-local-compaction.patch` gives the new value.
 
 What the patch does:
