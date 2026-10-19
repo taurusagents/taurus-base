@@ -3,8 +3,8 @@
 # Usage: hidden Taurus subscription sidecars use this image instead of the
 # user-visible default agent container image.
 
-ARG CODEX_GIT_REF=rust-v0.153.4
-ARG CODEX_GIT_COMMIT=3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+ARG CODEX_GIT_REF=rust-v0.163.0
+ARG CODEX_GIT_COMMIT=83086188ae0614bd882818ff1aa23f3194962012
 ARG CODEX_RUST_VERSION=1.95.0
 ARG CODEX_BUILD_JOBS=1
 

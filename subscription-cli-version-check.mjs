@@ -9,8 +9,8 @@
  * The version-output file is whatever `<cli> --version` printed. Both CLIs
  * surround the number with other words, so the comparison is against
  * whitespace-separated tokens: matching the whole line would break the first
- * time either changes its wording, and a substring match would accept 2.1.2601
- * as 2.1.260.
+ * time either changes its wording, and a substring match would accept 2.1.2961
+ * as 2.1.296.
  *
  * Every failure mode here is a failure. A manifest that cannot be read or
  * parsed, a key that is absent or not a version string, an empty or missing
